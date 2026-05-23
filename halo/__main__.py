@@ -263,8 +263,13 @@ def _print_full_result(job_label: str, ok: bool, text: str, elapsed: float) -> N
 
 
 def _drain_completed_jobs() -> None:
-    """Speak + print any finished agent jobs. Call between turns so we
-    don't talk over the user."""
+    """Print finished agent jobs to stdout, and speak a "done" cap.
+
+    For streaming agents (Claude), the response itself was already
+    spoken sentence-by-sentence as it generated; we just say a short
+    "Mercury is done." cap so the user knows the agent is no longer
+    working. For batch agents (Codex), we speak the full summary now.
+    """
     for job in completed_unconsumed_jobs():
         cfg = AGENTS[job.agent_key]
         spoken_name = session_name(cfg.key)
@@ -272,8 +277,12 @@ def _drain_completed_jobs() -> None:
             f"{cfg.key} / {spoken_name}", bool(job.ok), job.result, job.elapsed_sec
         )
         if job.ok:
-            short = summarize_for_speech(job.result) or f"{spoken_name} is done."
-            say(f"{spoken_name} says, {short}", blocking=True)
+            if cfg.streams_text_deltas:
+                # Streaming agent already narrated; just a cap.
+                say(f"{spoken_name} is done.", blocking=True)
+            else:
+                short = summarize_for_speech(job.result) or f"{spoken_name} is done."
+                say(f"{spoken_name} says, {short}", blocking=True)
         else:
             say(
                 f"{spoken_name} had a problem. {summarize_for_speech(job.result, 120)}",
@@ -288,7 +297,11 @@ def _print_decision(decision: dict) -> None:
 
 
 def _start_agent_and_ack(agent_key: str, prompt: str) -> str:
-    """Spawn a background job, return the voice-ack to speak."""
+    """Spawn a background job, return the voice-ack to speak.
+
+    For streaming-capable agents (Claude Code), wire a per-sentence TTS
+    callback so Halo narrates the response live while the agent works.
+    """
     if not (prompt or "").strip():
         # Belt-and-braces — callers should already guard, but never
         # dispatch a blank prompt to an agent. Claude / Codex both
@@ -299,12 +312,24 @@ def _start_agent_and_ack(agent_key: str, prompt: str) -> str:
     active = "continuing" if session_status()[agent_key] else "starting"
     print(f"  dispatching to {spoken} / {config.spoken_name.lower()} "
           f"({active} session): {prompt!r}")
+
+    def _speak_chunk(sentence: str) -> None:
+        # Non-blocking so a long monologue queues sentence-by-sentence
+        # without stalling the agent's stdout reader thread. The
+        # sanitizer inside voice.say() strips any markdown the agent
+        # leaks despite the voice system prompt.
+        print(f"    [{config.key} -> tts] {sentence!r}")
+        say(sentence, blocking=False)
+
+    on_chunk = _speak_chunk if config.streams_text_deltas else None
+
     try:
-        job = start_job(agent_key, prompt)
-        print(f"  job #{job.job_id} started in background")
+        job = start_job(agent_key, prompt, on_text_chunk=on_chunk)
+        print(f"  job #{job.job_id} started in background"
+              f"{' (streaming)' if config.streams_text_deltas else ''}")
         if active == "starting":
-            return f"On it. I'm calling this session {spoken}. I'll let you know."
-        return f"On it. {spoken} is working. I'll let you know."
+            return f"On it. I'm calling this session {spoken}."
+        return f"On it. {spoken} is working."
     except AgentBusy as exc:
         return str(exc)
 

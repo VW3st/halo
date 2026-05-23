@@ -4,7 +4,10 @@ Voice front-end for agentic coding tools. Say a wake word, talk to
 Claude Code or Codex CLI in plain English, and hear the result back.
 Halo is the audio layer; the agents do the work.
 
-Status: **v0.4 — multi-agent voice loop, async dispatch, persistent sessions.**
+Status: **v0.5 — Claude streams its response live, sentence by sentence.**
+
+See [CHANGELOG.md](./CHANGELOG.md) for the full history. Licensed MIT
+([LICENSE](./LICENSE)).
 
 ```
 You: "Hey Jarvis. Claude, write a one-line python script that prints hello."
@@ -331,11 +334,12 @@ you get false positives, lower if it takes too many tries.
 9. ✅ Conversation mode, end phrases, idle sleep
 10. ✅ Direct-dialogue mode, mode switches, mythology names
 11. ✅ Vocative dispatch — bypass router for explicit agent calls
-12. Custom `hey_halo` wake model (needs voice samples)
-13. Streaming agent output → speak Claude/Codex progress as it generates
-14. Premium TTS provider abstraction (ElevenLabs etc., opt-in)
-15. Agent registry from external TOML — `halo init` to scaffold new agents
-16. Package + publish (`pip install halo-voice`)
+12. ✅ Streaming Claude output → live TTS sentence-by-sentence
+13. Custom `hey_halo` wake model (needs voice samples)
+14. Streaming Codex (Codex CLI doesn't expose stream-json yet; tracking)
+15. Premium TTS provider abstraction (ElevenLabs etc., opt-in)
+16. Agent registry from external TOML — `halo init` to scaffold new agents
+17. Package + publish (`pip install halo-voice`)
 
 ---
 

@@ -118,6 +118,12 @@ class AgentConfig:
     # command template. If empty, we prepend voice instructions to the
     # user prompt directly (Codex has no append-system-prompt flag).
     accepts_system_prompt_arg: bool = False
+    # If True, stdout is newline-delimited JSON events that include
+    # text_delta chunks (Claude's --output-format stream-json). The
+    # dispatcher parses each line, accumulates text, and fires
+    # on_text_chunk per sentence so the orchestrator can TTS the
+    # response live instead of waiting for the agent to finish.
+    streams_text_deltas: bool = False
 
 
 AGENTS: dict[str, AgentConfig] = {
@@ -127,13 +133,17 @@ AGENTS: dict[str, AgentConfig] = {
         voice_triggers=("claude", "claude code"),
         first_call=(
             "claude", "-p", "{PROMPT}",
-            "--output-format", "json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--include-partial-messages",
             "--permission-mode", "acceptEdits",
             "--append-system-prompt", "{SYSTEM_PROMPT}",
         ),
         continue_call=(
             "claude", "-p", "{PROMPT}",
-            "--output-format", "json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--include-partial-messages",
             "--permission-mode", "acceptEdits",
             "--continue",
             "--append-system-prompt", "{SYSTEM_PROMPT}",
@@ -142,6 +152,7 @@ AGENTS: dict[str, AgentConfig] = {
         json_result_field="result",
         sandbox_label="acceptEdits",
         accepts_system_prompt_arg=True,
+        streams_text_deltas=True,
     ),
     "codex_cli": AgentConfig(
         key="codex_cli",
@@ -231,6 +242,87 @@ def _build_cmd(
     return out
 
 
+class _SentenceBuffer:
+    """Accumulates incremental text and yields complete sentences.
+
+    Used to break Claude's stream-json text_delta chunks into TTS-able
+    sentences. Sentence boundary = `.`/`!`/`?` followed by whitespace
+    or end of buffer, OR a paragraph break (`\\n\\n`).
+    """
+
+    _TERMINATORS = (".", "!", "?")
+
+    def __init__(self, on_sentence: Callable[[str], None]) -> None:
+        self._buf = ""
+        self._on_sentence = on_sentence
+        self._all: list[str] = []
+
+    def feed(self, chunk: str) -> None:
+        if not chunk:
+            return
+        self._buf += chunk
+        while True:
+            idx = self._find_sentence_end()
+            if idx < 0:
+                return
+            sentence = self._buf[: idx + 1].strip()
+            self._buf = self._buf[idx + 1:]
+            if sentence:
+                self._all.append(sentence)
+                try:
+                    self._on_sentence(sentence)
+                except Exception as exc:
+                    print(f"    [stream] on_sentence error: {exc}")
+
+    def flush(self) -> None:
+        remaining = self._buf.strip()
+        self._buf = ""
+        if remaining:
+            self._all.append(remaining)
+            try:
+                self._on_sentence(remaining)
+            except Exception as exc:
+                print(f"    [stream] on_sentence error (flush): {exc}")
+
+    def full_text(self) -> str:
+        return " ".join(self._all).strip()
+
+    def _find_sentence_end(self) -> int:
+        # Paragraph break beats sentence-terminator search.
+        nn = self._buf.find("\n\n")
+        for i, ch in enumerate(self._buf):
+            if ch in self._TERMINATORS:
+                nxt = self._buf[i + 1] if i + 1 < len(self._buf) else ""
+                if not nxt or nxt.isspace():
+                    if nn >= 0 and nn < i:
+                        return nn  # paragraph break came first
+                    return i
+        if nn >= 0:
+            return nn
+        return -1
+
+
+def _extract_text_delta(event: dict) -> str:
+    """Pull the user-facing text out of a Claude stream-json event,
+    if it carries one. Returns "" for events that aren't text deltas."""
+    if event.get("type") != "stream_event":
+        return ""
+    inner = event.get("event") or {}
+    if inner.get("type") != "content_block_delta":
+        return ""
+    delta = inner.get("delta") or {}
+    if delta.get("type") != "text_delta":
+        return ""
+    return delta.get("text", "") or ""
+
+
+def _extract_final_result(event: dict, field: str) -> Optional[str]:
+    """If `event` is Claude's terminal `result` event, return its text."""
+    if event.get("type") == "result" and isinstance(event.get(field), str):
+        return event[field]
+    return None
+
+
 def _run(
     cmd: list[str],
     *,
@@ -238,8 +330,17 @@ def _run(
     timeout: float,
     label: str,
     on_voice_tick: Optional[Callable[[float], None]] = None,
+    on_text_chunk: Optional[Callable[[str], None]] = None,
+    stream_text_deltas: bool = False,
+    json_result_field: str = "result",
 ) -> tuple[bool, str, str]:
     """Background-thread subprocess runner with status ticker.
+
+    When `stream_text_deltas=True`, stdout is parsed as Claude-style
+    newline-delimited JSON events. Text deltas are accumulated, broken
+    into sentences, and fired through `on_text_chunk` for live TTS.
+    The final `result` event becomes the returned stdout text; if it
+    never arrives we fall back to the concatenated deltas.
 
     Returns (ok, stdout, stderr_tail). Prints "still working (Ns)"
     every TICKER_STDOUT_SEC; calls on_voice_tick(elapsed) every
@@ -282,22 +383,59 @@ def _run(
                         box["stderr_lines"].append(line)
                         print(f"    [{label}] {line}")
             except (ValueError, OSError):
-                # stderr was closed mid-iterate by proc.communicate or
-                # proc.kill — nothing more to drain.
                 return
 
         stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
         stderr_thread.start()
 
-        try:
-            stdout, _ = proc.communicate(timeout=timeout)
-            box["stdout"] = stdout or ""
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            box["error"] = f"timed out after {timeout:.0f}s"
-        finally:
-            stderr_thread.join(timeout=2.0)
-            done.set()
+        if stream_text_deltas:
+            # Parse newline-delimited JSON events as they arrive; fire
+            # text_delta chunks into the sentence buffer so TTS can
+            # speak Claude's response while it's still generating.
+            sentence_cb = on_text_chunk if on_text_chunk is not None else (lambda _s: None)
+            buf = _SentenceBuffer(on_sentence=sentence_cb)
+            final_text: Optional[str] = None
+            try:
+                stream = proc.stdout
+                assert stream is not None
+                for line in stream:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    delta = _extract_text_delta(event)
+                    if delta:
+                        buf.feed(delta)
+                        continue
+                    final = _extract_final_result(event, json_result_field)
+                    if final is not None:
+                        final_text = final
+                buf.flush()
+                try:
+                    proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    box["error"] = f"timed out after {timeout:.0f}s"
+                box["stdout"] = final_text if final_text is not None else buf.full_text()
+            except (ValueError, OSError):
+                buf.flush()
+                box["stdout"] = buf.full_text()
+            finally:
+                stderr_thread.join(timeout=2.0)
+                done.set()
+        else:
+            try:
+                stdout, _ = proc.communicate(timeout=timeout)
+                box["stdout"] = stdout or ""
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                box["error"] = f"timed out after {timeout:.0f}s"
+            finally:
+                stderr_thread.join(timeout=2.0)
+                done.set()
 
     worker = threading.Thread(target=_worker, daemon=True)
     worker.start()
@@ -340,11 +478,15 @@ def dispatch(
     cwd: Path | None = None,
     timeout: float = DEFAULT_TIMEOUT_SEC,
     on_voice_tick: Optional[Callable[[float], None]] = None,
+    on_text_chunk: Optional[Callable[[str], None]] = None,
 ) -> tuple[bool, str]:
     """Synchronous one-shot dispatch (used by start_job and tests).
 
     Most callers should use `start_job(...)` instead so the
     conversation loop isn't blocked while the agent runs.
+
+    `on_text_chunk` is invoked per sentence while the agent generates
+    its response (only for agents with `streams_text_deltas=True`).
     """
     config = AGENTS.get(agent_key)
     if config is None:
@@ -374,12 +516,20 @@ def dispatch(
 
     ok, stdout, err = _run(
         cmd, cwd=workdir, timeout=timeout,
-        label=config.key, on_voice_tick=on_voice_tick,
+        label=config.key,
+        on_voice_tick=on_voice_tick,
+        on_text_chunk=on_text_chunk if config.streams_text_deltas else None,
+        stream_text_deltas=config.streams_text_deltas,
+        json_result_field=config.json_result_field,
     )
     if not ok:
         return False, f"{config.spoken_name} failed: {err}"
 
-    if config.parses_json:
+    if config.streams_text_deltas:
+        # The streaming branch already produced the canonical text
+        # (final result event or accumulated deltas).
+        text = stdout.strip()
+    elif config.parses_json:
         try:
             data = json.loads(stdout)
             text = (data.get(config.json_result_field) or "").strip()
@@ -446,8 +596,14 @@ def start_job(
     *,
     cwd: Path | None = None,
     timeout: float = DEFAULT_TIMEOUT_SEC,
+    on_text_chunk: Optional[Callable[[str], None]] = None,
 ) -> AgentJob:
     """Spawn an agent in the background. Returns immediately.
+
+    `on_text_chunk(sentence)` fires once per sentence while the agent
+    generates its response (streaming-capable agents only). The
+    orchestrator passes a TTS-speaker callback so Halo narrates the
+    response live instead of going dead-air on long jobs.
 
     Raises AgentBusy if the agent already has a job running. v0.1
     allows concurrent jobs across different agents (Claude + Codex
@@ -473,7 +629,11 @@ def start_job(
 
         def _runner() -> None:
             try:
-                ok, text = dispatch(agent_key, prompt, cwd=cwd, timeout=timeout)
+                ok, text = dispatch(
+                    agent_key, prompt,
+                    cwd=cwd, timeout=timeout,
+                    on_text_chunk=on_text_chunk,
+                )
             except Exception as exc:  # safety net so the thread never crashes silently
                 ok, text = False, f"unexpected error: {exc}"
             job.ok = ok
