@@ -1,0 +1,20 @@
+openwakeword>=0.6.0
+sounddevice>=0.4.6
+soundfile>=0.12
+# numpy<2 was pinned for silero-vad; the version we run on now (5.x)
+# works with numpy 2.x and kokoro-onnx pulls in 2.x anyway.
+numpy>=1.24
+silero-vad>=5.0
+ollama>=0.4.0
+faster-whisper>=1.2.0
+# faster-whisper needs cuBLAS + cuDNN. On Windows the easiest way is
+# the pip-shipped NVIDIA wheels; halo/stt.py adds their DLL dirs to
+# PATH at import time so CUDA actually loads.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12>=9.0,<10
+# TTS: Kokoro-82M via ONNX runtime. Pulls espeakng-loader so we don't
+# need a system-wide espeak install on Windows.
+kokoro-onnx>=0.5.0
+# Moonshine kept as install-only fallback so a user can swap models in
+# stt.py without re-pip-installing. We don't import it by default.
+moonshine-voice>=0.0.59

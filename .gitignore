@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Large model artifacts — downloaded per the README, not in source control
+models/*.bin
+models/*.onnx
+models/*.gguf
+models/*.safetensors
+
+# Legacy whisper.cpp binaries (we use faster-whisper now; bin/ kept for fallback)
+bin/
+
+# Debug recordings + temp WAVs (DEBUG=True writes them here)
+recordings/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Test artifacts the agents create at project root during voice runs
+/halo.html
+/hello.py
+/index.html
+/*.png
+/*.jpg
+
+# Environment secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Claude Code's own per-project session state (the dev's own usage,
+# not part of Halo's source)
+.claude/
