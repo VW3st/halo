@@ -27,6 +27,7 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 
+from halo import bus
 from halo.config import MODELS_DIR
 
 # af_heart is the only A/A graded voice in the Kokoro lineup
@@ -153,6 +154,7 @@ def say(
     spoken = _clean_for_speech(text)
     if not spoken:
         return
+    bus.emit("tts.spoke", text=spoken, who="Halo")
 
     def _do_synth_and_play() -> None:
         try:

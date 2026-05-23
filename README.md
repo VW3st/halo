@@ -4,10 +4,39 @@ Voice front-end for agentic coding tools. Say a wake word, talk to
 Claude Code or Codex CLI in plain English, and hear the result back.
 Halo is the audio layer; the agents do the work.
 
-Status: **v0.5 — Claude streams its response live, sentence by sentence.**
+Status: **v0.6 — live web dashboard at `http://127.0.0.1:7070`.**
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full history. Licensed MIT
 ([LICENSE](./LICENSE)).
+
+The dashboard shows the entire pipeline live: which stage is firing
+(wake / record / transcribe / route / agent / voice), the most recent
+transcript, every agent session by Roman name with state and elapsed
+time, and a color-coded event log. Auto-launches when you run Halo —
+just open the URL it prints at startup.
+
+```
+HALO •  LOCAL  •  listening                            live  ·  v0.6
+─────────────────────────────────────────────────────────────────────
+[wake] → [record] → [transcribe] → [route] → [agent] → [voice]
+─────────────────────────────────────────────────────────────────────
+  TRANSCRIPT                            │  AGENTS         1 running
+                                        │  Mercury · claude  RUNNING 23s
+   "Claude, build me a one-line         │    "build me a hello..."
+    python script that prints hello"    │
+                                        │  Neptune · codex   IDLE
+   ● Mercury — I wrote it to hello.py.  │
+─────────────────────────────────────────────────────────────────────
+  EVENT LOG                                              ● LIVE
+  14:23:01  wake.fired       score 0.83
+  14:23:03  record.opened
+  14:23:04  stt.done         620ms  "Claude, build me a..."
+  14:23:04  route.matched    vocative -> claude_code
+  14:23:04  agent.dispatched Mercury starting
+  14:23:12  agent.streaming  Mercury: I wrote it to hello.py.
+  14:23:13  tts.spoke        Halo: I wrote it to hello.py.
+  14:23:13  agent.done       Mercury  (8s)
+```
 
 ```
 You: "Hey Jarvis. Claude, write a one-line python script that prints hello."
@@ -246,6 +275,10 @@ halo/
   tools.py        cross-platform local tools (browser, calc, notepad, ...)
   agents.py       agent registry, dispatch, background jobs, session names
   voice.py        Kokoro TTS + Markdown sanitizer
+  bus.py          thread-safe event bus (ring buffer of {kind, ts, ...})
+  web.py          Flask server: serves dashboard + /api/events polling
+  web_static/
+    index.html    dashboard (single file, no build step)
 
 models/
   kokoro-v1.0.fp16.onnx       Kokoro 82M voice model
@@ -335,11 +368,12 @@ you get false positives, lower if it takes too many tries.
 10. ✅ Direct-dialogue mode, mode switches, mythology names
 11. ✅ Vocative dispatch — bypass router for explicit agent calls
 12. ✅ Streaming Claude output → live TTS sentence-by-sentence
-13. Custom `hey_halo` wake model (needs voice samples)
-14. Streaming Codex (Codex CLI doesn't expose stream-json yet; tracking)
-15. Premium TTS provider abstraction (ElevenLabs etc., opt-in)
-16. Agent registry from external TOML — `halo init` to scaffold new agents
-17. Package + publish (`pip install halo-voice`)
+13. ✅ Local web dashboard with live pipeline / transcript / jobs / log
+14. Custom `hey_halo` wake model (needs voice samples)
+15. Streaming Codex (Codex CLI doesn't expose stream-json yet; tracking)
+16. Premium TTS provider abstraction (ElevenLabs etc., opt-in)
+17. Agent registry from external TOML — `halo init` to scaffold new agents
+18. Package + publish (`pip install halo-voice`)
 
 ---
 

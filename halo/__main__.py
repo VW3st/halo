@@ -32,6 +32,7 @@ import re
 import signal
 import time
 
+from halo import bus
 from halo.agents import (
     AGENTS,
     AgentBusy,
@@ -55,6 +56,7 @@ from halo.voice import is_available as voice_available
 from halo.voice import preload_voice, say
 from halo.voice import stop as voice_stop
 from halo.wake import WAKE_WORD, _get_model, listen_for_wake
+from halo.web import start_server as start_web_server
 
 # Phrases that close the conversation and send us back to wake-listening.
 # Matched anywhere in the cleaned transcript (case-insensitive, word boundaries).
@@ -374,6 +376,13 @@ def _handle_decision(decision: dict) -> str:
     return confirmation or "Okay."
 
 
+def _set_direct(direct_agent: str | None) -> str | None:
+    """Update direct-dialogue mode + emit a bus event so the dashboard
+    pill updates. Returns the new direct_agent value."""
+    bus.emit("mode.changed", direct=direct_agent)
+    return direct_agent
+
+
 def run_conversation() -> None:
     """Loop one or more turns without requiring re-wake.
 
@@ -428,14 +437,17 @@ def run_conversation() -> None:
         # 1. End phrase
         if _is_end_phrase(cleaned):
             print("  end-phrase -> closing conversation")
+            bus.emit("route.matched", handler="end_phrase")
             say("Goodbye.", blocking=True)
             return
 
         # 2. New-session phrase
         if _is_new_session_phrase(cleaned):
             print("  reset-session phrase -> dropping agent continuation")
+            bus.emit("route.matched", handler="new_session")
             reset_session()
-            direct_agent = None
+            direct_agent = _set_direct(None)
+            bus.emit("session.reset")
             say("Fresh session.", blocking=True)
             continue
 
@@ -444,7 +456,8 @@ def run_conversation() -> None:
         voc_agent, voc_text = _vocative_dispatch(cleaned)
         if voc_agent and voc_text:
             print(f"  vocative dispatch -> {voc_agent}: {voc_text!r}")
-            direct_agent = voc_agent
+            bus.emit("route.matched", handler="vocative", target=voc_agent)
+            direct_agent = _set_direct(voc_agent)
             phrase = _start_agent_and_ack(voc_agent, voc_text)
             if phrase:
                 say(phrase, blocking=True)
@@ -454,9 +467,10 @@ def run_conversation() -> None:
         # 4. Pure mode-switch ("switch to codex" with no instruction after)
         switch_target = _agent_switch_target(cleaned)
         if switch_target is not None:
-            direct_agent = switch_target
+            direct_agent = _set_direct(switch_target)
             spoken = session_name(switch_target)
             print(f"  pure switch -> {switch_target} ({spoken})")
+            bus.emit("route.matched", handler="mode_switch", target=switch_target)
             say(f"Switching to {spoken}.", blocking=True)
             continue
 
@@ -464,7 +478,8 @@ def run_conversation() -> None:
         if _wants_back_to_halo(cleaned):
             if direct_agent:
                 print(f"  leaving direct dialogue with {direct_agent}")
-            direct_agent = None
+            direct_agent = _set_direct(None)
+            bus.emit("route.matched", handler="back_to_halo")
             say("Halo here.", blocking=True)
             continue
 
@@ -472,6 +487,7 @@ def run_conversation() -> None:
         if _is_status_query(cleaned):
             summary = status_summary()
             print(f"  status: {summary}")
+            bus.emit("route.matched", handler="status_query")
             say(summary, blocking=True)
             continue
 
@@ -499,6 +515,7 @@ def run_conversation() -> None:
             handled, summary = execute_system_intent(cleaned)
             if handled:
                 print(f"  tool fast-path: {summary}")
+                bus.emit("route.matched", handler="tool", text=summary)
                 say(summary, blocking=True)
                 continue
 
@@ -508,6 +525,7 @@ def run_conversation() -> None:
                 print("  direct-dialogue: empty after wake-strip, ignoring")
                 continue
             print(f"  direct-dialogue -> {direct_agent}")
+            bus.emit("route.matched", handler="direct", target=direct_agent)
             phrase = _start_agent_and_ack(direct_agent, cleaned)
             if phrase:
                 say(phrase, blocking=True)
@@ -521,6 +539,7 @@ def run_conversation() -> None:
         if not cleaned:
             continue
         print(f"  no local handler matched -> Stage 2 LLM")
+        bus.emit("route.matched", handler="stage2_llm")
         t0 = time.monotonic()
         lm_decision = understand_and_route(cleaned)
         print(f"  stage 2: {(time.monotonic() - t0) * 1000:.0f}ms")
@@ -541,7 +560,7 @@ def run_conversation() -> None:
         if lm_decision.get("status") == "ready":
             agent_dispatched = lm_decision.get("agent")
             if agent_dispatched in AGENTS:
-                direct_agent = agent_dispatched
+                direct_agent = _set_direct(agent_dispatched)
                 print(f"  entering direct-dialogue mode with {direct_agent}")
 
         last_activity = time.monotonic()
@@ -551,6 +570,15 @@ def main() -> None:
     # On Windows, Python's default SIGINT handling can stall behind
     # sounddevice's C callbacks; install the default handler explicitly.
     signal.signal(signal.SIGINT, signal.default_int_handler)
+
+    # Web dashboard — daemon thread, dies with the process. Start it
+    # first so it's already serving by the time the heavy models load
+    # and the user opens the URL.
+    try:
+        url = start_web_server()
+        print(f"Dashboard:  {url}")
+    except Exception as exc:
+        print(f"Dashboard failed to start: {exc}")
 
     # Pre-load every heavy thing so the first turn doesn't pay cold-start.
     _get_model()
@@ -565,8 +593,10 @@ def main() -> None:
         while True:
             listen_for_wake()
             print("\nwake word detected -- entering conversation\n")
+            bus.emit("convo.entered")
             say("I'm here.", blocking=True)
             run_conversation()
+            bus.emit("convo.exited")
             print("conversation ended -- back to wake-listening\n")
     except KeyboardInterrupt:
         print("\nstopped")

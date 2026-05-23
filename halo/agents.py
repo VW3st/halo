@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from halo import bus
+
 # Default to the directory Halo was launched from. Most users will
 # `cd <project>` before running Halo; agents then act on that project.
 DEFAULT_CWD = Path.cwd()
@@ -627,12 +629,24 @@ def start_job(
             started_at=time.monotonic(),
         )
 
+        # Wrap the user's on_text_chunk so we can also push streaming
+        # sentences onto the bus for the web dashboard.
+        spoken = session_name(agent_key)
+
+        def _on_chunk(sentence: str) -> None:
+            bus.emit("agent.streaming", agent=agent_key, name=spoken, sentence=sentence)
+            if on_text_chunk is not None:
+                on_text_chunk(sentence)
+
         def _runner() -> None:
+            bus.emit("agent.dispatched",
+                     agent=agent_key, name=spoken, prompt=prompt,
+                     job_id=job.job_id)
             try:
                 ok, text = dispatch(
                     agent_key, prompt,
                     cwd=cwd, timeout=timeout,
-                    on_text_chunk=on_text_chunk,
+                    on_text_chunk=_on_chunk,
                 )
             except Exception as exc:  # safety net so the thread never crashes silently
                 ok, text = False, f"unexpected error: {exc}"
@@ -640,6 +654,13 @@ def start_job(
             job.result = text
             job.completed_at = time.monotonic()
             _last_by_agent[agent_key] = job
+            bus.emit(
+                "agent.done" if ok else "agent.error",
+                agent=agent_key, name=spoken,
+                job_id=job.job_id,
+                elapsed_sec=job.elapsed_sec,
+                text=text,
+            )
 
         thread = threading.Thread(target=_runner, daemon=True, name=f"agent-{job.job_id}")
         job._thread = thread

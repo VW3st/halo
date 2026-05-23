@@ -19,6 +19,7 @@ import openwakeword
 import sounddevice as sd
 from openwakeword.model import Model
 
+from halo import bus
 from halo.config import SAMPLE_RATE
 
 # TODO: replace with a custom-trained "hey_halo" model
@@ -126,12 +127,14 @@ def listen_for_wake() -> None:
         if score >= LIVE_SCORE_FLOOR and now - last_score_print > LIVE_SCORE_INTERVAL:
             last_score_print = now
             print(f"  heard something (score={score:.2f})")
+            bus.emit("wake.heard", score=score)
         if score >= THRESHOLD and now - last_detection > COOLDOWN_SEC:
             last_detection = now
             # Always print the score that actually fired wake — overrides
             # the rate-limited "heard something" line above so the user
             # sees what crossed threshold and can tune accordingly.
             print(f"  wake fired (score={score:.2f}, threshold={THRESHOLD})")
+            bus.emit("wake.fired", score=score, threshold=THRESHOLD)
             # Snapshot the ring buffer in chronological order before
             # we hand control back to the turn orchestrator.
             with ring_lock:

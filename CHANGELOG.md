@@ -14,6 +14,34 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [0.6.0] — 2026-05-24
+
+### Added
+- **Local web dashboard** at `http://127.0.0.1:7070`, auto-launched on
+  Halo startup. Single-file HTML (no build step). Dark slate UI, mono
+  typography, cyan accent.
+  - Live **pipeline visualization** (wake → record → transcribe →
+    route → agent → voice) with stages lighting up as they fire.
+  - Top-of-page **mode pill** (LOCAL / DIRECT · MERCURY).
+  - **Big live transcript** of what you just said + a "now speaking"
+    indicator showing who's talking.
+  - **Agents panel** listing each session by Roman name with state
+    (running / ready / idle), elapsed time, and current prompt.
+  - Color-coded **event log** streaming every wake / stt / route /
+    agent / tts event with timestamps.
+- **`halo/bus.py`** — thread-safe ring-buffer event bus. `emit(kind, **data)`
+  from anywhere; web layer polls `events_since(seq)`.
+- **`halo/web.py`** — Flask app on a daemon thread. `/api/events?since=N`
+  for polling, `/api/state` for snapshot.
+- `flask>=3.0` added to requirements.
+
+### Changed
+- `halo/__main__.py`, `halo/wake.py`, `halo/turn.py`, `halo/agents.py`,
+  `halo/voice.py` all emit bus events at key transitions.
+- Werkzeug logger silenced (no per-poll log spam in the terminal).
+
+---
+
 ## [0.5.0] — 2026-05-24
 
 ### Added

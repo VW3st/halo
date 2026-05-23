@@ -1,6 +1,9 @@
 openwakeword>=0.6.0
 sounddevice>=0.4.6
 soundfile>=0.12
+# Web dashboard — http://127.0.0.1:7070 with live pipeline / transcript /
+# job state / event log. Flask is small (~600 KB), zero-config, threaded.
+flask>=3.0.0
 # numpy<2 was pinned for silero-vad; the version we run on now (5.x)
 # works with numpy 2.x and kokoro-onnx pulls in 2.x anyway.
 numpy>=1.24

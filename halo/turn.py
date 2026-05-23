@@ -38,6 +38,7 @@ from halo.config import (
     TURN_MAX_SEC,
     TURN_MAX_WAIT_FOR_FIRST_SPEECH_SEC,
 )
+from halo import bus
 from halo.record import RecorderState, open_stream, play_backchannel, play_chime
 from halo.router import check_turn_complete, understand_and_route
 from halo.stt import BatchTranscriber
@@ -244,6 +245,7 @@ def run_turn(
         with open_stream(state):
             play_chime()
             print("  [speak now]")
+            bus.emit("record.opened")
             if not state.wait_for_speech(first_wait):
                 print(f"  no speech detected within {first_wait:.1f}s")
                 return None
@@ -259,10 +261,13 @@ def run_turn(
                     print("  hard timeout while user still talking")
                     break
                 state.clear_silence_event()
+                bus.emit("record.silence")
 
                 t_stt = time.monotonic()
                 text = transcriber.transcribe()
-                print(f"  stt: {(time.monotonic() - t_stt) * 1000:.0f}ms  partial: {text!r}")
+                ms = int((time.monotonic() - t_stt) * 1000)
+                print(f"  stt: {ms}ms  partial: {text!r}")
+                bus.emit("stt.done", ms=ms, text=text)
 
                 if not text:
                     if not _wait_with_backchannel(state, 2.0, "thinking", deadline):
