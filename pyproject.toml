@@ -1,0 +1,100 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "halo-voice"
+version = "1.0.0"
+description = "Voice frontend for agentic coding tools — talk to Claude Code or Codex CLI by voice."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+    { name = "VW3st", email = "VW3st@users.noreply.github.com" },
+]
+keywords = [
+    "voice",
+    "speech",
+    "stt",
+    "tts",
+    "claude",
+    "claude-code",
+    "codex",
+    "agent",
+    "cli",
+    "ai",
+    "wake-word",
+    "ollama",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Software Development",
+]
+dependencies = [
+    "openwakeword>=0.6.0",
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12",
+    "flask>=3.0.0",
+    "numpy>=1.24",
+    "silero-vad>=5.0",
+    "ollama>=0.4.0",
+    "faster-whisper>=1.2.0",
+    "kokoro-onnx>=0.5.0",
+]
+
+[project.optional-dependencies]
+# faster-whisper needs cuBLAS + cuDNN. On Windows the easiest install
+# is the pip-shipped NVIDIA wheels; halo/stt.py adds their DLL dirs to
+# PATH at import time so CUDA actually loads.
+gpu-windows = [
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12>=9.0,<10",
+]
+# Optional STT fallback. Halo defaults to faster-whisper; this is kept
+# install-only so the user can swap in halo/stt.py without reinstalling.
+moonshine = ["moonshine-voice>=0.0.59"]
+dev = [
+    "build>=1.0",
+    "twine>=5.0",
+]
+
+[project.scripts]
+halo = "halo.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/VW3st/halo"
+Repository = "https://github.com/VW3st/halo"
+Issues = "https://github.com/VW3st/halo/issues"
+Changelog = "https://github.com/VW3st/halo/blob/main/CHANGELOG.md"
+
+# --- hatchling build config ---------------------------------------------
+
+[tool.hatch.version]
+path = "halo/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["halo"]
+# halo/web_static/index.html is inside the package dir, so hatchling
+# includes it by default. Listed here for clarity / safety against
+# future packaging tools.
+include = ["halo/**"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/halo",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/scripts",
+]

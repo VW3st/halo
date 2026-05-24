@@ -4,7 +4,7 @@ Voice front-end for agentic coding tools. Say a wake word, talk to
 Claude Code or Codex CLI in plain English, and hear the result back.
 Halo is the audio layer; the agents do the work.
 
-Status: **v0.6 — live web dashboard at `http://127.0.0.1:7070`.**
+Status: **v1.0 — `pip install` ready.** Live web dashboard at `http://127.0.0.1:7070`.
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full history. Licensed MIT
 ([LICENSE](./LICENSE)).
@@ -16,7 +16,7 @@ time, and a color-coded event log. Auto-launches when you run Halo —
 just open the URL it prints at startup.
 
 ```
-HALO •  LOCAL  •  listening                            live  ·  v0.6
+HALO •  LOCAL  •  listening                            live  ·  v1.0
 ─────────────────────────────────────────────────────────────────────
 [wake] → [record] → [transcribe] → [route] → [agent] → [voice]
 ─────────────────────────────────────────────────────────────────────
@@ -82,42 +82,47 @@ fall back to CPU.
 
 ---
 
-## Setup
+## Install
 
-### 1. Python deps
+### 1. Halo itself
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install git+https://github.com/VW3st/halo.git
 ```
 
-`silero-vad` pulls PyTorch (~800 MB). To save bandwidth/disk on a CPU-only
-laptop:
+(PyPI release coming — `pip install halo-voice` will work once published.)
+
+On a Windows machine with an NVIDIA GPU, also grab the CUDA wheels for
+faster-whisper:
+
+```powershell
+pip install "halo-voice[gpu-windows] @ git+https://github.com/VW3st/halo.git"
+```
+
+`silero-vad` pulls PyTorch (~800 MB). To save bandwidth on a CPU-only
+laptop, install Torch CPU-only first:
 
 ```powershell
 pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install -r requirements.txt
+pip install git+https://github.com/VW3st/halo.git
 ```
 
-First run downloads on demand:
-- openWakeWord pretrained ONNX models (~few MB)
+### 2. Kokoro TTS model files (~200 MB)
+
+```powershell
+halo download-models
+```
+
+Drops `kokoro-v1.0.fp16.onnx` + `voices-v1.0.bin` into `~/.halo/models/`
+(or `./models/` if you're running from a git checkout). Without these,
+Halo runs in silent (text-only) mode.
+
+The other models download themselves on first use:
+- openWakeWord pretrained ONNX (~few MB)
 - silero-vad model (~2 MB)
 - faster-whisper distil-large-v3 (~1.5 GB, from HuggingFace)
-
-### 2. Kokoro TTS model files
-
-Download into `models/`:
-- [`kokoro-v1.0.fp16.onnx`](https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.fp16.onnx) (~170 MB)
-- [`voices-v1.0.bin`](https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin) (~28 MB)
-
-```
-D:\Halo\models\
-    kokoro-v1.0.fp16.onnx
-    voices-v1.0.bin
-```
-
-Without these, Halo runs in silent (text-only) mode.
 
 ### 3. Ollama + routing model
 
@@ -157,14 +162,41 @@ Both must be on PATH. Verify with `claude --version` and `codex --version`.
 ## Run
 
 ```powershell
-cd D:\Halo
-.\.venv\Scripts\Activate.ps1
-python -m halo
+halo
 ```
+
+(or `python -m halo` if you cloned the repo directly.)
 
 You'll see preload messages, then `Halo ready. Say the wake word...`
 and hear `"Halo online."` Speak the wake word ("Hey Jarvis"), then
 your command.
+
+`halo` always uses the current working directory as Claude/Codex's
+project root, so `cd` into your project before launching. Override
+the model location with `HALO_MODELS_DIR=/path/to/models`.
+
+### CLI
+
+```
+halo                  start the voice loop (default)
+halo run              same as above
+halo download-models  fetch Kokoro TTS model files
+halo version          print installed version
+halo --help           show help
+```
+
+### Dev install
+
+Clone the repo and install editable:
+
+```powershell
+git clone https://github.com/VW3st/halo.git
+cd halo
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e .[gpu-windows,dev]
+python -m halo
+```
 
 ---
 
@@ -369,11 +401,13 @@ you get false positives, lower if it takes too many tries.
 11. ✅ Vocative dispatch — bypass router for explicit agent calls
 12. ✅ Streaming Claude output → live TTS sentence-by-sentence
 13. ✅ Local web dashboard with live pipeline / transcript / jobs / log
-14. Custom `hey_halo` wake model (needs voice samples)
-15. Streaming Codex (Codex CLI doesn't expose stream-json yet; tracking)
-16. Premium TTS provider abstraction (ElevenLabs etc., opt-in)
-17. Agent registry from external TOML — `halo init` to scaffold new agents
-18. Package + publish (`pip install halo-voice`)
+14. ✅ Packaged for `pip install` (v1.0)
+15. Publish to PyPI (`pip install halo-voice` direct, no `git+`)
+16. Custom `hey_halo` wake model (needs voice samples)
+17. Streaming Codex (Codex CLI doesn't expose stream-json yet; tracking)
+18. Premium TTS provider abstraction (ElevenLabs etc., opt-in)
+19. Agent registry from external TOML — `halo init` to scaffold new agents
+20. Project registry — `halo project add/use <name>` for multi-project flows
 
 ---
 

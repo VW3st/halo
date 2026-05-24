@@ -6,11 +6,35 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ## [Unreleased]
 
+- Publish to PyPI (currently install via `pip install git+https://github.com/VW3st/halo.git`).
 - Custom `hey_halo` wake model (needs voice samples + openWakeWord training notebook).
 - Premium TTS provider abstraction (ElevenLabs, etc.) behind an opt-in flag.
 - External `agents.toml` so adding agents doesn't require Python edits.
-- `pyproject.toml` + `pip install halo-voice`.
+- `halo project add / use <name>` for multi-project flows.
 - GitHub Actions CI running `scripts/test_*.py`.
+
+---
+
+## [1.0.0] — 2026-05-24
+
+### Added
+- **Packaged as `halo-voice`** — `pip install git+https://github.com/VW3st/halo.git`
+  installs a real `halo` shell command, no more `python -m halo` needed.
+- **`pyproject.toml`** (hatchling backend) — proper PEP 621 metadata,
+  console-script entry point, `[gpu-windows]` and `[moonshine]` optional extras.
+- **`halo/cli.py`** — argparse-driven CLI with subcommands:
+  `halo run` (default), `halo download-models`, `halo version`.
+- **`halo download-models`** — fetches Kokoro fp16 ONNX + voices bin
+  (~200 MB) into `~/.halo/models/` so pip users don't have to curl
+  release artifacts manually.
+- **`HALO_MODELS_DIR` env var** — override the model location.
+  `config.py:_resolve_models_dir()` prefers the override, then a local
+  `./models/` (dev checkout), then `~/.halo/models/` (installed).
+- `halo/__init__.py` now exports `__version__`.
+
+### Changed
+- `requirements.txt` removed — dependencies live in `pyproject.toml`.
+  Dev install: `pip install -e .[gpu-windows,dev]`.
 
 ---
 

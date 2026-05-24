@@ -6,13 +6,35 @@ hardware/model knobs here so individual modules stay focused on logic.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # Flip to False once we're past the build-and-debug phase.
 DEBUG = True
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MODELS_DIR = PROJECT_ROOT / "models"
+
+
+def _resolve_models_dir() -> Path:
+    """Pick where Kokoro / faster-whisper model files live.
+
+    Precedence:
+      1. $HALO_MODELS_DIR  — explicit override, wins always.
+      2. <project-root>/models — dev mode (running from a git checkout)
+         when that directory already exists.
+      3. ~/.halo/models    — installed mode (pip-installed package, no
+         dev tree). Created on demand by `halo download-models`.
+    """
+    override = os.environ.get("HALO_MODELS_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    dev_dir = PROJECT_ROOT / "models"
+    if dev_dir.exists():
+        return dev_dir
+    return Path.home() / ".halo" / "models"
+
+
+MODELS_DIR = _resolve_models_dir()
 RECORDINGS_DIR = PROJECT_ROOT / "recordings"
 
 # Audio format used end-to-end (wake → record → STT).
