@@ -3,531 +3,967 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Halo · voice frontend for agentic coding tools</title>
+<title>Halo · voice interface for Claude Code &amp; Codex CLI</title>
 <meta name="description" content="Talk to Claude Code or Codex CLI by voice. Custom 'halo' wake word, persistent agent sessions, live dashboard. 100% local — no API keys to run." />
-<meta name="theme-color" content="#0b0f15" />
-<meta property="og:title" content="Halo · voice frontend for agentic coding tools" />
-<meta property="og:description" content="Talk to Claude Code or Codex CLI by voice. Custom 'halo' wake word, persistent agent sessions, live dashboard." />
+<meta name="theme-color" content="#05070b" />
+<meta property="og:title" content="Halo · voice interface for agentic coding" />
+<meta property="og:description" content="Talk to Claude Code or Codex CLI by voice. Custom wake word, persistent agent sessions, live dashboard." />
 <meta property="og:type" content="website" />
-<meta property="og:url" content="https://github.com/VW3st/halo" />
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><defs><radialGradient id=%22g%22 cx=%22.5%22 cy=%22.5%22 r=%22.5%22><stop offset=%220%22 stop-color=%22%2300d4ff%22 stop-opacity=%220%22/><stop offset=%22.7%22 stop-color=%22%2300d4ff%22 stop-opacity=%22.3%22/><stop offset=%221%22 stop-color=%22%2300d4ff%22/></radialGradient></defs><circle cx=%2216%22 cy=%2216%22 r=%2213%22 fill=%22none%22 stroke=%22url(%23g)%22 stroke-width=%223%22/><circle cx=%2216%22 cy=%2216%22 r=%224%22 fill=%22%2300d4ff%22/></svg>" />
+<meta property="og:url" content="https://vw3st.github.io/halo/" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><defs><linearGradient id=%22g%22 x1=%220%22 y1=%220%22 x2=%221%22 y2=%221%22><stop offset=%220%22 stop-color=%22%2300d4ff%22/><stop offset=%221%22 stop-color=%22%23b794f4%22/></linearGradient></defs><circle cx=%2216%22 cy=%2216%22 r=%2213%22 fill=%22none%22 stroke=%22url(%23g)%22 stroke-width=%222.5%22/><circle cx=%2216%22 cy=%2216%22 r=%224%22 fill=%22%2300d4ff%22/></svg>" />
 <style>
 :root {
-  --bg-0: #07090c;
-  --bg-1: #0b0f15;
-  --bg-2: #11161f;
-  --bg-3: #18202d;
-  --line: #1f2a3a;
-  --line-soft: #141c28;
-  --text: #d9e3f1;
-  --text-dim: #6b7a90;
-  --text-faint: #3e4a5f;
-  --accent: #00d4ff;
-  --accent-dim: #007999;
-  --good: #6ee7b7;
-  --warn: #ffb547;
-  --bad: #ff5d6c;
-  --purple: #b794f4;
-  --font-ui: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Consolas, monospace;
+  --bg-void:  #05070b;
+  --bg-deep:  #07090f;
+  --bg-card:  #0b0f17;
+  --bg-card2: #0e131c;
+  --line:     #1a2233;
+  --line-dim: #111722;
+  --text:     #e2e8f5;
+  --text-mid: #97a3bb;
+  --text-dim: #5a667e;
+  --text-low: #353e51;
+  --cyan:     #00e0ff;
+  --cyan-dim: #00829c;
+  --magenta:  #ff5dd6;
+  --purple:   #b794f4;
+  --indigo:   #7c83ff;
+  --green:    #4ade80;
+  --amber:    #fbbf24;
+  --rose:     #fb7185;
+  --grad-1: linear-gradient(135deg, #00e0ff 0%, #b794f4 50%, #ff5dd6 100%);
+  --grad-2: linear-gradient(120deg, #00e0ff, #7c83ff);
+  --shadow-glow: 0 0 60px -10px rgba(0, 224, 255, 0.35);
 }
 
-* { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
-html { scroll-behavior: smooth; }
+html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
 body {
-  background: var(--bg-0);
+  background: var(--bg-void);
   color: var(--text);
-  font-family: var(--font-ui);
-  font-size: 15px;
-  line-height: 1.55;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   overflow-x: hidden;
+  font-feature-settings: 'cv11','ss01','ss03';
+}
+a { color: var(--cyan); text-decoration: none; transition: color .15s; }
+a:hover { color: #66ecff; }
+code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace; }
+
+/* ============================================
+   ATMOSPHERIC BACKGROUND
+   - Tron-style perspective grid floor
+   - Twin radial nebulae
+   - Subtle starfield
+   ============================================ */
+.bg-fx { position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden; }
+.bg-fx .nebula {
+  position: absolute;
+  width: 800px; height: 800px;
+  border-radius: 50%;
+  filter: blur(80px);
+  opacity: 0.5;
+  animation: drift 30s ease-in-out infinite alternate;
+}
+.bg-fx .nebula.n1 { top: -200px; right: -200px;
+  background: radial-gradient(circle, rgba(0,224,255,0.35), transparent 70%); }
+.bg-fx .nebula.n2 { bottom: -200px; left: -200px;
+  background: radial-gradient(circle, rgba(183,148,244,0.28), transparent 70%);
+  animation-delay: -10s; }
+.bg-fx .nebula.n3 { top: 40%; left: 50%; width: 600px; height: 600px;
+  background: radial-gradient(circle, rgba(255,93,214,0.12), transparent 70%);
+  animation-delay: -20s; }
+@keyframes drift {
+  0%   { transform: translate(0, 0) scale(1); }
+  100% { transform: translate(60px, -40px) scale(1.1); }
+}
+.bg-fx .grid {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 50vh;
+  background:
+    linear-gradient(transparent 0%, var(--bg-void) 90%),
+    linear-gradient(to right,  rgba(0,224,255,0.08) 1px, transparent 1px) 0 0 / 60px 60px,
+    linear-gradient(to bottom, rgba(0,224,255,0.08) 1px, transparent 1px) 0 0 / 60px 60px;
+  transform: perspective(500px) rotateX(60deg);
+  transform-origin: bottom;
+  opacity: 0.7;
+  mask-image: radial-gradient(ellipse at center bottom, black 0%, transparent 80%);
+  -webkit-mask-image: radial-gradient(ellipse at center bottom, black 0%, transparent 80%);
+}
+.bg-fx .scanlines {
+  position: absolute; inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent 2px,
+    rgba(255,255,255,0.012) 2px,
+    rgba(255,255,255,0.012) 3px
+  );
 }
 
-/* ambient glow behind the hero */
-body::before {
-  content: "";
-  position: fixed;
-  inset: -30% -20% auto auto;
-  width: 80%; height: 80%;
-  background: radial-gradient(circle at 70% 30%, rgba(0, 212, 255, 0.08), transparent 55%);
-  pointer-events: none;
-  z-index: 0;
-}
-body::after {
-  content: "";
-  position: fixed;
-  inset: auto auto -30% -20%;
-  width: 70%; height: 70%;
-  background: radial-gradient(circle at 30% 70%, rgba(183, 148, 244, 0.06), transparent 55%);
-  pointer-events: none;
-  z-index: 0;
-}
+.wrap { max-width: 1140px; margin: 0 auto; padding: 0 28px; position: relative; z-index: 1; }
+.wrap-narrow { max-width: 920px; margin: 0 auto; padding: 0 28px; position: relative; z-index: 1; }
 
-a { color: var(--accent); text-decoration: none; }
-a:hover { text-decoration: underline; }
-
-.wrap {
-  max-width: 980px;
-  margin: 0 auto;
-  padding: 0 24px;
-  position: relative;
-  z-index: 1;
-}
-
-/* ---------- HEADER ---------- */
+/* ============================================
+   HEADER
+   ============================================ */
 .site-hdr {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 22px 0 18px;
-  border-bottom: 1px solid var(--line-soft);
+  position: sticky; top: 0; z-index: 50;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  background: rgba(5, 7, 11, 0.6);
+  border-bottom: 1px solid var(--line-dim);
+}
+.hdr-inner {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 0;
 }
 .brand {
   display: flex; align-items: center; gap: 12px;
-  font-family: var(--font-mono);
-  font-size: 16px;
-  letter-spacing: 0.36em;
-  font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px; letter-spacing: 0.4em; font-weight: 700;
   color: var(--text);
 }
-.brand .mark { width: 28px; height: 28px; display: block; }
-.site-nav { display: flex; gap: 22px; font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.08em; }
+.brand .mark { width: 28px; height: 28px; }
+.site-nav { display: flex; align-items: center; gap: 28px;
+  font-family: 'JetBrains Mono', monospace; font-size: 12px;
+  letter-spacing: 0.08em; text-transform: lowercase; }
 .site-nav a { color: var(--text-dim); }
-.site-nav a:hover { color: var(--text); text-decoration: none; }
-.site-nav .ver { color: var(--text-faint); }
+.site-nav a:hover { color: var(--text); }
+.site-nav .gh-btn {
+  padding: 8px 16px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  transition: all .15s;
+}
+.site-nav .gh-btn:hover { border-color: var(--cyan); color: var(--cyan); background: rgba(0,224,255,0.04); }
+.site-nav .ver-chip {
+  font-size: 10px; color: var(--text-low);
+  padding: 3px 8px;
+  border: 1px solid var(--line-dim); border-radius: 999px;
+}
 
-/* ---------- HERO ---------- */
-.hero {
-  padding: 70px 0 60px;
-  text-align: center;
+/* ============================================
+   HERO
+   ============================================ */
+.hero { padding: 70px 0 80px; text-align: center; position: relative; }
+
+.hero-orb {
+  width: 260px; height: 260px;
+  margin: 0 auto 36px;
   position: relative;
 }
-.hero-logo {
-  width: 200px;
-  height: 200px;
-  margin: 0 auto 28px;
-  display: block;
-  position: relative;
+.hero-orb canvas {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  filter: drop-shadow(0 0 30px rgba(0, 224, 255, 0.45)) drop-shadow(0 0 60px rgba(183, 148, 244, 0.25));
 }
-.hero-logo svg { width: 100%; height: 100%; display: block; }
+.hero-orb .listen-chip {
+  position: absolute;
+  bottom: -12px; left: 50%; transform: translateX(-50%);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; letter-spacing: 0.25em; text-transform: uppercase;
+  color: var(--text-mid);
+  padding: 6px 14px;
+  background: rgba(5, 7, 11, 0.85);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  display: inline-flex; align-items: center; gap: 8px;
+  white-space: nowrap;
+}
+.listen-chip .dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+  animation: pulse-dot 1.6s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.4; transform: scale(0.9); }
+  50%      { opacity: 1;   transform: scale(1.2); }
+}
 
-/* sound-wave rings: outward pulse */
-.hero-logo .ring-pulse {
-  transform-origin: 100px 100px;
-  animation: ring-pulse 3.2s ease-out infinite;
-  opacity: 0;
+.eyebrow {
+  display: inline-flex; align-items: center; gap: 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase;
+  color: var(--text-mid);
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(11, 15, 23, 0.6);
+  margin-bottom: 28px;
 }
-.hero-logo .ring-pulse.d1 { animation-delay: 0s; }
-.hero-logo .ring-pulse.d2 { animation-delay: 1.06s; }
-.hero-logo .ring-pulse.d3 { animation-delay: 2.13s; }
-@keyframes ring-pulse {
-  0%   { transform: scale(0.55); opacity: 0; }
-  15%  { opacity: 0.7; }
-  100% { transform: scale(1.5); opacity: 0; }
-}
-.hero-logo .halo-ring { animation: halo-glow 4s ease-in-out infinite; }
-@keyframes halo-glow {
-  0%, 100% { opacity: 0.85; filter: drop-shadow(0 0 6px rgba(0,212,255,0.35)); }
-  50%      { opacity: 1;    filter: drop-shadow(0 0 16px rgba(0,212,255,0.65)); }
-}
-.hero-logo .core {
-  animation: core-pulse 2.4s ease-in-out infinite;
-  transform-origin: 100px 100px;
-}
-@keyframes core-pulse {
-  0%, 100% { transform: scale(0.92); opacity: 0.85; }
-  50%      { transform: scale(1.08); opacity: 1; }
+.eyebrow .ver-pulse {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--cyan);
+  box-shadow: 0 0 8px var(--cyan);
+  animation: pulse-dot 2s ease-in-out infinite;
 }
 
 .hero h1 {
-  font-family: var(--font-ui);
-  font-weight: 600;
-  font-size: clamp(36px, 6vw, 60px);
-  line-height: 1.05;
-  letter-spacing: -0.02em;
-  margin: 0 0 18px;
+  font-family: 'Inter', sans-serif;
+  font-weight: 700;
+  font-size: clamp(40px, 7vw, 80px);
+  line-height: 1.02;
+  letter-spacing: -0.035em;
+  margin: 0 0 24px;
   color: var(--text);
 }
-.hero h1 .accent {
-  background: linear-gradient(135deg, var(--accent), var(--purple));
+.hero h1 .grad {
+  background: var(--grad-1);
+  background-size: 200% auto;
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
+  animation: grad-shift 8s linear infinite;
+}
+@keyframes grad-shift {
+  0%   { background-position: 0% 50%; }
+  100% { background-position: 200% 50%; }
 }
 .hero .tagline {
-  font-size: clamp(15px, 2vw, 19px);
-  color: var(--text-dim);
-  max-width: 640px;
-  margin: 0 auto 36px;
+  font-size: clamp(16px, 1.6vw, 20px);
+  color: var(--text-mid);
+  max-width: 680px;
+  margin: 0 auto 40px;
+  line-height: 1.55;
 }
-.hero .tagline code { font-family: var(--font-mono); color: var(--accent); font-size: 0.92em; }
-.hero .cta {
-  display: inline-flex;
-  gap: 12px;
-  font-family: var(--font-mono);
-  font-size: 13px;
-  letter-spacing: 0.05em;
-}
-.cta a {
-  padding: 12px 22px;
-  border-radius: 6px;
+.hero .tagline code { color: var(--cyan); font-size: 0.92em; padding: 1px 6px;
+  background: rgba(0,224,255,0.08); border-radius: 4px; }
+
+.cta { display: inline-flex; gap: 14px; flex-wrap: wrap; justify-content: center; }
+.btn {
+  display: inline-flex; align-items: center; gap: 10px;
+  padding: 14px 26px;
+  border-radius: 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px; letter-spacing: 0.04em; font-weight: 500;
   text-decoration: none;
-  font-weight: 500;
-  transition: transform .15s, background .15s, border-color .15s, color .15s;
+  transition: all .2s;
+  cursor: pointer;
+  border: none;
 }
-.cta a:hover { transform: translateY(-1px); }
-.cta .primary {
-  background: var(--accent);
-  color: var(--bg-0);
-  box-shadow: 0 0 24px rgba(0, 212, 255, 0.25);
+.btn-primary {
+  background: var(--grad-2);
+  color: #05070b;
+  box-shadow: 0 0 0 1px rgba(0,224,255,0.5), 0 10px 40px -10px rgba(0,224,255,0.7);
+  font-weight: 600;
 }
-.cta .primary:hover { background: #4ce0ff; }
-.cta .secondary {
-  background: transparent;
+.btn-primary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 0 0 1px rgba(0,224,255,0.7), 0 18px 50px -10px rgba(0,224,255,0.85);
+}
+.btn-ghost {
+  background: rgba(11, 15, 23, 0.7);
   color: var(--text);
   border: 1px solid var(--line);
 }
-.cta .secondary:hover { border-color: var(--accent); color: var(--accent); }
+.btn-ghost:hover { border-color: var(--cyan); color: var(--cyan); transform: translateY(-2px); }
 
-.hero .badges {
-  margin-top: 28px;
-  display: inline-flex;
-  gap: 18px;
+.hero-stats {
+  display: flex; justify-content: center; gap: 40px;
+  margin-top: 60px;
   flex-wrap: wrap;
-  justify-content: center;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.12em;
-  color: var(--text-faint);
-  text-transform: uppercase;
 }
-.hero .badges span::before { content: "•  "; color: var(--accent); }
+.stat {
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+}
+.stat .num { font-size: 24px; font-weight: 600; color: var(--text);
+  background: var(--grad-2); -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent; }
+.stat .lbl { font-size: 10px; color: var(--text-dim); letter-spacing: 0.18em;
+  text-transform: uppercase; margin-top: 4px; }
 
-/* ---------- DEMO TRANSCRIPT ---------- */
-.demo {
-  background: var(--bg-1);
-  border: 1px solid var(--line-soft);
-  border-radius: 10px;
+/* ============================================
+   TERMINAL DEMO
+   ============================================ */
+.demo-section { padding: 60px 0; }
+.section-eyebrow {
+  display: flex; align-items: center; gap: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; letter-spacing: 0.3em; text-transform: uppercase;
+  color: var(--text-dim);
+  margin: 0 0 16px;
+}
+.section-eyebrow::before, .section-eyebrow::after {
+  content: ""; height: 1px; background: var(--line-dim); flex: 1;
+}
+.section-eyebrow.left::before { display: none; }
+.section-eyebrow.left { justify-content: flex-start; }
+.section-title {
+  font-family: 'Inter', sans-serif;
+  font-size: clamp(28px, 4vw, 42px);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 1.1;
+  margin: 0 0 14px;
+  color: var(--text);
+}
+.section-title .grad {
+  background: var(--grad-1);
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.section-sub {
+  font-size: 16px; color: var(--text-mid); max-width: 640px;
+  margin: 0 0 32px;
+}
+
+.terminal {
+  background: linear-gradient(180deg, #0a0e16 0%, #07090f 100%);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow:
+    0 0 0 1px rgba(0,224,255,0.06),
+    0 30px 80px -20px rgba(0,0,0,0.7),
+    0 0 60px -20px rgba(0,224,255,0.25);
+}
+.term-bar {
+  display: flex; align-items: center;
+  padding: 12px 16px;
+  background: rgba(0,0,0,0.3);
+  border-bottom: 1px solid var(--line-dim);
+}
+.term-dots { display: flex; gap: 7px; }
+.term-dots span { width: 11px; height: 11px; border-radius: 50%; }
+.term-dots .r { background: #ff5f57; }
+.term-dots .y { background: #febc2e; }
+.term-dots .g { background: #28c840; }
+.term-title { flex: 1; text-align: center; font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; color: var(--text-dim); letter-spacing: 0.06em; }
+.term-mic {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; color: var(--green); letter-spacing: 0.1em; text-transform: uppercase;
+}
+.term-mic::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--green); box-shadow: 0 0 6px var(--green);
+  animation: pulse-dot 1.6s ease-in-out infinite;
+}
+.term-body {
   padding: 24px 28px;
-  font-family: var(--font-mono);
-  font-size: 13px;
-  line-height: 1.7;
-  margin: 28px 0 60px;
-  position: relative;
-  box-shadow: 0 30px 60px -30px rgba(0, 0, 0, 0.6);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13.5px;
+  line-height: 1.85;
+  min-height: 460px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
-.demo::before {
-  content: "live conversation";
-  position: absolute;
-  top: -10px; left: 18px;
-  background: var(--bg-0);
-  color: var(--text-faint);
-  font-size: 10px;
-  letter-spacing: 0.2em;
-  padding: 0 8px;
-  text-transform: uppercase;
+.term-body .you   { color: var(--text); }
+.term-body .halo  { color: var(--cyan); }
+.term-body .note  { color: var(--text-low); font-style: italic; }
+.term-body .lead-you   { color: var(--magenta); font-weight: 500; }
+.term-body .lead-halo  { color: var(--cyan); font-weight: 500; }
+.term-body .lead-note  { color: var(--text-low); }
+.term-cursor {
+  display: inline-block;
+  width: 8px; height: 16px;
+  background: var(--cyan);
+  vertical-align: text-bottom;
+  margin-left: 2px;
+  animation: blink 1s steps(2) infinite;
 }
-.demo .you   { color: var(--text); }
-.demo .halo  { color: var(--accent); }
-.demo .note  { color: var(--text-faint); font-style: italic; padding-left: 8px; }
-.demo .lead  { color: var(--text-dim); margin-right: 6px; }
+@keyframes blink { 50% { opacity: 0; } }
 
-/* ---------- PIPELINE ---------- */
-.pipeline-section { padding: 40px 0 20px; }
-.pipeline-section h2,
-.stack h2,
-.install h2 {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.3em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-  margin: 0 0 18px;
-}
+/* ============================================
+   PIPELINE
+   ============================================ */
+.pipeline-section { padding: 80px 0 60px; }
 .pipeline {
   display: grid;
   grid-template-columns: repeat(6, 1fr);
-  gap: 8px;
+  gap: 0;
+  position: relative;
+  padding: 8px 0;
+}
+.pipeline::before {
+  content: ""; position: absolute;
+  top: 50%; left: 5%; right: 5%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--cyan-dim), var(--cyan-dim), transparent);
+  opacity: 0.4;
+  z-index: 0;
+}
+.pipeline-flow {
+  position: absolute; top: 50%; left: 5%; right: 5%;
+  height: 2px;
+  z-index: 1;
+  pointer-events: none;
+  overflow: hidden;
+}
+.pipeline-flow .pulse {
+  position: absolute; top: -2px; left: 0;
+  width: 60px; height: 6px;
+  background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+  border-radius: 999px;
+  filter: blur(1px);
+  animation: flow 4s linear infinite;
+}
+.pipeline-flow .pulse:nth-child(2) { animation-delay: 1.3s; }
+.pipeline-flow .pulse:nth-child(3) { animation-delay: 2.6s; }
+@keyframes flow {
+  0%   { transform: translateX(-60px); opacity: 0; }
+  10%  { opacity: 1; }
+  90%  { opacity: 1; }
+  100% { transform: translateX(calc(100vw + 60px)); opacity: 0; }
 }
 .stage {
-  background: var(--bg-1);
-  border: 1px solid var(--line-soft);
-  border-radius: 6px;
-  padding: 14px 12px;
+  position: relative; z-index: 2;
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 18px 12px;
   text-align: center;
-  transition: border-color .15s, transform .15s;
+  margin: 0 6px;
+  transition: all .2s;
 }
-.stage:hover { border-color: var(--accent-dim); transform: translateY(-2px); }
+.stage:hover {
+  border-color: var(--cyan);
+  transform: translateY(-3px);
+  box-shadow: 0 10px 30px -10px rgba(0,224,255,0.4);
+}
+.stage .icon {
+  width: 32px; height: 32px;
+  margin: 0 auto 10px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(0,224,255,0.15), rgba(183,148,244,0.15));
+  border: 1px solid rgba(0,224,255,0.2);
+}
+.stage .icon svg { width: 16px; height: 16px; }
 .stage .label {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase;
+  color: var(--cyan);
 }
 .stage .what {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-dim);
-  margin-top: 6px;
-  line-height: 1.35;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10.5px; color: var(--text-dim);
+  margin-top: 6px; line-height: 1.4;
 }
 
-/* ---------- FEATURES ---------- */
+/* ============================================
+   FEATURES
+   ============================================ */
+.features-section { padding: 80px 0; }
 .features {
-  padding: 60px 0;
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 22px;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 18px;
 }
 .feat {
-  background: var(--bg-1);
-  border: 1px solid var(--line-soft);
-  border-radius: 10px;
-  padding: 24px 26px;
-  transition: border-color .15s, transform .15s;
+  position: relative;
+  background: linear-gradient(180deg, rgba(11,15,23,0.9), rgba(7,9,15,0.9));
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 28px 28px;
+  overflow: hidden;
+  transition: transform .25s, border-color .25s;
 }
-.feat:hover { border-color: var(--accent-dim); transform: translateY(-2px); }
-.feat h3 {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--accent);
-  margin: 0 0 10px;
+.feat::before {
+  content: ""; position: absolute; inset: 0;
+  background: radial-gradient(circle at 0% 0%, rgba(0,224,255,0.08), transparent 50%);
+  opacity: 0; transition: opacity .25s;
+  pointer-events: none;
 }
-.feat p { color: var(--text-dim); margin: 0; font-size: 14px; }
-.feat p code { font-family: var(--font-mono); font-size: 12px; color: var(--text); background: var(--bg-2); padding: 1px 5px; border-radius: 3px; }
+.feat:hover {
+  transform: translateY(-4px);
+  border-color: rgba(0,224,255,0.4);
+}
+.feat:hover::before { opacity: 1; }
+.feat-head {
+  display: flex; align-items: center; gap: 12px;
+  margin-bottom: 14px;
+}
+.feat-icon {
+  width: 36px; height: 36px;
+  flex-shrink: 0;
+  border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(135deg, rgba(0,224,255,0.18), rgba(183,148,244,0.18));
+  border: 1px solid rgba(0,224,255,0.25);
+}
+.feat-icon svg { width: 18px; height: 18px; }
+.feat-head h3 {
+  font-family: 'Inter', sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  margin: 0;
+}
+.feat p {
+  color: var(--text-mid);
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.6;
+}
+.feat p code {
+  font-size: 12px; color: var(--cyan);
+  background: rgba(0,224,255,0.08);
+  padding: 1px 6px; border-radius: 4px;
+}
 
-/* ---------- STACK TABLE ---------- */
-.stack { padding: 40px 0 60px; }
+/* ============================================
+   STACK
+   ============================================ */
+.stack-section { padding: 80px 0; }
 .stack-table {
   width: 100%;
   border-collapse: collapse;
-  background: var(--bg-1);
-  border: 1px solid var(--line-soft);
-  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(11,15,23,0.6), rgba(7,9,15,0.6));
+  border: 1px solid var(--line);
+  border-radius: 14px;
   overflow: hidden;
   font-size: 14px;
 }
 .stack-table th, .stack-table td {
   text-align: left;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--line-soft);
+  padding: 16px 22px;
+  border-bottom: 1px solid var(--line-dim);
 }
-.stack-table th {
-  font-family: var(--font-mono);
+.stack-table thead th {
+  font-family: 'JetBrains Mono', monospace;
   font-size: 10px;
-  letter-spacing: 0.18em;
+  letter-spacing: 0.2em;
   text-transform: uppercase;
-  color: var(--text-faint);
+  color: var(--text-low);
   font-weight: 400;
-  background: var(--bg-2);
+  background: rgba(0,0,0,0.25);
 }
+.stack-table tbody tr:last-child td { border-bottom: none; }
+.stack-table tbody tr { transition: background .15s; }
+.stack-table tbody tr:hover { background: rgba(0,224,255,0.025); }
 .stack-table td:first-child {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--cyan);
   white-space: nowrap;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
-.stack-table tr:last-child td { border-bottom: none; }
-.stack-table code { font-family: var(--font-mono); font-size: 12px; color: var(--text); background: var(--bg-2); padding: 1px 5px; border-radius: 3px; }
+.stack-table td a { color: var(--text); border-bottom: 1px dotted var(--text-low); }
+.stack-table td a:hover { color: var(--cyan); border-bottom-color: var(--cyan); }
+.stack-table code { font-family: 'JetBrains Mono', monospace; font-size: 12px;
+  color: var(--purple); background: rgba(183,148,244,0.1);
+  padding: 1px 6px; border-radius: 4px; }
+.stack-table td:last-child { color: var(--text-mid); font-size: 13px; }
 
-/* ---------- INSTALL ---------- */
-.install { padding: 40px 0 60px; }
-.install pre {
-  background: var(--bg-1);
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  padding: 18px 22px;
-  font-family: var(--font-mono);
+/* ============================================
+   INSTALL
+   ============================================ */
+.install-section { padding: 80px 0 60px; }
+.install-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 32px;
+  align-items: start;
+}
+.install-pre {
+  background: linear-gradient(180deg, #0a0e16, #07090f);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 22px 26px;
+  font-family: 'JetBrains Mono', monospace;
   font-size: 13px;
-  line-height: 1.7;
+  line-height: 1.85;
   color: var(--text);
   overflow-x: auto;
   margin: 0;
+  box-shadow: 0 30px 60px -20px rgba(0,0,0,0.5);
 }
-.install pre .c { color: var(--text-faint); }
-.install pre .v { color: var(--accent); }
-
-/* ---------- FOOTER ---------- */
-.site-ftr {
-  border-top: 1px solid var(--line-soft);
-  padding: 28px 0 40px;
-  margin-top: 60px;
-  font-family: var(--font-mono);
+.install-pre .c { color: var(--text-low); }
+.install-pre .v { color: var(--cyan); }
+.install-pre .p { color: var(--magenta); }
+.install-steps { display: flex; flex-direction: column; gap: 18px; }
+.istep {
+  display: flex; gap: 14px; align-items: flex-start;
+}
+.istep-num {
+  flex-shrink: 0;
+  width: 28px; height: 28px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(135deg, var(--cyan), var(--purple));
+  color: var(--bg-void);
+  font-family: 'JetBrains Mono', monospace;
   font-size: 12px;
-  color: var(--text-faint);
-  display: flex;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 12px;
+  font-weight: 700;
 }
-.site-ftr a { color: var(--text-dim); }
-.site-ftr a:hover { color: var(--accent); }
+.istep-body h4 {
+  margin: 4px 0 4px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.istep-body p { margin: 0; color: var(--text-mid); font-size: 14px; }
 
-@media (max-width: 720px) {
-  .features { grid-template-columns: 1fr; }
+.note-row {
+  margin-top: 24px;
+  padding: 18px 22px;
+  border-radius: 10px;
+  background: rgba(0,224,255,0.04);
+  border: 1px solid rgba(0,224,255,0.15);
+  font-size: 13px;
+  color: var(--text-mid);
+}
+.note-row strong { color: var(--text); }
+
+/* ============================================
+   QUICKSTART / DEMO COMMANDS
+   ============================================ */
+.cmd-section { padding: 80px 0 40px; }
+.cmd-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+}
+.cmd {
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 18px 20px;
+  transition: all .2s;
+}
+.cmd:hover { border-color: var(--cyan); transform: translateY(-2px); }
+.cmd .quote {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+.cmd .quote::before { content: "\201C"; color: var(--cyan); margin-right: 2px; }
+.cmd .quote::after  { content: "\201D"; color: var(--cyan); margin-left: 2px; }
+.cmd .what {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* ============================================
+   FOOTER
+   ============================================ */
+.site-ftr {
+  border-top: 1px solid var(--line-dim);
+  padding: 40px 0 60px;
+  margin-top: 80px;
+  background: rgba(0,0,0,0.3);
+}
+.ftr-inner {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr 1fr;
+  gap: 40px;
+}
+.ftr-col h5 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase;
+  color: var(--text-low);
+  margin: 0 0 14px;
+  font-weight: 400;
+}
+.ftr-col a { display: block; color: var(--text-mid); font-size: 13px;
+  padding: 4px 0; }
+.ftr-col a:hover { color: var(--cyan); }
+.ftr-brand { color: var(--text-mid); font-size: 13px; line-height: 1.6;
+  margin-top: 14px; max-width: 280px; }
+.ftr-bottom {
+  margin-top: 40px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line-dim);
+  display: flex; justify-content: space-between; align-items: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; color: var(--text-low); letter-spacing: 0.06em;
+  flex-wrap: wrap; gap: 12px;
+}
+
+/* ============================================
+   RESPONSIVE
+   ============================================ */
+@media (max-width: 880px) {
   .pipeline { grid-template-columns: repeat(3, 1fr); }
-  .site-nav { gap: 14px; font-size: 11px; }
-  .hero-logo { width: 150px; height: 150px; margin-bottom: 20px; }
-  .hero { padding: 40px 0 50px; }
+  .pipeline::before { display: none; }
+  .features { grid-template-columns: 1fr; }
+  .install-grid { grid-template-columns: 1fr; }
+  .cmd-grid { grid-template-columns: 1fr; }
+  .ftr-inner { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 560px) {
+  .site-nav { gap: 14px; }
+  .site-nav .nav-link { display: none; }
+  .hero-orb { width: 200px; height: 200px; }
+  .hero-stats { gap: 24px; }
+  .term-body { font-size: 12px; padding: 18px 18px; }
+  .ftr-inner { grid-template-columns: 1fr; }
+  .ftr-bottom { flex-direction: column; align-items: flex-start; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+  .bg-fx .nebula { animation: none; }
 }
 </style>
 </head>
 <body>
 
-<header class="site-hdr wrap">
-  <div class="brand">
-    <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
-      <defs>
-        <linearGradient id="hdr-ring" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0%" stop-color="#00d4ff"/>
-          <stop offset="100%" stop-color="#b794f4"/>
-        </linearGradient>
-      </defs>
-      <circle cx="16" cy="16" r="13" fill="none" stroke="url(#hdr-ring)" stroke-width="2.4"/>
-      <circle cx="16" cy="16" r="4" fill="#00d4ff"/>
-    </svg>
-    HALO
-  </div>
-  <nav class="site-nav">
-    <a href="#features">features</a>
-    <a href="#stack">stack</a>
-    <a href="#install">install</a>
-    <a href="https://github.com/VW3st/halo">github</a>
-    <span class="ver">v1.1</span>
-  </nav>
-</header>
+<div class="bg-fx" aria-hidden="true">
+  <div class="grid"></div>
+  <div class="nebula n1"></div>
+  <div class="nebula n2"></div>
+  <div class="nebula n3"></div>
+  <div class="scanlines"></div>
+</div>
 
-<main class="wrap">
-
-  <section class="hero">
-    <div class="hero-logo" aria-hidden="true">
-      <svg viewBox="0 0 200 200">
+<header class="site-hdr">
+  <div class="wrap hdr-inner">
+    <a href="#" class="brand">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
         <defs>
-          <linearGradient id="halo-grad" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stop-color="#00d4ff"/>
+          <linearGradient id="hdr-ring" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#00e0ff"/>
             <stop offset="100%" stop-color="#b794f4"/>
           </linearGradient>
-          <radialGradient id="core-grad" cx=".5" cy=".5" r=".5">
-            <stop offset="0%" stop-color="#ffffff"/>
-            <stop offset="40%" stop-color="#00d4ff"/>
-            <stop offset="100%" stop-color="#007999"/>
-          </radialGradient>
         </defs>
-        <!-- outgoing soundwave rings -->
-        <circle class="ring-pulse d1" cx="100" cy="100" r="50" fill="none" stroke="#00d4ff" stroke-width="1.5"/>
-        <circle class="ring-pulse d2" cx="100" cy="100" r="50" fill="none" stroke="#00d4ff" stroke-width="1.5"/>
-        <circle class="ring-pulse d3" cx="100" cy="100" r="50" fill="none" stroke="#00d4ff" stroke-width="1.5"/>
-        <!-- the halo ring -->
-        <circle class="halo-ring" cx="100" cy="100" r="62" fill="none" stroke="url(#halo-grad)" stroke-width="3"/>
-        <circle class="halo-ring" cx="100" cy="100" r="62" fill="none" stroke="url(#halo-grad)" stroke-width="1" opacity="0.4" transform="rotate(0 100 100) scale(1.08)" transform-origin="100 100"/>
-        <!-- inner mic / orb -->
-        <circle class="core" cx="100" cy="100" r="22" fill="url(#core-grad)"/>
-        <!-- mic slot -->
-        <rect x="96" y="90" width="8" height="20" rx="4" fill="#07090c" opacity="0.65"/>
+        <circle cx="16" cy="16" r="13" fill="none" stroke="url(#hdr-ring)" stroke-width="2.5"/>
+        <circle cx="16" cy="16" r="4" fill="#00e0ff"/>
       </svg>
+      HALO
+    </a>
+    <nav class="site-nav">
+      <a class="nav-link" href="#demo">demo</a>
+      <a class="nav-link" href="#features">features</a>
+      <a class="nav-link" href="#stack">stack</a>
+      <a class="nav-link" href="#install">install</a>
+      <span class="ver-chip">v1.1</span>
+      <a class="gh-btn" href="https://github.com/VW3st/halo" target="_blank" rel="noopener">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.28-.01-1.01-.02-1.99-3.2.69-3.88-1.54-3.88-1.54-.52-1.33-1.27-1.68-1.27-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.18-3.1-.12-.29-.51-1.46.11-3.04 0 0 .97-.31 3.18 1.18.92-.26 1.91-.39 2.9-.39.98 0 1.97.13 2.9.39 2.2-1.49 3.17-1.18 3.17-1.18.63 1.58.24 2.75.12 3.04.73.81 1.18 1.84 1.18 3.1 0 4.42-2.7 5.4-5.26 5.69.41.36.78 1.06.78 2.14 0 1.55-.01 2.79-.01 3.17 0 .31.21.68.8.56C20.22 21.38 23.5 17.08 23.5 12 23.5 5.65 18.35.5 12 .5z"/></svg>
+        github
+      </a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+  <!-- ============================================
+       HERO
+       ============================================ -->
+  <section class="hero wrap">
+    <div class="hero-orb" aria-hidden="true">
+      <canvas id="orb" width="520" height="520"></canvas>
+      <div class="listen-chip"><span class="dot"></span>listening for "halo"</div>
     </div>
-    <h1>Talk to <span class="accent">Claude Code</span><br/>or <span class="accent">Codex CLI</span> by voice.</h1>
+
+    <div class="eyebrow"><span class="ver-pulse"></span>v1.1.0 — custom halo wake word</div>
+
+    <h1>Talk to <span class="grad">Claude Code</span><br/>
+        or <span class="grad">Codex CLI</span> by voice.</h1>
+
     <p class="tagline">
-      Custom <code>"halo"</code> wake word.
-      One long-lived agent process per session.
-      Live dashboard at <code>localhost:7070</code>.
-      100% local — no API keys to run Halo itself.
+      A local voice frontend for agentic coding tools. Custom <code>"halo"</code> wake word,
+      one long-lived agent process per session, watch-Claude popup, live dashboard at
+      <code>localhost:7070</code>. No API keys to run Halo itself.
     </p>
+
     <div class="cta">
-      <a class="primary" href="#install">install</a>
-      <a class="secondary" href="https://github.com/VW3st/halo">github →</a>
+      <a class="btn btn-primary" href="#install">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 3v12M6 9l6 6 6-6M3 21h18"/></svg>
+        install halo
+      </a>
+      <a class="btn btn-ghost" href="#demo">see it work →</a>
     </div>
-    <div class="badges">
-      <span>v1.1.0</span>
-      <span>MIT</span>
-      <span>Windows / Mac / Linux</span>
-      <span>Python 3.11+</span>
+
+    <div class="hero-stats">
+      <div class="stat"><div class="num">~500ms</div><div class="lbl">stt latency</div></div>
+      <div class="stat"><div class="num">100%</div><div class="lbl">local</div></div>
+      <div class="stat"><div class="num">2</div><div class="lbl">agents supported</div></div>
+      <div class="stat"><div class="num">8</div><div class="lbl">voice commands</div></div>
+      <div class="stat"><div class="num">MIT</div><div class="lbl">license</div></div>
     </div>
   </section>
 
-  <section class="demo">
-    <div><span class="lead">you  →</span> <span class="you">"halo. Claude, write a one-line python script that prints hello."</span></div>
-    <div><span class="lead">halo →</span> <span class="halo">"On it. I'm calling this session Mercury."</span></div>
-    <div class="note">a separate PowerShell window opens, live-tailing Claude's text deltas + tool calls</div>
-    <div><span class="lead">halo →</span> <span class="halo">"I wrote it to hello dot py."</span></div>
-    <div>&nbsp;</div>
-    <div><span class="lead">you  →</span> <span class="you">"now make it print goodbye instead."</span></div>
-    <div class="note">same Mercury session (persistent process — no spawn cost, no `exit None`)</div>
-    <div><span class="lead">halo →</span> <span class="halo">"Done."</span></div>
-    <div>&nbsp;</div>
-    <div><span class="lead">you  →</span> <span class="you">"ask Codex to refactor it into a function."</span></div>
-    <div class="note">verbal dispatch regex matches "ask Codex to" → skips Stage 2 LLM</div>
-    <div><span class="lead">halo →</span> <span class="halo">"On it. I'm calling this session Neptune."</span></div>
-    <div>&nbsp;</div>
-    <div><span class="lead">you  →</span> <span class="you">"back to halo. open hello.py."</span></div>
-    <div><span class="lead">halo →</span> <span class="halo">"Opened hello.py."</span></div>
-    <div>&nbsp;</div>
-    <div><span class="lead">you  →</span> <span class="you">"end session."</span></div>
-    <div><span class="lead">halo →</span> <span class="halo">"Goodbye."</span></div>
+  <!-- ============================================
+       TERMINAL DEMO
+       ============================================ -->
+  <section id="demo" class="demo-section wrap-narrow">
+    <h2 class="section-eyebrow"><span>live transcript</span></h2>
+    <h3 class="section-title">A real <span class="grad">voice → agent</span> turn, in your terminal.</h3>
+    <p class="section-sub">
+      Halo wakes on your custom word, transcribes locally with distil-whisper, routes via regex first
+      (LLM only as fallback), and streams the agent's response back through Kokoro TTS while a separate
+      window tails the raw CLI output.
+    </p>
+
+    <div class="terminal">
+      <div class="term-bar">
+        <div class="term-dots"><span class="r"></span><span class="y"></span><span class="g"></span></div>
+        <div class="term-title">halo — voice frontend</div>
+        <div class="term-mic">mic live</div>
+      </div>
+      <div class="term-body" id="term-body"></div>
+    </div>
   </section>
 
-  <section class="pipeline-section">
-    <h2>pipeline</h2>
+  <!-- ============================================
+       PIPELINE
+       ============================================ -->
+  <section class="pipeline-section wrap">
+    <h2 class="section-eyebrow"><span>signal pipeline</span></h2>
+    <h3 class="section-title" style="text-align:center;">From mic to <span class="grad">Claude</span> in under a second.</h3>
+    <p class="section-sub" style="margin: 0 auto 40px; text-align:center;">
+      Six stages, each replaceable, each measurable. Everything runs on your machine.
+    </p>
     <div class="pipeline">
-      <div class="stage"><div class="label">wake</div><div class="what">openWakeWord<br/>halo.onnx</div></div>
-      <div class="stage"><div class="label">record</div><div class="what">sounddevice<br/>silero-VAD</div></div>
-      <div class="stage"><div class="label">transcribe</div><div class="what">faster-whisper<br/>distil-large-v3</div></div>
-      <div class="stage"><div class="label">route</div><div class="what">regex first<br/>Ollama fallback</div></div>
-      <div class="stage"><div class="label">agent</div><div class="what">Claude Code<br/>Codex CLI</div></div>
-      <div class="stage"><div class="label">voice</div><div class="what">Kokoro-82M<br/>af_heart</div></div>
+      <div class="pipeline-flow"><div class="pulse"></div><div class="pulse"></div><div class="pulse"></div></div>
+      <div class="stage">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><path d="M3 12h2M19 12h2M12 3v2M12 19v2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4l1.4-1.4M17 7l1.4-1.4"/><circle cx="12" cy="12" r="3"/></svg></div>
+        <div class="label">wake</div><div class="what">openWakeWord<br/>halo.onnx</div>
+      </div>
+      <div class="stage">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M8 21h8"/></svg></div>
+        <div class="label">record</div><div class="what">sounddevice<br/>silero-VAD</div>
+      </div>
+      <div class="stage">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><path d="M3 12h2l2-6 4 12 2-8 3 6h5"/></svg></div>
+        <div class="label">transcribe</div><div class="what">faster-whisper<br/>distil-large-v3</div>
+      </div>
+      <div class="stage">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M6 9v3a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V9"/></svg></div>
+        <div class="label">route</div><div class="what">regex first<br/>Ollama fallback</div>
+      </div>
+      <div class="stage">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div>
+        <div class="label">agent</div><div class="what">Claude Code<br/>Codex CLI</div>
+      </div>
+      <div class="stage">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></div>
+        <div class="label">voice</div><div class="what">Kokoro-82M<br/>af_heart</div>
+      </div>
     </div>
   </section>
 
-  <section id="features" class="features">
-    <div class="feat">
-      <h3>custom "halo" wake word</h3>
-      <p>Single-word wake trained on 188 ElevenLabs voice samples + 524 negatives. F1 = 0.80. Ships in the repo — no training step on first install. silero-VAD gate (<code>vad_threshold=0.7</code>) on top of the DNN kills false fires on room noise. Falls back to <code>hey_jarvis</code> if the file is missing.</p>
-    </div>
-    <div class="feat">
-      <h3>persistent Claude session</h3>
-      <p>One long-lived <code>claude -p --input-format stream-json</code> process per session, reused across every turn. No more per-turn subprocess spawn, no more <code>exit None</code> race condition. Each follow-up speaks the same session ID (<code>Mercury</code>, <code>Neptune</code>...).</p>
-    </div>
-    <div class="feat">
-      <h3>watch-Claude popup</h3>
-      <p>A separate PowerShell window opens per session, live-tailing <code>~/.halo/runtime/&lt;agent&gt;.log</code>. Text deltas, tool calls, result events all stream there so Halo's main terminal stays clean. Toggle with <code>AGENT_CLI_VISIBLE</code>.</p>
-    </div>
-    <div class="feat">
-      <h3>noise suppression pipeline</h3>
-      <p>Three layers: mic RMS noise gate, silero-VAD gate on the wake DNN, faster-whisper internal <code>vad_filter=True</code>. Plus a residual hallucination filter for distil-whisper's <em>"Thank you"</em> / <em>"hello"</em> artifacts on silence. Plus mic-mute during Halo's own TTS — no feedback loop.</p>
-    </div>
-    <div class="feat">
-      <h3>fuzzy fallback dispatcher</h3>
-      <p>When the router LLM is unreachable AND your transcript mentions an agent name (even a Whisper-mangled <em>"Cloud"</em> for <em>"Claude"</em>), Halo dispatches to that agent directly instead of giving up. <code>AgentConfig.fuzzy_triggers</code> is per-agent and extensible.</p>
-    </div>
-    <div class="feat">
-      <h3>live dashboard</h3>
-      <p>Auto-opens at <code>http://127.0.0.1:7070</code> on startup. Pipeline visualization, live transcript, session panel with green/yellow/red agent connection chips, recent files (click to open), reset/clear controls, event log polled at 4 Hz.</p>
-    </div>
-    <div class="feat">
-      <h3>voice-mode permissions</h3>
-      <p>Claude runs with <code>--permission-mode bypassPermissions</code>; Codex with <code>-c approval_policy="never"</code>. You can't click "approve" by voice, so both agents are pre-configured to never prompt. Verified against official Claude Code + OpenAI Codex CLI docs.</p>
-    </div>
-    <div class="feat">
-      <h3><code>halo doctor</code></h3>
-      <p>Read-only diagnostic. Probes Ollama (HTTP), each agent's <code>--version</code>, Kokoro model files. Prints <code>[ok]/[warn]/[fail]</code> per dependency with the exact install command for any miss. Run after install to verify your environment.</p>
+  <!-- ============================================
+       VOICE COMMANDS
+       ============================================ -->
+  <section class="cmd-section wrap">
+    <h2 class="section-eyebrow"><span>voice commands</span></h2>
+    <h3 class="section-title" style="text-align:center;">What you can <span class="grad">actually say</span>.</h3>
+    <p class="section-sub" style="margin: 0 auto 40px; text-align:center;">
+      Regex handles the common shapes — no LLM round-trip required.
+    </p>
+    <div class="cmd-grid">
+      <div class="cmd"><div class="quote">halo. Claude, write a fizzbuzz in Python.</div><div class="what">wake → dispatch a new Claude session</div></div>
+      <div class="cmd"><div class="quote">ask Codex to refactor it into a function.</div><div class="what">verbal dispatch → spawns new agent</div></div>
+      <div class="cmd"><div class="quote">now make it print goodbye instead.</div><div class="what">follow-up → reuses persistent session</div></div>
+      <div class="cmd"><div class="quote">transfer me to Codex.</div><div class="what">switch active session, no spawn</div></div>
+      <div class="cmd"><div class="quote">open hello.py.</div><div class="what">local file open, no agent involved</div></div>
+      <div class="cmd"><div class="quote">end session.</div><div class="what">closes the active session cleanly</div></div>
     </div>
   </section>
 
-  <section id="stack" class="stack">
-    <h2>stack</h2>
+  <!-- ============================================
+       FEATURES
+       ============================================ -->
+  <section id="features" class="features-section wrap">
+    <h2 class="section-eyebrow"><span>what's inside</span></h2>
+    <h3 class="section-title" style="text-align:center;">Built for the <span class="grad">voice loop</span>.</h3>
+    <p class="section-sub" style="margin: 0 auto 40px; text-align:center;">
+      Every layer was tuned around the specific failure modes of running a voice frontend
+      against a streaming agent CLI on a noisy desktop mic.
+    </p>
+    <div class="features">
+
+      <div class="feat">
+        <div class="feat-head">
+          <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/></svg></div>
+          <h3>Custom "halo" wake word</h3>
+        </div>
+        <p>Single-word wake trained on 188 ElevenLabs voice samples + 524 negatives. F1 = 0.80. Ships in the repo — no training step on first install. silero-VAD gate (<code>vad_threshold=0.7</code>) on top of the DNN kills false fires on room noise. Falls back to <code>hey_jarvis</code> if the file is missing.</p>
+      </div>
+
+      <div class="feat">
+        <div class="feat-head">
+          <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><path d="M4 6h16v12H4z"/><path d="M4 10h16M8 14h2M8 6V4M16 6V4"/></svg></div>
+          <h3>Persistent Claude session</h3>
+        </div>
+        <p>One long-lived <code>claude -p --input-format stream-json</code> process per session, reused across every turn. No more per-turn subprocess spawn, no more <code>exit None</code> race. Each follow-up speaks the same session ID (<code>Mercury</code>, <code>Neptune</code>...).</p>
+      </div>
+
+      <div class="feat">
+        <div class="feat-head">
+          <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><polyline points="6 9 2 12 6 15"/><polyline points="18 9 22 12 18 15"/><line x1="14" y1="4" x2="10" y2="20"/></svg></div>
+          <h3>Watch-Claude popup</h3>
+        </div>
+        <p>A separate PowerShell window opens per session, live-tailing <code>~/.halo/runtime/&lt;agent&gt;.log</code>. Text deltas, tool calls, result events all stream there so Halo's main terminal stays clean. Toggle with <code>AGENT_CLI_VISIBLE</code>.</p>
+      </div>
+
+      <div class="feat">
+        <div class="feat-head">
+          <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><path d="M3 12c1.5-3 4-3 5 0M9 12c1.5-6 4-6 5 0M15 12c1.5-3 4-3 5 0"/></svg></div>
+          <h3>Noise suppression pipeline</h3>
+        </div>
+        <p>Three layers: mic RMS noise gate, silero-VAD gate on the wake DNN, faster-whisper internal <code>vad_filter=True</code>. Plus a residual hallucination filter for distil-whisper's <em>"Thank you"</em> artifacts on silence. Plus mic-mute during Halo's own TTS — no feedback loop.</p>
+      </div>
+
+      <div class="feat">
+        <div class="feat-head">
+          <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><path d="M21 11.5a8.5 8.5 0 1 1-17 0 8.5 8.5 0 0 1 17 0z"/><polyline points="22 22 18 18"/></svg></div>
+          <h3>Fuzzy fallback dispatcher</h3>
+        </div>
+        <p>When the router LLM is unreachable AND your transcript mentions an agent name (even a Whisper-mangled <em>"Cloud"</em> for <em>"Claude"</em>), Halo dispatches to that agent directly instead of giving up. <code>AgentConfig.fuzzy_triggers</code> is per-agent and extensible.</p>
+      </div>
+
+      <div class="feat">
+        <div class="feat-head">
+          <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><rect x="3" y="4" width="18" height="14" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="22" x2="15" y2="22"/></svg></div>
+          <h3>Live dashboard</h3>
+        </div>
+        <p>Auto-opens at <code>http://127.0.0.1:7070</code> on startup. Pipeline visualization, live transcript, session panel with green/yellow/red agent connection chips, recent files (click to open), reset/clear controls, event log polled at 4 Hz.</p>
+      </div>
+
+      <div class="feat">
+        <div class="feat-head">
+          <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><path d="M9 12l2 2 4-4"/><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
+          <h3>Voice-mode permissions</h3>
+        </div>
+        <p>Claude runs with <code>--permission-mode bypassPermissions</code>; Codex with <code>-c approval_policy="never"</code>. You can't click "approve" by voice, so both agents are pre-configured to never prompt. Verified against official Claude Code + OpenAI Codex CLI docs.</p>
+      </div>
+
+      <div class="feat">
+        <div class="feat-head">
+          <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#00e0ff" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v6l4 2"/></svg></div>
+          <h3><code style="color:var(--text);background:none;padding:0">halo doctor</code></h3>
+        </div>
+        <p>Read-only diagnostic. Probes Ollama (HTTP), each agent's <code>--version</code>, Kokoro model files. Prints <code>[ok]/[warn]/[fail]</code> per dependency with the exact install command for any miss. Run after install to verify your environment.</p>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============================================
+       STACK
+       ============================================ -->
+  <section id="stack" class="stack-section wrap">
+    <h2 class="section-eyebrow"><span>open stack</span></h2>
+    <h3 class="section-title" style="text-align:center;">Every layer is <span class="grad">open source</span>.</h3>
+    <p class="section-sub" style="margin: 0 auto 40px; text-align:center;">
+      No proprietary glue. Swap any layer; the contract between them is plain stdin/stdout.
+    </p>
     <table class="stack-table">
       <thead><tr><th>layer</th><th>tech</th><th>notes</th></tr></thead>
       <tbody>
         <tr><td>wake word</td><td><a href="https://github.com/dscripka/openWakeWord">openWakeWord</a> + custom <code>halo.onnx</code></td><td>trained via <a href="https://github.com/bbarrick/wakeword_trainer">bbarrick/wakeword_trainer</a></td></tr>
         <tr><td>mic</td><td><a href="https://python-sounddevice.readthedocs.io/">sounddevice</a></td><td>16 kHz mono int16</td></tr>
         <tr><td>VAD</td><td><a href="https://github.com/snakers4/silero-vad">silero-vad v5</a></td><td>600 ms base silence, mode-adaptive</td></tr>
-        <tr><td>STT</td><td><a href="https://github.com/SYSTRAN/faster-whisper">faster-whisper</a> + distil-large-v3</td><td>int8_float16 on CUDA, ~500 ms / utterance</td></tr>
+        <tr><td>STT</td><td><a href="https://github.com/SYSTRAN/faster-whisper">faster-whisper</a> + distil-large-v3</td><td><code>int8_float16</code> on CUDA, ~500 ms / utterance</td></tr>
         <tr><td>router</td><td><a href="https://ollama.com">Ollama</a> + <code>qwen2.5:1.5b-instruct</code></td><td>regex first, LLM only as fallback</td></tr>
         <tr><td>TTS</td><td><a href="https://huggingface.co/hexgrad/Kokoro-82M">Kokoro-82M</a> ONNX (fp16)</td><td><code>af_heart</code> voice, sanitized for Markdown</td></tr>
         <tr><td>agents</td><td><a href="https://github.com/anthropics/claude-code">Claude Code</a> + <a href="https://github.com/openai/codex">Codex CLI</a></td><td>persistent sessions, voice-mode permission flags</td></tr>
@@ -536,41 +972,312 @@ a:hover { text-decoration: underline; }
     </table>
   </section>
 
-  <section id="install" class="install">
-    <h2>install</h2>
-    <pre><span class="c"># 1. clone or pip install</span>
+  <!-- ============================================
+       INSTALL
+       ============================================ -->
+  <section id="install" class="install-section wrap">
+    <h2 class="section-eyebrow"><span>get running</span></h2>
+    <h3 class="section-title" style="text-align:center;">Installed in <span class="grad">six commands</span>.</h3>
+    <p class="section-sub" style="margin: 0 auto 40px; text-align:center;">
+      Python 3.11+. NVIDIA GPU recommended (RTX 3060 is plenty); CPU paths exist.
+    </p>
+
+    <div class="install-grid">
+      <pre class="install-pre"><span class="c"># 1. install the package</span>
 pip install <span class="v">git+https://github.com/VW3st/halo.git@v1.1.0</span>
 
 <span class="c"># 2. fetch the Kokoro TTS model (~200 MB)</span>
-halo download-models
+halo <span class="p">download-models</span>
 
-<span class="c"># 3. start Ollama (if not already running)</span>
+<span class="c"># 3. start the router LLM</span>
 ollama pull <span class="v">qwen2.5:1.5b-instruct</span>
 
 <span class="c"># 4. install at least one coding agent</span>
-npm install -g <span class="v">@anthropic-ai/claude-code</span>  <span class="c"># then: claude login</span>
-npm install -g <span class="v">@openai/codex</span>             <span class="c"># then: codex login</span>
+npm install -g <span class="v">@anthropic-ai/claude-code</span>
+claude login
 
-<span class="c"># 5. verify everything's wired</span>
-halo doctor
+npm install -g <span class="v">@openai/codex</span>
+codex login
 
-<span class="c"># 6. run</span>
+<span class="c"># 5. verify your environment</span>
+halo <span class="p">doctor</span>
+
+<span class="c"># 6. go</span>
 halo</pre>
-    <p style="color: var(--text-dim); font-size: 13px; margin-top: 14px;">
-      Windows + NVIDIA GPU recommended (RTX 3060 12 GB is enough). Mac / Linux paths exist; CUDA-specific bits gracefully fall back to CPU. Python 3.11+.
-    </p>
+
+      <div class="install-steps">
+        <div class="istep">
+          <div class="istep-num">1</div>
+          <div class="istep-body"><h4>Install Halo</h4><p>Single <code>pip install</code> from GitHub. Pinned to <code>v1.1.0</code> for reproducibility.</p></div>
+        </div>
+        <div class="istep">
+          <div class="istep-num">2</div>
+          <div class="istep-body"><h4>Download Kokoro</h4><p>One-time ~200 MB TTS model fetch. Lives in <code>./models/</code>.</p></div>
+        </div>
+        <div class="istep">
+          <div class="istep-num">3</div>
+          <div class="istep-body"><h4>Start the router</h4><p>Tiny 1.5 B param Qwen model. Only invoked when regex can't resolve the intent.</p></div>
+        </div>
+        <div class="istep">
+          <div class="istep-num">4</div>
+          <div class="istep-body"><h4>Bring at least one agent</h4><p>Claude Code, Codex CLI, or both. Halo dispatches to whichever you mention.</p></div>
+        </div>
+        <div class="istep">
+          <div class="istep-num">5</div>
+          <div class="istep-body"><h4>Doctor pass</h4><p><code>halo doctor</code> probes every dependency and prints exact install commands for misses.</p></div>
+        </div>
+        <div class="istep">
+          <div class="istep-num">6</div>
+          <div class="istep-body"><h4>Say "halo"</h4><p>The dashboard auto-opens at <code>localhost:7070</code>. You're live.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="note-row">
+      <strong>Windows note:</strong> for GPU acceleration, also install
+      <code>pip install halo-voice[gpu-windows]</code> — pulls the NVIDIA cuBLAS + cuDNN wheels
+      that faster-whisper needs. On Mac / Linux, faster-whisper falls back to CPU automatically.
+    </div>
   </section>
 
 </main>
 
-<footer class="site-ftr wrap">
-  <div>halo v1.1.0 · MIT licensed · built on top of the open-source voice + agent stack</div>
-  <div>
-    <a href="https://github.com/VW3st/halo">github</a> ·
-    <a href="https://github.com/VW3st/halo/blob/main/CHANGELOG.md">changelog</a> ·
-    <a href="https://github.com/VW3st/halo/issues">issues</a>
+<footer class="site-ftr">
+  <div class="wrap ftr-inner">
+    <div class="ftr-col">
+      <a href="#" class="brand">
+        <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+          <defs><linearGradient id="ftr-ring" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#00e0ff"/><stop offset="100%" stop-color="#b794f4"/></linearGradient></defs>
+          <circle cx="16" cy="16" r="13" fill="none" stroke="url(#ftr-ring)" stroke-width="2.5"/>
+          <circle cx="16" cy="16" r="4" fill="#00e0ff"/>
+        </svg>
+        HALO
+      </a>
+      <p class="ftr-brand">Local-first voice frontend for agentic coding tools. Built on a fully open stack — no API keys to run.</p>
+    </div>
+    <div class="ftr-col">
+      <h5>project</h5>
+      <a href="https://github.com/VW3st/halo">github</a>
+      <a href="https://github.com/VW3st/halo/blob/main/CHANGELOG.md">changelog</a>
+      <a href="https://github.com/VW3st/halo/issues">issues</a>
+      <a href="https://github.com/VW3st/halo/blob/main/LICENSE">license</a>
+    </div>
+    <div class="ftr-col">
+      <h5>agents</h5>
+      <a href="https://github.com/anthropics/claude-code">Claude Code</a>
+      <a href="https://github.com/openai/codex">Codex CLI</a>
+      <a href="https://ollama.com">Ollama</a>
+    </div>
+    <div class="ftr-col">
+      <h5>stack</h5>
+      <a href="https://github.com/dscripka/openWakeWord">openWakeWord</a>
+      <a href="https://github.com/SYSTRAN/faster-whisper">faster-whisper</a>
+      <a href="https://huggingface.co/hexgrad/Kokoro-82M">Kokoro-82M</a>
+    </div>
+  </div>
+  <div class="wrap ftr-bottom">
+    <div>halo v1.1.0 · MIT licensed · made for makers who&nbsp;talk</div>
+    <div>© 2026 VW3st</div>
   </div>
 </footer>
+
+<script>
+/* ============================================
+   HERO ORB
+   Audio-reactive-looking canvas visualizer.
+   No real audio — driven by deterministic sine math.
+   ============================================ */
+(function() {
+  const c = document.getElementById('orb');
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  const W = c.width, H = c.height, CX = W/2, CY = H/2;
+  let t = 0;
+
+  function ring(radius, segments, freqs, color, lineWidth, fill) {
+    ctx.beginPath();
+    for (let i = 0; i <= segments; i++) {
+      const a = (i / segments) * Math.PI * 2;
+      let dr = 0;
+      for (const [k, amp, ph] of freqs) {
+        dr += Math.sin(a * k + t * ph) * amp;
+      }
+      const r = radius + dr;
+      const x = CX + Math.cos(a) * r;
+      const y = CY + Math.sin(a) * r;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (lineWidth) { ctx.strokeStyle = color; ctx.lineWidth = lineWidth; ctx.stroke(); }
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+
+    /* outer faint halo */
+    ctx.save();
+    const haloGrad = ctx.createRadialGradient(CX, CY, 120, CX, CY, 240);
+    haloGrad.addColorStop(0, 'rgba(0, 224, 255, 0.0)');
+    haloGrad.addColorStop(0.6, 'rgba(0, 224, 255, 0.15)');
+    haloGrad.addColorStop(1, 'rgba(183, 148, 244, 0)');
+    ctx.fillStyle = haloGrad;
+    ctx.beginPath(); ctx.arc(CX, CY, 240, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+
+    /* main halo ring — slightly warped */
+    ring(195,
+      120,
+      [[6, 4, 0.04], [11, 2.5, 0.06], [3, 3, 0.02]],
+      'rgba(0, 224, 255, 0.9)', 1.8);
+
+    /* secondary ring */
+    ring(175,
+      120,
+      [[8, 3, -0.05], [4, 4, 0.03], [13, 2, 0.08]],
+      'rgba(183, 148, 244, 0.55)', 1.2);
+
+    /* inner sharper ring */
+    ring(150,
+      120,
+      [[5, 6, 0.07], [9, 3, -0.04]],
+      'rgba(0, 224, 255, 0.4)', 1);
+
+    /* tick marks around the halo */
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0, 224, 255, 0.5)';
+    ctx.lineWidth = 1.5;
+    for (let i = 0; i < 60; i++) {
+      const a = (i / 60) * Math.PI * 2 + t * 0.005;
+      const r1 = 220, r2 = 224 + Math.sin(a*3 + t*0.02) * 3;
+      const x1 = CX + Math.cos(a) * r1, y1 = CY + Math.sin(a) * r1;
+      const x2 = CX + Math.cos(a) * r2, y2 = CY + Math.sin(a) * r2;
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    }
+    ctx.restore();
+
+    /* center waveform pillar — looks like a live audio wave */
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0, 224, 255, 0.9)';
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    const bars = 7;
+    const barW = 8, gap = 6;
+    const totalW = bars * barW + (bars - 1) * gap;
+    const startX = CX - totalW / 2 + barW/2;
+    for (let i = 0; i < bars; i++) {
+      const x = startX + i * (barW + gap);
+      const ph = i * 0.6;
+      const amp = 40 + Math.sin(t * 0.06 + ph) * 30 + Math.sin(t * 0.13 + ph * 2) * 18;
+      const h = Math.max(8, Math.abs(amp));
+      ctx.beginPath();
+      ctx.moveTo(x, CY - h);
+      ctx.lineTo(x, CY + h);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    /* core glow */
+    const coreGrad = ctx.createRadialGradient(CX, CY, 0, CX, CY, 90);
+    coreGrad.addColorStop(0, 'rgba(0, 224, 255, 0.25)');
+    coreGrad.addColorStop(1, 'rgba(0, 224, 255, 0)');
+    ctx.fillStyle = coreGrad;
+    ctx.beginPath(); ctx.arc(CX, CY, 90, 0, Math.PI*2); ctx.fill();
+
+    t++;
+    requestAnimationFrame(draw);
+  }
+  draw();
+})();
+
+/* ============================================
+   TYPING TERMINAL DEMO
+   Loops the demo conversation forever.
+   ============================================ */
+(function() {
+  const body = document.getElementById('term-body');
+  if (!body) return;
+
+  const lines = [
+    { kind: 'you',  text: 'halo. Claude, write a one-line python script that prints hello.' },
+    { kind: 'halo', text: "On it. I'm calling this session Mercury." },
+    { kind: 'note', text: 'a separate PowerShell window opens, live-tailing Claude’s text deltas + tool calls' },
+    { kind: 'halo', text: 'I wrote it to hello dot py.' },
+    { kind: 'spacer' },
+    { kind: 'you',  text: 'now make it print goodbye instead.' },
+    { kind: 'note', text: 'same Mercury session — persistent process, no spawn cost' },
+    { kind: 'halo', text: 'Done.' },
+    { kind: 'spacer' },
+    { kind: 'you',  text: 'ask Codex to refactor it into a function.' },
+    { kind: 'note', text: 'verbal dispatch regex matches "ask Codex to" → skips Stage 2 LLM' },
+    { kind: 'halo', text: "On it. I'm calling this session Neptune." },
+    { kind: 'spacer' },
+    { kind: 'you',  text: 'back to halo. open hello.py.' },
+    { kind: 'halo', text: 'Opened hello.py.' },
+    { kind: 'spacer' },
+    { kind: 'you',  text: 'end session.' },
+    { kind: 'halo', text: 'Goodbye.' },
+  ];
+
+  const LEAD = {
+    you:  '<span class="lead-you">you  → </span>',
+    halo: '<span class="lead-halo">halo → </span>',
+    note: '<span class="lead-note">         </span>',
+  };
+
+  function el(html) {
+    const d = document.createElement('div');
+    d.innerHTML = html;
+    return d;
+  }
+
+  async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  async function typeLine(line, container) {
+    if (line.kind === 'spacer') {
+      const d = document.createElement('div');
+      d.innerHTML = '&nbsp;';
+      container.appendChild(d);
+      await sleep(140);
+      return;
+    }
+    const wrap = document.createElement('div');
+    wrap.innerHTML = LEAD[line.kind] || '';
+    const span = document.createElement('span');
+    span.className = line.kind === 'you' ? 'you' : line.kind === 'halo' ? 'halo' : 'note';
+    if (line.kind === 'you') span.appendChild(document.createTextNode('"'));
+    wrap.appendChild(span);
+    const cursor = document.createElement('span');
+    cursor.className = 'term-cursor';
+    wrap.appendChild(cursor);
+    container.appendChild(wrap);
+
+    const txt = line.text;
+    const speed = line.kind === 'you' ? 22 : line.kind === 'halo' ? 18 : 8;
+    for (let i = 0; i < txt.length; i++) {
+      cursor.before(document.createTextNode(txt[i]));
+      await sleep(speed + Math.random() * 12);
+    }
+    if (line.kind === 'you') cursor.before(document.createTextNode('"'));
+    cursor.remove();
+    await sleep(line.kind === 'note' ? 350 : 600);
+  }
+
+  async function run() {
+    while (true) {
+      body.innerHTML = '';
+      for (const line of lines) {
+        await typeLine(line, body);
+      }
+      const wait = document.createElement('div');
+      wait.innerHTML = '<span class="lead-you">you  → </span><span class="term-cursor"></span>';
+      body.appendChild(wait);
+      await sleep(2800);
+    }
+  }
+  run();
+})();
+</script>
 
 </body>
 </html>
