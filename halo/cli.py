@@ -6,6 +6,7 @@ subcommands:
   halo                  Start the voice loop (same as `halo run`).
   halo run              Start the voice loop.
   halo download-models  Fetch Kokoro TTS model files into the models dir.
+  halo doctor           Diagnose dependency setup (Ollama, agents, models).
   halo version          Print the installed version.
   halo --help           Show this help.
 
@@ -36,6 +37,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "download-models",
         help="Download Kokoro TTS model files (~200 MB) into the models dir.",
     )
+    sub.add_parser(
+        "doctor",
+        help="Check that Ollama, agents (claude/codex), and Kokoro are wired up.",
+    )
     sub.add_parser("version", help="Print the installed version and exit.")
     return parser
 
@@ -52,6 +57,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "download-models":
         from halo.download_models import download_all
         return download_all()
+
+    if args.command == "doctor":
+        from halo.doctor import run as run_doctor
+        return run_doctor()
 
     if args.command == "version":
         print(f"halo-voice {__version__}")

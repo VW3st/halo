@@ -24,6 +24,7 @@ from halo.config import (
     CHIME_DURATION_MS,
     CHIME_FREQ_HZ,
     DEBUG,
+    MIC_NOISE_GATE_RMS,
     RECORDINGS_DIR,
     SAMPLE_RATE,
 )
@@ -38,9 +39,18 @@ VAD_THRESHOLD = 0.5
 SPEECH_PAD_MS = 200
 
 # Tell the user "your mic is picking up audio" when RMS rises above this.
-# Rate-limited print, purely diagnostic.
-MIC_RMS_FLOOR = 0.01
+# Rate-limited print, purely diagnostic. Bumped from 0.01 to 0.05 so we
+# only print on actual speech-level audio, not ambient room noise — the
+# old floor was spamming "mic level: 0.013" hundreds of times per
+# conversation. Real speech is typically 0.05-0.30.
+MIC_RMS_FLOOR = 0.05
 MIC_RMS_PRINT_INTERVAL_SEC = 0.4
+
+# Throttle "audio status: input overflow" prints — they used to fire on
+# every overflow, sometimes 4-5x per second under load. One per 5s is
+# enough to know the mic pipeline is struggling without flooding logs.
+_AUDIO_STATUS_THROTTLE_SEC = 5.0
+_last_audio_status_print = 0.0
 
 _vad_model = None
 
@@ -97,7 +107,22 @@ class RecorderState:
 
     def _callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
         if status:
-            print(f"audio status: {status}")
+            global _last_audio_status_print
+            now = time.monotonic()
+            if now - _last_audio_status_print > _AUDIO_STATUS_THROTTLE_SEC:
+                _last_audio_status_print = now
+                print(f"audio status: {status}")
+
+        # Halo's TTS plays through the same physical speakers the user's
+        # mic is listening to. If we feed those chunks to the STT pipeline,
+        # Whisper transcribes Halo's own voice and the orchestrator
+        # dispatches it back to Claude — Halo ends up arguing with itself.
+        # Drop chunks while voice.is_speaking(); a real interrupt would
+        # need barge-in, which is a separate (deferred) feature.
+        from halo.voice import is_speaking as _voice_is_speaking
+        if _voice_is_speaking():
+            return
+
         chunk = indata[:, 0].copy()
         with self._lock:
             self._chunks.append(chunk)
@@ -118,6 +143,12 @@ class RecorderState:
         if rms > MIC_RMS_FLOOR and now - self._last_rms_print > MIC_RMS_PRINT_INTERVAL_SEC:
             self._last_rms_print = now
             print(f"  mic level: {rms:.3f}")
+
+        # Noise gate: chunks below the floor are treated as silence and
+        # NOT fed to VAD. Keeps silero from triggering on room noise,
+        # fan hum, breath, etc. Tunable via config.MIC_NOISE_GATE_RMS.
+        if rms < MIC_NOISE_GATE_RMS:
+            return
 
         result = self.vad(torch.from_numpy(chunk_float), return_seconds=False)
         if result is None:

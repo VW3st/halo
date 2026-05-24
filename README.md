@@ -4,7 +4,7 @@ Voice front-end for agentic coding tools. Say a wake word, talk to
 Claude Code or Codex CLI in plain English, and hear the result back.
 Halo is the audio layer; the agents do the work.
 
-Status: **v1.0 — `pip install` ready.** Live web dashboard at `http://127.0.0.1:7070`.
+Status: **v1.1 — custom "halo" wake word, persistent Claude sessions, separate-console live feed, noise-suppression pipeline.** Live web dashboard at `http://127.0.0.1:7070`.
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full history. Licensed MIT
 ([LICENSE](./LICENSE)).
@@ -12,11 +12,11 @@ See [CHANGELOG.md](./CHANGELOG.md) for the full history. Licensed MIT
 The dashboard shows the entire pipeline live: which stage is firing
 (wake / record / transcribe / route / agent / voice), the most recent
 transcript, every agent session by Roman name with state and elapsed
-time, and a color-coded event log. Auto-launches when you run Halo —
-just open the URL it prints at startup.
+time, and a color-coded event log. Auto-launches in your default
+browser when you run Halo (set `HALO_NO_BROWSER=1` to suppress).
 
 ```
-HALO •  LOCAL  •  listening                            live  ·  v1.0
+HALO •  LOCAL  •  listening                            live  ·  v1.1
 ─────────────────────────────────────────────────────────────────────
 [wake] → [record] → [transcribe] → [route] → [agent] → [voice]
 ─────────────────────────────────────────────────────────────────────
@@ -39,22 +39,25 @@ HALO •  LOCAL  •  listening                            live  ·  v1.0
 ```
 
 ```
-You: "Hey Jarvis. Claude, write a one-line python script that prints hello."
-Halo: "On it. I'm calling this session Mercury. I'll let you know."
-        ... (Claude works in the background, you can keep talking)
-Halo: "Mercury says, I wrote it to hello.py."
+You: "halo. Claude, write a one-line python script that prints hello."
+Halo: "On it. I'm calling this session Mercury."
+        ... a separate PowerShell window pops up live-tailing Claude
+            (text deltas, tool calls, result events) so you can watch
+            Claude work without scrolling Halo's own terminal
+        ... Mercury speaks: "I wrote it to hello dot py."
 
 You: "now make it print goodbye instead."
-Halo: "Mercury is working. I'll let you know."
-Halo: "Mercury says, done."
+        ... same Mercury session (persistent process, no spawn cost)
+Halo: "Done."
 
-You: "Codex, refactor it into a function."
-Halo: "On it. I'm calling this session Neptune. I'll let you know."
+You: "ask Codex to refactor it into a function."
+        ... verbal-dispatch regex catches this, skips Stage 2 LLM
+Halo: "On it. I'm calling this session Neptune."
 
-You: "back to halo. open chrome."
-Halo: "Halo here. Opened browser."
+You: "back to halo. open hello.py."
+Halo: "Opened hello.py."
 
-You: "goodbye."
+You: "end session."
 Halo: "Goodbye."
 ```
 
@@ -68,17 +71,41 @@ authenticate against their own services.
 
 | Layer        | Tech                                              | Notes |
 |--------------|---------------------------------------------------|-------|
-| Wake word    | [openWakeWord](https://github.com/dscripka/openWakeWord) | `hey_jarvis` (placeholder until custom `hey_halo` is trained) |
+| Wake word    | [openWakeWord](https://github.com/dscripka/openWakeWord) + custom `halo.onnx` (trained via [bbarrick/wakeword_trainer](https://github.com/bbarrick/wakeword_trainer)) | Single-word "halo" wake (188 positives × 22 voices + 524 negatives via ElevenLabs TTS, F1 = 0.80). silero-VAD gate on top via `vad_threshold=0.7`. Falls back to builtin `hey_jarvis` if `halo.onnx` is missing. |
 | Mic          | [sounddevice](https://python-sounddevice.readthedocs.io/) | 16 kHz mono int16 |
 | VAD          | [silero-vad v5](https://github.com/snakers4/silero-vad)   | 600 ms base silence, mode-adaptive extensions |
 | STT          | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + distil-large-v3 | int8_float16 on CUDA, ~500 ms per utterance |
 | Router       | [Ollama](https://ollama.com) + `qwen2.5:1.5b-instruct`    | Stage 2 LLM, fires only when no local handler matches |
 | TTS          | [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) ONNX (fp16) | `af_heart` voice, sanitized for Markdown |
-| Agents       | [Claude Code](https://github.com/anthropics/claude-code) + [Codex CLI](https://github.com/openai/codex) subprocesses | Persistent sessions across Halo's lifetime |
+| Agents       | [Claude Code](https://github.com/anthropics/claude-code) + [Codex CLI](https://github.com/openai/codex) subprocesses | Persistent sessions; voice-mode flags (`--permission-mode bypassPermissions` / `approval_policy="never"`) so no manual approvals |
 
-Hardware target: Windows + NVIDIA GPU (RTX 3060 4 GB is enough). Mac /
+Hardware target: Windows + NVIDIA GPU (RTX 3060 is enough). Mac /
 Linux paths exist for tools and TTS; CUDA-specific bits gracefully
 fall back to CPU.
+
+### v1.1 highlights
+
+- **Custom "halo" wake word** — single-word wake ("halo" alone fires
+  it, no "hey" prefix needed). Trained on RTX 3060 in ~30 min via
+  bbarrick's wakeword_trainer + ElevenLabs free-tier TTS.
+- **Persistent Claude sessions** — one long-lived `claude -p
+  --input-format stream-json` process per session, kept alive across
+  every voice turn. Kills the per-turn-subprocess race that caused
+  `exit None` failures and "starting session" duplicates.
+- **Separate-console live feed** — when you dispatch to Claude, a
+  PowerShell window pops up tailing the session log. You watch Claude's
+  text deltas, tool calls, and result events in real time, while
+  Halo's own terminal stays clean. Toggle with
+  `AGENT_CLI_VISIBLE = False` in `halo/config.py`.
+- **Noise suppression pipeline** — three layers: mic noise gate
+  (`MIC_NOISE_GATE_RMS = 0.005`), wake silero-VAD gate
+  (`vad_threshold = 0.7`), Whisper internal VAD filter
+  (`vad_filter=True`). Plus a residual STT hallucination filter for
+  Whisper's "Thank you" / "you" / "hello" artifacts on silence.
+- **Fuzzy-fallback dispatcher** — when Ollama's down AND you said an
+  agent name (even Whisper-mangled as "Cloud" / "Codec"), dispatches
+  to that agent directly instead of giving up.
+- **`halo doctor`** — diagnose Ollama, agent CLIs, Kokoro models.
 
 ---
 
@@ -181,9 +208,16 @@ the model location with `HALO_MODELS_DIR=/path/to/models`.
 halo                  start the voice loop (default)
 halo run              same as above
 halo download-models  fetch Kokoro TTS model files
+halo doctor           check Ollama, agents (claude/codex), models — read-only
 halo version          print installed version
 halo --help           show help
 ```
+
+`halo doctor` is the first thing to run after install. It probes every
+external dependency (Ollama running + routing model pulled, Claude CLI
+on PATH and responsive, Codex CLI on PATH and responsive, Kokoro model
+files present) and prints the exact install command for anything that's
+missing. It never installs or modifies anything itself.
 
 ### Dev install
 
@@ -207,25 +241,27 @@ to re-say "Hey Jarvis" between turns. Each thing you say is matched
 against this priority list, **first match wins**:
 
 ```
-1. End phrase             "over and out" / "goodbye" / "go to sleep"      -> exit conversation
-2. New session            "new task" / "start over" / "forget that"       -> reset agent sessions
-3. Vocative dispatch      "Claude, build X" / "Codex, run Y"              -> direct to that agent (no LLM)
-4. Pure mode switch       "switch to codex" / "talk to claude"            -> set direct-dialogue agent
-5. Back to Halo           "back to halo" / "talk to me"                   -> exit direct-dialogue mode
-6. Status query           "what's happening" / "are you done"             -> read job registry
-7. Replay last result     "what did Claude say" / "repeat what Codex..."  -> re-speak last response
-8. Local tool             "open chrome" / "launch calculator"             -> system app handlers
-9. Direct-dialogue active sends utterance straight to current agent       -> --continue
-10. Stage 2 LLM (fallback) only fires when nothing above matched          -> qwen2.5 routing
+1.  End phrase             "over and out" / "goodbye" / "go to sleep"      -> exit conversation
+2.  New session            "new task" / "start over" / "forget that"       -> reset agent sessions
+3.  Vocative dispatch      "Claude, build X" / "Codex, run Y"              -> direct to that agent (no LLM)
+3b. Verbal dispatch        "ask Codex to ..." / "tell Claude to ..."       -> direct to that agent (no LLM)
+4.  Pure mode switch       "switch to codex" / "talk to claude"            -> set direct-dialogue agent
+5.  Back to Halo           "back to halo" / "talk to me"                   -> exit direct-dialogue mode
+6.  Status query           "what's happening" / "are you done"             -> read job registry
+7.  Replay last result     "what did Claude say" / "repeat what Codex..."  -> re-speak last response
+8.  Local tool             "open chrome" / "launch calculator"             -> system app handlers
+9.  Direct-dialogue active sends utterance straight to current agent       -> --continue
+10. Stage 2 LLM (fallback) only fires when nothing above matched           -> qwen2.5 routing
 ```
 
 After 5 s of true idleness (no jobs running, no speech), Halo goes back
 to wake-listening.
 
-### Vocative dispatch — the killer feature
+### Vocative & verbal dispatch — the killer features
 
-Naming the agent up front skips the router LLM entirely. Comma is
-required (faster-whisper adds it reliably):
+Naming the agent up front skips the router LLM entirely. Two forms work:
+
+**Vocative** (comma required — faster-whisper adds it reliably):
 
 ```
 "Claude, build a login page with Supabase"
@@ -233,6 +269,20 @@ required (faster-whisper adds it reliably):
 "Claude code, summarize the README"
 "Hey Codex, list the open issues"
 ```
+
+**Verbal** (verb + agent + instruction):
+
+```
+"ask Codex to build a landing page"
+"tell Claude to refactor auth.py"
+"have Codex deploy the latest build"
+"get Claude to write tests for this"
+"use Codex for the bug in routes.py"
+"let Claude handle the migration"
+```
+
+Both bypass the Stage 2 LLM, which means no agent-name swap or
+hallucinated extras (a real failure mode on the 1.5B router model).
 
 After the first dispatch, you're automatically in **direct-dialogue
 mode** with that agent — every follow-up goes straight to its
@@ -250,9 +300,17 @@ To switch agents mid-flow:
 
 ```
 "switch to codex" / "talk to codex"        -> direct dialogue with Codex
+"transfer me to codex" / "transfer to ..."  -> same as switch
 "Codex, ..."                                -> dispatches to Codex AND switches
 "back to halo" / "talk to me"               -> exit direct dialogue
+"transfer me back to halo"                  -> same
 ```
+
+Once you're in direct dialogue with an agent, Halo never auto-sleeps —
+the conversation stays open until you explicitly say `"goodbye"`,
+`"go to sleep"`, `"over and out"`, or any of the end phrases. The 5-second
+idle sleep only applies when you're in plain Halo mode (no direct
+dialogue and no running jobs).
 
 ### Mythology names
 
@@ -279,6 +337,57 @@ Job results land between turns so they don't talk over you.
 
 ---
 
+## Custom wake word
+
+Halo ships with a custom-trained `halo.onnx` wake-word model so you
+wake it with just *"halo"* (no "hey" prefix). If `models/halo.onnx`
+is missing, Halo falls back to openWakeWord's builtin `hey_jarvis`.
+
+### Training your own
+
+If you want a different wake phrase (or to re-train on your own voice
+samples), use [`bbarrick/wakeword_trainer`](https://github.com/bbarrick/wakeword_trainer).
+Halo's training scratch dir is `training/wakeword_trainer/`
+(gitignored). The wake DNN trains on top of OpenWakeWord's frozen
+feature extractor, so the output is a plain ONNX classifier that
+Halo's existing wake loader picks up automatically.
+
+Cost: free (ElevenLabs free tier gives 10k chars/month — enough for
+one training run of ~120 voice samples). Training time: ~5 min on an
+RTX 3060. Best results: 8 phrase variants × 20+ voices for positives,
+40+ confusables × 5 voices for hard negatives, 50+ common phrases for
+soft negatives.
+
+Tune in `halo/wake.py`:
+
+| Constant | Default | What |
+|---|---|---|
+| `WAKE_WORD` | `"halo"` | Phrase name. Halo loads `<MODELS_DIR>/<WAKE_WORD>.onnx`. |
+| `THRESHOLD` | `0.75` | Wake DNN activation score (0-1). Raise to filter false fires, lower if real wakes are missed. |
+| `WAKE_VAD_THRESHOLD` | `0.7` | silero-VAD must also score above this. 0.0 disables the gate. |
+
+---
+
+## Voice-mode permissions
+
+Voice users have no way to click "approve" on agent permission prompts,
+so Halo configures both agents to never ask:
+
+- **Claude Code**: `--permission-mode bypassPermissions` (documented in
+  `claude --help` as "Bypass all permission checks"). Without this,
+  Claude would hang on the first Bash call waiting for TUI confirmation.
+- **Codex CLI**: `-c approval_policy="never"` (OpenAI's documented
+  setting for non-interactive runs). `--sandbox workspace-write` is
+  kept, so Codex's file writes stay constrained to the project root.
+
+This is the right tradeoff for voice — you ARE the supervisor, just
+via spoken commands instead of keystrokes. If you'd rather have Claude
+prompt you for risky operations (and you're OK with Halo hanging
+silently when it does), change `--permission-mode bypassPermissions`
+back to `acceptEdits` in `halo/agents.py:AGENTS["claude_code"]`.
+
+---
+
 ## Voice quality
 
 - **Voice**: `af_heart` — the only A/A-graded voice in the Kokoro
@@ -287,9 +396,15 @@ Job results land between turns so they don't talk over you.
   which strips Markdown (`**bold**`, `` `code` ``, em-dashes, bullets,
   headings, link syntax), collapses long file paths to basenames,
   drops mojibake (`â€"`), and turns newlines into sentence breaks.
-- **Agent voice prompt**: Claude and Codex are told they're on a voice
-  channel and to keep responses to 2 short sentences. They're told to
-  write code/long content to files and just say "I wrote it to <name>."
+- **Agent voice prompt** (`VOICE_SYSTEM_PROMPT` in `halo/agents.py`):
+  Claude and Codex are told they're on a voice channel and follow eight
+  rules — no Markdown, 2-sentence max, write code to files, file
+  basenames only, connecting words instead of bullets, one short
+  clarifying question, **announce time estimates for slow tasks**, and
+  **state the filename clearly when they finish something openable**.
+- **Open what was built**: when an agent says *"I wrote it to landing.html"*,
+  you can immediately say *"open landing.html"* and Halo opens it in your
+  OS default app — works for any extension (`.html`, `.png`, `.md`, `.pdf`, ...).
 
 ---
 
@@ -297,8 +412,11 @@ Job results land between turns so they don't talk over you.
 
 ```
 halo/
+  __init__.py     package marker + __version__
   __main__.py     main loop: wake -> conversation -> routing priority
+  cli.py          `halo` shell entry point + subcommands
   config.py       paths, sample rate, model name, timing constants
+  download_models.py  `halo download-models` — fetches Kokoro
   wake.py         openWakeWord listener + pre-wake audio ring buffer
   record.py       silero-vad RecorderState, chime, backchannel tone
   stt.py          faster-whisper BatchTranscriber (CUDA + DLL fixup)
@@ -312,14 +430,22 @@ halo/
   web_static/
     index.html    dashboard (single file, no build step)
 
-models/
-  kokoro-v1.0.fp16.onnx       Kokoro 82M voice model
-  voices-v1.0.bin             Kokoro voice pack
+pyproject.toml    package metadata (hatchling backend, `halo` console script)
+CHANGELOG.md      keep-a-changelog format, per-version history
+LICENSE           MIT
+
+models/                          dev-mode location (this dir, project root)
+~/.halo/models/                  installed-mode default
+  kokoro-v1.0.fp16.onnx          Kokoro 82M voice model
+  voices-v1.0.bin                Kokoro voice pack
+                                 # override either with HALO_MODELS_DIR
 
 scripts/
   bench_router.py             Stage 1 + Stage 2 latency benchmark
   fw_smoke.py                 faster-whisper accuracy smoke test
+  moonshine_smoke.py          legacy Moonshine STT smoke (kept for comparison)
   test_detect_mode.py         adaptive turn-taking unit tests
+  test_streaming.py           sentence buffer + Claude stream-json extractor
   test_vocative.py            vocative dispatch unit tests
   test_voice_mode.py          TTS sanitizer + mode-switch tests
   test_fixes_round.py         regression suite for recent bug fixes
@@ -359,7 +485,9 @@ out of the box. There is no built-in `hey_halo`. Step 1 uses
 To train a real `hey_halo` model:
 1. Record ~100 samples of yourself saying "Halo" using openWakeWord's
    [training notebook](https://github.com/dscripka/openWakeWord#training-new-models)
-2. Drop the resulting `.onnx` into `models/`
+2. Drop the resulting `.onnx` into your `MODELS_DIR` (defaults to
+   `./models/` in dev, `~/.halo/models/` when pip-installed; override
+   with `HALO_MODELS_DIR`)
 3. Update `halo/wake.py:WAKE_WORD`
 
 Threshold lives in `halo/wake.py:THRESHOLD` (default 0.5). Raise if

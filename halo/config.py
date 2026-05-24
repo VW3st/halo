@@ -35,7 +35,21 @@ def _resolve_models_dir() -> Path:
 
 
 MODELS_DIR = _resolve_models_dir()
-RECORDINGS_DIR = PROJECT_ROOT / "recordings"
+
+
+def _resolve_recordings_dir() -> Path:
+    """Same precedence as MODELS_DIR — env override, then dev tree, then
+    user data dir. Only used when DEBUG=True (debug wav dumps)."""
+    override = os.environ.get("HALO_RECORDINGS_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    dev_dir = PROJECT_ROOT / "recordings"
+    if (PROJECT_ROOT / "halo").is_dir():
+        return dev_dir
+    return Path.home() / ".halo" / "recordings"
+
+
+RECORDINGS_DIR = _resolve_recordings_dir()
 
 # Audio format used end-to-end (wake → record → STT).
 SAMPLE_RATE = 16_000
@@ -65,12 +79,39 @@ TURN_MAX_INCOMPLETE_EXTENSIONS = 3
 CHIME_FREQ_HZ = 800
 CHIME_DURATION_MS = 60
 
+# Mic-side noise gate. Audio chunks with RMS below this floor are
+# treated as silence and dropped before they reach silero-VAD / STT.
+# Conservative default (0.005) — well below normal speech levels
+# (typically 0.05+) so it only filters true ambient room noise.
+# Raise to 0.015-0.020 if your environment is noisy and you still
+# get spurious wake-ups or "Thank you" hallucinations. Disable by
+# setting to 0.0. NVIDIA Broadcast / Krisp / OS-level noise filters
+# remove the need for this entirely.
+MIC_NOISE_GATE_RMS = 0.005
+
 # Conversation mode: stay awake after wake until either an explicit
 # end phrase or N seconds of idle silence (with no active agent jobs).
-# Short by design — the orchestrator extends this whenever an agent
-# job is mid-flight, so this only fires when there's truly nothing
-# happening.
+#
+# Two budgets:
+# - PRE-engagement (no commands processed yet, e.g. an accidental wake):
+#   short, so a phantom wake doesn't hold the mic open. 5s.
+# - POST-engagement (you've spoken at least one command):
+#   generous, so you can think, read Halo's reply, decide what to ask
+#   next, all without being cut off. 90s. End it earlier with any of
+#   the explicit end phrases ("goodbye", "go to sleep", "over and out").
+#
+# Direct-dialogue mode never auto-sleeps regardless of these (see
+# run_conversation in __main__).
 CONVERSATION_IDLE_SEC = 5.0
+CONVERSATION_IDLE_ENGAGED_SEC = 90.0
+
+# Persistent CLI session visibility. When True, Halo echoes each event
+# from the agent's stdout to its own terminal — you watch Claude write
+# text deltas in real time, see tool calls (Bash / Edit / Read), and
+# see the terminating result event. When False, only the parsed
+# sentence chunks reach the TTS callback and the rest is silent.
+# Per-agent override via `AgentConfig.cli_visible` (None = use this).
+AGENT_CLI_VISIBLE = True
 
 # Step 3.5 adaptive constants. Total silence-to-commit per mode
 # (silero base + orchestrator extra). See detect_mode() in halo/turn.py.

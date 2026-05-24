@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "halo-voice"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Voice frontend for agentic coding tools — talk to Claude Code or Codex CLI by voice."
 readme = "README.md"
 requires-python = ">=3.11"

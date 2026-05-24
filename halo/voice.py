@@ -45,6 +45,44 @@ _kokoro = None
 _load_lock = threading.Lock()
 _playback_lock = threading.Lock()
 
+# Track in-flight TTS so the orchestrator can avoid opening the mic
+# while Halo is still talking back (would catch echo, fire false
+# "no speech detected" turns, and consume idle budget the user needs
+# for replying to a question).
+_active_say_count = 0
+_active_count_lock = threading.Lock()
+
+
+def _begin_speaking() -> None:
+    global _active_say_count
+    with _active_count_lock:
+        _active_say_count += 1
+
+
+def _end_speaking() -> None:
+    global _active_say_count
+    with _active_count_lock:
+        _active_say_count = max(0, _active_say_count - 1)
+
+
+def is_speaking() -> bool:
+    """True while at least one say() call is mid-synthesis or playback."""
+    with _active_count_lock:
+        return _active_say_count > 0
+
+
+def wait_until_silent(timeout: float = 15.0, poll_interval: float = 0.05) -> bool:
+    """Block until is_speaking() returns False or `timeout` elapses.
+
+    Returns True if Halo went silent cleanly, False on timeout (caller
+    can decide whether to proceed anyway).
+    """
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while is_speaking() and _time.monotonic() < deadline:
+        _time.sleep(poll_interval)
+    return not is_speaking()
+
 # Tiny per-state phrase banks so Halo doesn't sound robotic.
 ACK_PHRASES = (
     "Yes?",
@@ -156,6 +194,11 @@ def say(
         return
     bus.emit("tts.spoke", text=spoken, who="Halo")
 
+    # Mark "speaking" synchronously (before the worker thread starts)
+    # so is_speaking() is reliable for callers that check immediately
+    # after firing a non-blocking say().
+    _begin_speaking()
+
     def _do_synth_and_play() -> None:
         try:
             samples, sample_rate = _kokoro.create(
@@ -168,6 +211,8 @@ def say(
                 sd.wait()
         except Exception as exc:
             print(f"  voice synth/playback error: {exc}")
+        finally:
+            _end_speaking()
 
     if blocking:
         _do_synth_and_play()

@@ -37,6 +37,8 @@ from halo.agents import (
     AGENTS,
     AgentBusy,
     active_jobs,
+    available_agents,
+    check_availability,
     completed_unconsumed_jobs,
     last_result_for,
     mark_consumed,
@@ -47,14 +49,16 @@ from halo.agents import (
     status_summary,
     summarize_for_speech,
 )
-from halo.config import CONVERSATION_IDLE_SEC
+from halo.config import CONVERSATION_IDLE_ENGAGED_SEC, CONVERSATION_IDLE_SEC
 from halo.record import preload_models as preload_audio_models
 from halo.router import preload_router, understand_and_route
 from halo.tools import execute_system_intent
 from halo.turn import run_turn
 from halo.voice import is_available as voice_available
+from halo.voice import is_speaking as voice_is_speaking
 from halo.voice import preload_voice, say
 from halo.voice import stop as voice_stop
+from halo.voice import wait_until_silent as voice_wait_until_silent
 from halo.wake import WAKE_WORD, _get_model, listen_for_wake
 from halo.web import start_server as start_web_server
 
@@ -64,7 +68,8 @@ _END_CONVERSATION_RE = re.compile(
     r"\b("
     r"over and out|over n out|"
     r"go to sleep|go back to sleep|"
-    r"stop listening|stop conversation|end conversation|"
+    r"stop listening|stop conversation|end conversation|end session|"
+    r"end of session|session end|that'?s enough|that'?s it|enough|"
     r"good ?bye|bye bye|see you|"
     r"that'?s all|that will be all|i'?m done|done for now|"
     r"thanks that'?s all|"
@@ -111,6 +116,7 @@ _REPLAY_RE = re.compile(
 _TALK_TO_AGENT_RE = re.compile(
     r"\b(?:"
     r"switch (?:to|over to)|"
+    r"transfer (?:me )?(?:to|over to)|"
     r"talk to|let me talk to|"
     r"hand (?:it |this )?to|give (?:it |this )?to|put me on|"
     r"use|try|let'?s (?:try|use|ask)|"
@@ -130,7 +136,7 @@ _AGENT_VOCATIVE_RE = re.compile(
 _BACK_TO_HALO_RE = re.compile(
     r"\b(?:back to halo|halo (?:back|take over)|stop (?:talking to|using) "
     r"(?:claude|codex)|exit (?:claude|codex)|leave (?:claude|codex)|"
-    r"talk to me|hand it back)\b",
+    r"talk to me|hand it back|transfer (?:me )?back to halo)\b",
     re.IGNORECASE,
 )
 
@@ -168,6 +174,63 @@ def _vocative_dispatch(text: str) -> tuple[str | None, str]:
     if not instruction:
         return None, ""
     return agent, instruction
+
+
+# Verbal dispatch: "ask Codex to build X" / "tell Claude to refactor Y" /
+# "have Codex deploy" / "get Claude to write tests" / "use Codex for the
+# bug" / "let Claude handle this". Same effect as vocative dispatch, but
+# with an explicit verb instead of a comma. Catches the natural English
+# pattern that the Stage 2 router LLM frequently mangles (eg. swapping
+# Codex -> Claude or adding hallucinated details).
+_VERBAL_DISPATCH_RE = re.compile(
+    r"^\s*"
+    r"(?:hey\s+|ok\s+|okay\s+|please\s+)?"
+    r"(?:can\s+you\s+|could\s+you\s+|would\s+you\s+)?"
+    r"(?:ask|tell|have|get|use|let|try)\s+"
+    r"(claude(?:\s+code)?|codex(?:\s+cli)?)\s+"
+    r"(?:to\s+|please\s+|for\s+|if\s+(?:you|she|he)\s+can\s+)?"
+    r"(.+)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _verbal_dispatch(text: str) -> tuple[str | None, str]:
+    """If text is 'ask Codex to X' / 'tell Claude to Y' / etc, return
+    (agent_key, X). Otherwise (None, '')."""
+    m = _VERBAL_DISPATCH_RE.match(text or "")
+    if not m:
+        return None, ""
+    agent = _resolve_agent_word(m.group(1))
+    if agent is None:
+        return None, ""
+    instruction = m.group(2).strip()
+    if not instruction:
+        return None, ""
+    return agent, instruction
+
+
+def _fuzzy_agent_match(text: str) -> str | None:
+    """Permissive agent-name detection used ONLY as a fallback when the
+    Stage 2 LLM is unreachable. Matches the canonical voice_triggers
+    AND the per-agent fuzzy_triggers (Whisper mis-transcriptions like
+    'Cloud' for 'Claude'). Returns the first agent_key whose triggers
+    appear as a whole word in `text`, else None.
+
+    The strict vocative / verbal regexes are still preferred for the
+    happy path; this only fires when nothing else matched AND the LLM
+    couldn't disambiguate either.
+    """
+    if not text:
+        return None
+    low = text.lower()
+    for key, cfg in AGENTS.items():
+        all_triggers = tuple(cfg.voice_triggers) + tuple(cfg.fuzzy_triggers)
+        for trigger in all_triggers:
+            # Whole-word match so 'cloud' doesn't catch 'cloudy' etc.
+            pattern = r"\b" + re.escape(trigger.lower()) + r"\b"
+            if re.search(pattern, low):
+                return key
+    return None
 
 
 # Trailing fluff that doesn't count as a real instruction after a switch verb.
@@ -280,8 +343,11 @@ def _drain_completed_jobs() -> None:
         )
         if job.ok:
             if cfg.streams_text_deltas:
-                # Streaming agent already narrated; just a cap.
-                say(f"{spoken_name} is done.", blocking=True)
+                # Streaming agent already spoke its full response via the
+                # on_text_chunk callback during the job. Adding "X is done."
+                # on top was just noise — the user can hear the response
+                # ended (TTS playback finished). Skip the cap entirely.
+                pass
             else:
                 short = summarize_for_speech(job.result) or f"{spoken_name} is done."
                 say(f"{spoken_name} says, {short}", blocking=True)
@@ -309,11 +375,29 @@ def _start_agent_and_ack(agent_key: str, prompt: str) -> str:
         # dispatch a blank prompt to an agent. Claude / Codex both
         # error on empty input.
         return ""
+
+    # Pre-flight: refuse to dispatch to an agent whose binary isn't on
+    # PATH or didn't respond to its check_call. Otherwise the subprocess
+    # errors halfway through and the user hears "had a problem" with no
+    # clue what's missing.
     config = AGENTS[agent_key]
+    status = check_availability().get(agent_key, {})
+    if not (status.get("installed") and status.get("responsive")):
+        print(f"  refusing dispatch -> {agent_key}: not connected ({status})")
+        return (
+            f"{config.spoken_name} isn't connected. "
+            f"Run halo doctor for setup help."
+        )
+
     spoken = session_name(agent_key)
-    active = "continuing" if session_status()[agent_key] else "starting"
+    if config.session_kind == "persistent":
+        active = "continuing" if session_status()[agent_key] else "starting"
+        suffix = f"persistent session, {active}"
+    else:
+        active = "continuing" if session_status()[agent_key] else "starting"
+        suffix = f"{active} session"
     print(f"  dispatching to {spoken} / {config.spoken_name.lower()} "
-          f"({active} session): {prompt!r}")
+          f"({suffix}): {prompt!r}")
 
     def _speak_chunk(sentence: str) -> None:
         # Non-blocking so a long monologue queues sentence-by-sentence
@@ -364,8 +448,19 @@ def _handle_decision(decision: dict) -> str:
         if handled:
             print(f"  executed: {summary}")
             return summary
-        print(f"  no tool matched {cleaned!r}")
-        return "I don't know how to do that yet."
+        # No local tool matched. The Stage 2 LLM was confident this was
+        # a "system" intent (probably because the utterance started with
+        # an "open ..." verb), but none of our handlers cover it. Two
+        # paths lead here:
+        #   1. Mixed intent like "open hallo.html and change the colors"
+        #      where the open-file split couldn't pull the filename out
+        #      of mid-sentence AND the rest is a coding task. Claude can
+        #      do both: Read the file, Edit it, and report back.
+        #   2. Truly unknown ("open the dishwasher") — Claude politely
+        #      explains it can't help.
+        # Falling through to Claude beats a flat "I don't know" refusal.
+        print(f"  no tool matched {cleaned!r} -> falling through to claude_code")
+        return _start_agent_and_ack("claude_code", cleaned)
 
     # Registry-driven dispatch — non-blocking. Job runs in background;
     # _drain_completed_jobs() between turns will speak the result.
@@ -388,15 +483,16 @@ def run_conversation() -> None:
 
     Routing priority — first match wins, Stage 2 LLM is the LAST resort:
 
-      1. end-phrase                -> goodbye, return
-      2. new-session phrase        -> reset, continue
-      3. vocative dispatch         -> "Claude, X" / "Codex, X" -> direct
-      4. pure mode-switch          -> "switch to codex" -> direct mode
-      5. back-to-halo              -> exit direct mode
-      6. status query / replay     -> registry, no LLM
-      7. tool fast-path            -> open chrome, calculator, etc.
-      8. direct-dialogue active    -> straight to current agent (no LLM)
-      9. Stage 2 LLM (fallback)    -> only if nothing above matched AND
+      1.  end-phrase               -> goodbye, return
+      2.  new-session phrase       -> reset, continue
+      3.  vocative dispatch        -> "Claude, X" / "Codex, X" -> direct
+      3b. verbal dispatch          -> "ask Codex to X" / "tell Claude" -> direct
+      4.  pure mode-switch         -> "switch to codex" -> direct mode
+      5.  back-to-halo             -> exit direct mode
+      6.  status query / replay    -> registry, no LLM
+      7.  tool fast-path           -> open chrome, calculator, etc.
+      8.  direct-dialogue active   -> straight to current agent (no LLM)
+      9.  Stage 2 LLM (fallback)   -> only if nothing above matched AND
                                       we're not in direct mode
 
     Mode auto-enters DIRECT_<agent> the moment a job for that agent
@@ -404,18 +500,43 @@ def run_conversation() -> None:
     """
     last_activity = time.monotonic()
     direct_agent: str | None = None
+    # Toggled True the first time the user actually says something we
+    # process (any non-None decision). The idle budget jumps from 5s
+    # to CONVERSATION_IDLE_ENGAGED_SEC (90s) once engaged, so a single
+    # spoken command no longer cuts the conversation short the moment
+    # Halo finishes its reply.
+    engaged = False
 
     while True:
         # Speak any background-job results that landed since last turn.
         _drain_completed_jobs()
 
-        # Idle timeout — extend whenever a job is in flight.
+        # Don't open the mic while Halo is still speaking back — it'd
+        # pick up echo, fire false "no speech detected" turns, and eat
+        # the idle budget the user needs to actually reply to a question.
+        # Reset last_activity once Halo goes silent so the idle clock
+        # starts from "user could begin talking now", not from when the
+        # user last spoke (which may have been before a 10s agent reply).
+        if voice_is_speaking():
+            voice_wait_until_silent(timeout=20.0)
+            last_activity = time.monotonic()
+
+        # Idle timeout — extend whenever a job is in flight, Halo is
+        # still talking back to the user, OR the user is in direct
+        # dialogue with an agent. The last clause means once you've
+        # opted in to a session ("Claude, ..." / "ask Codex to ...")
+        # Halo only exits the conversation on an explicit phrase
+        # ("goodbye" / "back to halo" / "transfer to ..."). No silent
+        # cut-off mid-thread.
         idle = time.monotonic() - last_activity
-        if idle > CONVERSATION_IDLE_SEC:
-            if active_jobs():
+        idle_limit = (
+            CONVERSATION_IDLE_ENGAGED_SEC if engaged else CONVERSATION_IDLE_SEC
+        )
+        if idle > idle_limit:
+            if active_jobs() or voice_is_speaking() or direct_agent is not None:
                 last_activity = time.monotonic()
             else:
-                print(f"\nconversation idle for {CONVERSATION_IDLE_SEC:.0f}s -> sleeping")
+                print(f"\nconversation idle for {idle_limit:.0f}s -> sleeping")
                 say("Going back to sleep.", blocking=True)
                 return
 
@@ -431,6 +552,7 @@ def run_conversation() -> None:
             continue
 
         last_activity = time.monotonic()
+        engaged = True
         cleaned = (decision.get("cleaned_text") or "").strip()
         print(f"  heard: {cleaned!r}")
 
@@ -459,6 +581,22 @@ def run_conversation() -> None:
             bus.emit("route.matched", handler="vocative", target=voc_agent)
             direct_agent = _set_direct(voc_agent)
             phrase = _start_agent_and_ack(voc_agent, voc_text)
+            if phrase:
+                say(phrase, blocking=True)
+            last_activity = time.monotonic()
+            continue
+
+        # 3b. Verbal dispatch — "ask Codex to X" / "tell Claude to Y" /
+        #     "have Codex deploy". Same effect as vocative but with a
+        #     verb instead of a comma. The small Stage 2 LLM frequently
+        #     mis-routes these (swapping the agent name, hallucinating
+        #     extras), so we intercept here.
+        verb_agent, verb_text = _verbal_dispatch(cleaned)
+        if verb_agent and verb_text:
+            print(f"  verbal dispatch -> {verb_agent}: {verb_text!r}")
+            bus.emit("route.matched", handler="verbal", target=verb_agent)
+            direct_agent = _set_direct(verb_agent)
+            phrase = _start_agent_and_ack(verb_agent, verb_text)
             if phrase:
                 say(phrase, blocking=True)
             last_activity = time.monotonic()
@@ -543,6 +681,36 @@ def run_conversation() -> None:
         t0 = time.monotonic()
         lm_decision = understand_and_route(cleaned)
         print(f"  stage 2: {(time.monotonic() - t0) * 1000:.0f}ms")
+
+        # 9b. Fallback: if Stage 2 failed (Ollama down / network error /
+        #     model crash) AND the user mentioned an agent name — even
+        #     a Whisper-mangled one like 'Cloud' for 'Claude' — dispatch
+        #     to that agent directly instead of giving up with "Sorry,
+        #     the router brain didn't respond." Saves the turn whenever
+        #     the user intent was clear even though Ollama wasn't.
+        if lm_decision.get("_error"):
+            fallback_agent = _fuzzy_agent_match(cleaned)
+            if fallback_agent:
+                avail = check_availability().get(fallback_agent, {})
+                if avail.get("installed") and avail.get("responsive"):
+                    spoken = AGENTS[fallback_agent].spoken_name
+                    print(f"  stage 2 unreachable -> fuzzy fallback to "
+                          f"{fallback_agent} ({spoken})")
+                    bus.emit(
+                        "route.matched",
+                        handler="stage2_fallback",
+                        target=fallback_agent,
+                    )
+                    direct_agent = _set_direct(fallback_agent)
+                    phrase = _start_agent_and_ack(fallback_agent, cleaned)
+                    if phrase:
+                        say(phrase, blocking=True)
+                    last_activity = time.monotonic()
+                    continue
+                else:
+                    print(f"  fuzzy-matched {fallback_agent} but it isn't "
+                          f"connected; falling through to error message")
+
         _print_decision(lm_decision)
 
         if lm_decision.get("status") == "cancel":
@@ -586,8 +754,27 @@ def main() -> None:
     preload_router()
     preload_voice()
     print(f"Halo ready. Say the wake word ('{WAKE_WORD}') to start. (Ctrl+C to stop)\n")
+
+    # Probe which coding agents are actually connected and announce them
+    # — the user gets immediate audible confirmation that Claude/Codex
+    # are wired (or that they aren't). Cached so /api/state polls don't
+    # re-fork `--version` every 750 ms.
     if voice_available():
-        say("Halo online.", blocking=False)
+        avail = available_agents()
+        if not avail:
+            say(
+                "Halo online. No coding agents connected. Run halo doctor.",
+                blocking=False,
+            )
+        elif len(avail) == 1:
+            say(f"Halo online. {avail[0]} is connected.", blocking=False)
+        elif len(avail) == 2:
+            say(f"Halo online. {avail[0]} and {avail[1]} are connected.",
+                blocking=False)
+        else:
+            joined = ", ".join(avail[:-1]) + f", and {avail[-1]}"
+            say(f"Halo online. Connected: {joined}.", blocking=False)
+    print(f"agents: {', '.join(available_agents()) or '(none connected)'}")
 
     try:
         while True:

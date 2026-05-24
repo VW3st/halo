@@ -16,13 +16,26 @@ import subprocess
 import sys
 import webbrowser
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 # everything else (Linux, BSD) gets the xdg path
 
-_OPEN = r"\b(open|launch|start|run|fire up|bring up|go to)\b"
+# Non-capturing so the file-open regex's group(1) is the filename, not
+# the verb. None of the existing tool patterns use .group() either —
+# they just .search() to test membership — so making this non-capturing
+# changes no behavior.
+_OPEN = r"\b(?:open|launch|start|run|fire up|bring up|go to)\b"
+
+# "open landing.html" / "open the file landing.html" / "open my notes.md".
+# Captures the bare filename; relative to CWD at call time.
+# Extension required so we don't false-match things like "open chrome".
+_OPEN_FILE_RE = re.compile(
+    _OPEN + r"\s+(?:the\s+|file\s+|my\s+)*([A-Za-z0-9_\-./\\]+\.[A-Za-z0-9]{1,5})\b",
+    re.IGNORECASE,
+)
 
 
 def _spawn(cmd: list[str]) -> None:
@@ -96,6 +109,34 @@ def _open_explorer() -> str:
     else:
         _spawn(["xdg-open", os.path.expanduser("~")])
     return "Opened file explorer."
+
+
+def _try_open_file(part: str) -> tuple[bool, str]:
+    """Open `landing.html`-style filenames in the OS default app.
+
+    Returns (matched, spoken_summary). matched=True even on failure (e.g.
+    file not in CWD) so the orchestrator doesn't fall through to the
+    LLM router for what's clearly a local-tool intent.
+    """
+    m = _OPEN_FILE_RE.search(part)
+    if not m:
+        return False, ""
+    target = m.group(1)
+    path = Path(target)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.exists():
+        return True, f"I don't see {path.name} in this folder."
+    try:
+        if IS_WIN:
+            os.startfile(str(path))
+        elif IS_MAC:
+            _spawn(["open", str(path)])
+        else:
+            _spawn(["xdg-open", str(path)])
+        return True, f"Opened {path.name}."
+    except Exception as exc:
+        return True, f"Couldn't open {path.name}: {exc}"
 
 
 def _open_terminal() -> str:
@@ -174,15 +215,17 @@ def is_pure_tool(text: str) -> bool:
     """Strict pre-LLM check: is this transcript ONLY tool commands?
 
     Returns True iff every comma/and-separated segment matches a tool
-    pattern. Mixed intent like "open chrome and build a login page"
-    returns False so it falls through to Stage 2 LLM and the code
-    request isn't silently dropped.
+    pattern OR the `open <filename>` pattern. Mixed intent like
+    "open chrome and build a login page" returns False so it falls
+    through to Stage 2 LLM and the code request isn't silently dropped.
     """
     cleaned = text.strip().rstrip(".!?,")
     if not cleaned:
         return False
     parts = [p.strip() for p in _SPLIT_RE.split(cleaned) if p and p.strip()] or [cleaned]
     for part in parts:
+        if _OPEN_FILE_RE.search(part):
+            continue
         if not any(tool.pattern.search(part) for tool in _TOOLS):
             return False
     return True
@@ -213,6 +256,13 @@ def execute_system_intent(cleaned_text: str) -> tuple[bool, str]:
     fired: set[str] = set()  # don't double-fire the same tool in one turn
 
     for part in parts:
+        # File-open path runs first — "open landing.html" otherwise hits
+        # the generic _OPEN regex from the next tool and false-fires.
+        fhandled, fsummary = _try_open_file(part)
+        if fhandled:
+            summaries.append(fsummary)
+            any_handled = True
+            continue
         for tool in _TOOLS:
             if tool.name in fired:
                 continue

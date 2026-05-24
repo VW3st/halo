@@ -28,6 +28,12 @@ models/*.gguf
 models/*.safetensors
 models/*.pt
 models/*.pth
+# EXCEPTION: ship the custom-trained halo wake word model (~557 KB).
+# Users get a working wake word out of the box without re-training.
+!models/halo.onnx
+# Local rollback backup files — never commit
+models/*.bak
+models/*.onnx.bak
 
 # Legacy whisper.cpp binaries (we use faster-whisper now; bin/ kept for fallback)
 bin/
@@ -71,3 +77,10 @@ desktop.ini
 # Logs
 *.log
 logs/
+
+# Playwright MCP debug snapshots (from browser-driving sessions)
+.playwright-mcp/
+
+# Wake-word training sandbox (clone of bbarrick/wakeword_trainer + its venv).
+# Self-contained; the only output we keep is models/hey_halo.onnx.
+training/

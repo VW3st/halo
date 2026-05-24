@@ -215,7 +215,13 @@ def run_turn(
     pre = get_pre_wake_audio()
     if pre.size > 0:
         transcriber.seed(pre)
-        print(f"  seeded with {pre.size / SAMPLE_RATE:.2f}s of pre-wake audio")
+
+    # "Polling" mode: orchestrator passes a short first_wait (<3s) when
+    # we're just checking for a follow-up between agent-job ticks. We
+    # suppress the per-iteration `[speak now]` / `no speech detected`
+    # chatter in that case — those messages flood the terminal during
+    # direct dialogue while waiting for the user's next turn.
+    polling = first_wait < 3.0
 
     state = RecorderState(
         min_silence_ms=TURN_END_SILENCE_MS,
@@ -244,10 +250,12 @@ def run_turn(
     try:
         with open_stream(state):
             play_chime()
-            print("  [speak now]")
+            if not polling:
+                print("  [speak now]")
             bus.emit("record.opened")
             if not state.wait_for_speech(first_wait):
-                print(f"  no speech detected within {first_wait:.1f}s")
+                if not polling:
+                    print(f"  no speech detected within {first_wait:.1f}s")
                 return None
             state.clear_speech_event()
 

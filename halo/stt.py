@@ -61,6 +61,39 @@ _CUDA_COMPUTE = "int8_float16"
 _CPU_COMPUTE = "int8"
 _MIN_AUDIO_SEC = 0.2  # any shorter and Whisper will hallucinate
 
+# distil-large-v3 (like the full distil-whisper family) was fine-tuned
+# on millions of YouTube auto-captions. Its highest-probability output
+# on near-silence is the literal end-of-video credit roll: "thank you",
+# "thanks for watching", "subscribe", etc. We see "Thank you." on every
+# false-positive wake fire if we don't filter.
+# Match is case-insensitive, after stripping punctuation/whitespace.
+_HALLUCINATION_PHRASES = {
+    "",
+    ".", "...", "..", "?", "!", "?!", "??",
+    "you", "you you", "you you you",
+    "thank you", "thanks", "thanks for watching",
+    "thank you for watching", "thanks for watching!",
+    "thank you very much", "thank you so much",
+    "bye", "bye bye", "goodbye", "see you",
+    "okay", "ok", "uh", "um", "hmm", "mm", "mhm",
+    "yeah", "yes", "no", "oh",
+    "subscribe", "like and subscribe",
+    # Greetings — Whisper invents these constantly on near-silence right
+    # after a wake fire (the audio is mostly room noise + a faint trail
+    # of "halo" which decodes as "hello"). Real commands from a user
+    # right after wake are never bare greetings.
+    "hello", "hi", "hi there", "hey", "hey there",
+    "good morning", "good evening", "good night",
+    "ah", "ahh", "huh", "what", "wait",
+    "halo", "hi halo",  # echoes of the wake word itself
+}
+
+
+def _is_hallucination(text: str) -> bool:
+    """True if `text` is one of distil-whisper's known silence-mode artifacts."""
+    cleaned = text.strip().rstrip(".!?,").lower().strip()
+    return cleaned in _HALLUCINATION_PHRASES
+
 _model: Optional[WhisperModel] = None
 _load_lock = threading.Lock()
 _backend: str = "(uninitialized)"
@@ -142,11 +175,26 @@ class BatchTranscriber:
             audio_f32,
             language="en",
             beam_size=5,
-            vad_filter=False,
+            # Whisper's built-in silero VAD pass strips non-speech segments
+            # BEFORE transcription. Massive reduction in "Thank you" /
+            # "Thanks for watching" hallucinations on quiet or noisy
+            # turns — those artifacts only appear when Whisper gets fed
+            # near-silence to decode. With vad_filter on, Whisper sees
+            # only the actual speech.
+            vad_filter=True,
             without_timestamps=True,
             condition_on_previous_text=False,  # avoid hallucinated continuations
         )
-        return " ".join(seg.text.strip() for seg in segments).strip()
+        text = " ".join(seg.text.strip() for seg in segments).strip()
+        # Filter known distil-whisper silence-mode artifacts ("Thank you.",
+        # "Thanks for watching.", etc) so the orchestrator doesn't dispatch
+        # them as real commands. SILENT discard — logging each drop spammed
+        # the terminal during long silent waits ("discarded hallucination
+        # 'Hello.'" x 30). The bus event below still fires for the
+        # dashboard, just no stdout noise.
+        if _is_hallucination(text):
+            return ""
+        return text
 
     def stop(self) -> str:
         """Symmetric API with the old streaming transcriber. Returns final text."""
