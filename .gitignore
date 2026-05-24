@@ -2,32 +2,48 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.whl
 
 # Virtual envs
 .venv/
 venv/
 env/
+ENV/
 
 # Large model artifacts — downloaded per the README, not in source control
 models/*.bin
 models/*.onnx
 models/*.gguf
 models/*.safetensors
+models/*.pt
+models/*.pth
 
 # Legacy whisper.cpp binaries (we use faster-whisper now; bin/ kept for fallback)
 bin/
 
 # Debug recordings + temp WAVs (DEBUG=True writes them here)
 recordings/
+*.wav
 
 # Editor / OS
 .vscode/
 .idea/
 *.swp
+*.swo
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # Test artifacts the agents create at project root during voice runs
 /halo.html
@@ -35,6 +51,8 @@ Thumbs.db
 /index.html
 /*.png
 /*.jpg
+/*.jpeg
+/*.gif
 
 # Environment secrets — never commit
 .env
@@ -44,3 +62,12 @@ Thumbs.db
 # Claude Code's own per-project session state (the dev's own usage,
 # not part of Halo's source)
 .claude/
+
+# Halo runtime state (project registry, session continuation hashes,
+# anything we may persist in the future)
+.halo/
+~/.halo/
+
+# Logs
+*.log
+logs/
