@@ -51,10 +51,10 @@ recordings/
 Thumbs.db
 desktop.ini
 
-# Test artifacts the agents create at project root during voice runs
+# Test artifacts the agents create at project root during voice runs.
+# index.html is the real landing page now (since v1.1.1) — keep it tracked.
 /halo.html
 /hello.py
-/index.html
 /*.png
 /*.jpg
 /*.jpeg

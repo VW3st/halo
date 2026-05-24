@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Halo · voice frontend for agentic coding tools</title>
+<meta name="description" content="Talk to Claude Code or Codex CLI by voice. Custom 'halo' wake word, persistent agent sessions, live dashboard. 100% local — no API keys to run." />
+<meta name="theme-color" content="#0b0f15" />
+<meta property="og:title" content="Halo · voice frontend for agentic coding tools" />
+<meta property="og:description" content="Talk to Claude Code or Codex CLI by voice. Custom 'halo' wake word, persistent agent sessions, live dashboard. 100% local — no API keys to run." />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://github.com/VW3st/halo" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22><circle cx=%228%22 cy=%228%22 r=%226%22 fill=%22none%22 stroke=%22%2300d4ff%22 stroke-width=%222%22/></svg>" />
+<style>
+:root {
+  --bg-0: #07090c;
+  --bg-1: #0b0f15;
+  --bg-2: #11161f;
+  --bg-3: #18202d;
+  --line: #1f2a3a;
+  --line-soft: #141c28;
+  --text: #d9e3f1;
+  --text-dim: #6b7a90;
+  --text-faint: #3e4a5f;
+  --accent: #00d4ff;
+  --accent-dim: #007999;
+  --good: #6ee7b7;
+  --warn: #ffb547;
+  --bad: #ff5d6c;
+  --purple: #b794f4;
+  --font-ui: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg-0);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: -20% -20% auto auto;
+  width: 60%; height: 60%;
+  background: radial-gradient(circle at 70% 30%, rgba(0, 212, 255, 0.06), transparent 60%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.wrap {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 0 24px;
+  position: relative;
+  z-index: 1;
+}
+
+/* ---------- HEADER ---------- */
+.site-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 22px 0 18px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.brand {
+  font-family: var(--font-mono);
+  font-size: 16px;
+  letter-spacing: 0.36em;
+  font-weight: 700;
+  display: flex; align-items: center; gap: 10px;
+}
+.brand .dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 12px var(--accent);
+  animation: pulse 2.4s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 0.55; transform: scale(0.9); }
+  50%      { opacity: 1; transform: scale(1.05); }
+}
+.site-nav { display: flex; gap: 22px; font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.08em; }
+.site-nav a { color: var(--text-dim); }
+.site-nav a:hover { color: var(--text); text-decoration: none; }
+.site-nav .ver { color: var(--text-faint); }
+
+/* ---------- HERO ---------- */
+.hero {
+  padding: 80px 0 60px;
+  text-align: center;
+}
+.hero h1 {
+  font-family: var(--font-ui);
+  font-weight: 600;
+  font-size: clamp(36px, 6vw, 64px);
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  margin: 0 0 18px;
+  color: var(--text);
+}
+.hero h1 .accent {
+  background: linear-gradient(135deg, var(--accent), var(--purple));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.hero .tagline {
+  font-size: clamp(15px, 2vw, 19px);
+  color: var(--text-dim);
+  max-width: 640px;
+  margin: 0 auto 36px;
+}
+.hero .cta {
+  display: inline-flex;
+  gap: 12px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  letter-spacing: 0.05em;
+}
+.cta a {
+  padding: 12px 22px;
+  border-radius: 6px;
+  text-decoration: none;
+  font-weight: 500;
+  transition: transform .15s, background .15s;
+}
+.cta a:hover { transform: translateY(-1px); }
+.cta .primary {
+  background: var(--accent);
+  color: var(--bg-0);
+}
+.cta .primary:hover { background: #4ce0ff; }
+.cta .secondary {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--line);
+}
+.cta .secondary:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ---------- DEMO TRANSCRIPT ---------- */
+.demo {
+  background: var(--bg-1);
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  padding: 24px 28px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.7;
+  margin: 28px 0 60px;
+  position: relative;
+}
+.demo::before {
+  content: "live conversation";
+  position: absolute;
+  top: -10px; left: 18px;
+  background: var(--bg-0);
+  color: var(--text-faint);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  padding: 0 8px;
+  text-transform: uppercase;
+}
+.demo .you   { color: var(--text); }
+.demo .halo  { color: var(--accent); }
+.demo .note  { color: var(--text-faint); font-style: italic; padding-left: 8px; }
+.demo .lead  { color: var(--text-dim); margin-right: 6px; }
+
+/* ---------- PIPELINE ---------- */
+.pipeline-section { padding: 40px 0 20px; }
+.pipeline-section h2 {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin: 0 0 18px;
+}
+.pipeline {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 8px;
+}
+.stage {
+  background: var(--bg-1);
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  padding: 14px 12px;
+  text-align: center;
+}
+.stage .label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.stage .what {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 6px;
+  line-height: 1.35;
+}
+
+/* ---------- FEATURES ---------- */
+.features {
+  padding: 60px 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 22px;
+}
+.feat {
+  background: var(--bg-1);
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  padding: 24px 26px;
+}
+.feat h3 {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 10px;
+}
+.feat p { color: var(--text-dim); margin: 0; font-size: 14px; }
+.feat p code { font-family: var(--font-mono); font-size: 12px; color: var(--text); background: var(--bg-2); padding: 1px 5px; border-radius: 3px; }
+
+/* ---------- STACK TABLE ---------- */
+.stack { padding: 40px 0 60px; }
+.stack h2 {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin: 0 0 18px;
+}
+.stack-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg-1);
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  overflow: hidden;
+  font-size: 14px;
+}
+.stack-table th, .stack-table td {
+  text-align: left;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.stack-table th {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  font-weight: 400;
+  background: var(--bg-2);
+}
+.stack-table td:first-child {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--accent);
+  white-space: nowrap;
+}
+.stack-table tr:last-child td { border-bottom: none; }
+.stack-table code { font-family: var(--font-mono); font-size: 12px; color: var(--text); background: var(--bg-2); padding: 1px 5px; border-radius: 3px; }
+
+/* ---------- INSTALL ---------- */
+.install { padding: 40px 0 60px; }
+.install h2 {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin: 0 0 18px;
+}
+.install pre {
+  background: var(--bg-1);
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  padding: 18px 22px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text);
+  overflow-x: auto;
+  margin: 0;
+}
+.install pre .c { color: var(--text-faint); }
+.install pre .v { color: var(--accent); }
+
+/* ---------- FOOTER ---------- */
+.site-ftr {
+  border-top: 1px solid var(--line-soft);
+  padding: 28px 0 40px;
+  margin-top: 60px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-faint);
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.site-ftr a { color: var(--text-dim); }
+.site-ftr a:hover { color: var(--accent); }
+
+@media (max-width: 720px) {
+  .features { grid-template-columns: 1fr; }
+  .pipeline { grid-template-columns: repeat(3, 1fr); }
+  .site-nav { gap: 14px; font-size: 11px; }
+}
+</style>
+</head>
+<body>
+
+<header class="site-hdr wrap">
+  <div class="brand"><span class="dot"></span>HALO</div>
+  <nav class="site-nav">
+    <a href="#features">features</a>
+    <a href="#stack">stack</a>
+    <a href="#install">install</a>
+    <a href="https://github.com/VW3st/halo">github</a>
+    <span class="ver">v1.1</span>
+  </nav>
+</header>
+
+<main class="wrap">
+
+  <section class="hero">
+    <h1>Talk to <span class="accent">Claude Code</span> or <span class="accent">Codex CLI</span> by voice.</h1>
+    <p class="tagline">
+      Custom <code style="font-family:var(--font-mono);color:var(--accent);">"halo"</code> wake word.
+      One long-lived agent process per session.
+      Live dashboard at <code style="font-family:var(--font-mono);color:var(--accent);">localhost:7070</code>.
+      100% local — no API keys to run Halo itself.
+    </p>
+    <div class="cta">
+      <a class="primary" href="#install">install</a>
+      <a class="secondary" href="https://github.com/VW3st/halo">github →</a>
+    </div>
+  </section>
+
+  <section class="demo">
+    <div><span class="lead">you  →</span> <span class="you">"halo. Claude, write a one-line python script that prints hello."</span></div>
+    <div><span class="lead">halo →</span> <span class="halo">"On it. I'm calling this session Mercury."</span></div>
+    <div class="note">a separate PowerShell window opens, live-tailing Claude's text deltas + tool calls</div>
+    <div><span class="lead">halo →</span> <span class="halo">"I wrote it to hello dot py."</span></div>
+    <div>&nbsp;</div>
+    <div><span class="lead">you  →</span> <span class="you">"now make it print goodbye instead."</span></div>
+    <div class="note">same Mercury session (persistent process — no spawn cost, no `exit None`)</div>
+    <div><span class="lead">halo →</span> <span class="halo">"Done."</span></div>
+    <div>&nbsp;</div>
+    <div><span class="lead">you  →</span> <span class="you">"ask Codex to refactor it into a function."</span></div>
+    <div class="note">verbal dispatch regex matches "ask Codex to" → skips Stage 2 LLM</div>
+    <div><span class="lead">halo →</span> <span class="halo">"On it. I'm calling this session Neptune."</span></div>
+    <div>&nbsp;</div>
+    <div><span class="lead">you  →</span> <span class="you">"back to halo. open hello.py."</span></div>
+    <div><span class="lead">halo →</span> <span class="halo">"Opened hello.py."</span></div>
+    <div>&nbsp;</div>
+    <div><span class="lead">you  →</span> <span class="you">"end session."</span></div>
+    <div><span class="lead">halo →</span> <span class="halo">"Goodbye."</span></div>
+  </section>
+
+  <section class="pipeline-section">
+    <h2>pipeline</h2>
+    <div class="pipeline">
+      <div class="stage"><div class="label">wake</div><div class="what">openWakeWord<br/>halo.onnx</div></div>
+      <div class="stage"><div class="label">record</div><div class="what">sounddevice<br/>silero-VAD</div></div>
+      <div class="stage"><div class="label">transcribe</div><div class="what">faster-whisper<br/>distil-large-v3</div></div>
+      <div class="stage"><div class="label">route</div><div class="what">regex first<br/>Ollama fallback</div></div>
+      <div class="stage"><div class="label">agent</div><div class="what">Claude Code<br/>Codex CLI</div></div>
+      <div class="stage"><div class="label">voice</div><div class="what">Kokoro-82M<br/>af_heart</div></div>
+    </div>
+  </section>
+
+  <section id="features" class="features">
+    <div class="feat">
+      <h3>custom "halo" wake word</h3>
+      <p>Single-word wake trained on 188 ElevenLabs voice samples + 524 negatives. F1 = 0.80. Ships in the repo — no training step on first install. silero-VAD gate (<code>vad_threshold=0.7</code>) on top of the DNN kills false fires on room noise. Falls back to <code>hey_jarvis</code> if the file is missing.</p>
+    </div>
+    <div class="feat">
+      <h3>persistent Claude session</h3>
+      <p>One long-lived <code>claude -p --input-format stream-json</code> process per session, reused across every turn. No more per-turn subprocess spawn, no more <code>exit None</code> race condition. Each follow-up speaks the same session ID (<code>Mercury</code>, <code>Neptune</code>...).</p>
+    </div>
+    <div class="feat">
+      <h3>watch-Claude popup</h3>
+      <p>A separate PowerShell window opens per session, live-tailing <code>~/.halo/runtime/&lt;agent&gt;.log</code>. Text deltas, tool calls, result events all stream there so Halo's main terminal stays clean. Toggle with <code>AGENT_CLI_VISIBLE</code>.</p>
+    </div>
+    <div class="feat">
+      <h3>noise suppression pipeline</h3>
+      <p>Three layers: mic RMS noise gate, silero-VAD gate on the wake DNN, faster-whisper internal <code>vad_filter=True</code>. Plus a residual hallucination filter for distil-whisper's <em>"Thank you"</em> / <em>"hello"</em> artifacts on silence. Plus mic-mute during Halo's own TTS — no feedback loop.</p>
+    </div>
+    <div class="feat">
+      <h3>fuzzy fallback dispatcher</h3>
+      <p>When the router LLM is unreachable AND your transcript mentions an agent name (even a Whisper-mangled <em>"Cloud"</em> for <em>"Claude"</em>), Halo dispatches to that agent directly instead of giving up. <code>AgentConfig.fuzzy_triggers</code> is per-agent and extensible.</p>
+    </div>
+    <div class="feat">
+      <h3>live dashboard</h3>
+      <p>Auto-opens at <code>http://127.0.0.1:7070</code> on startup. Pipeline visualization, live transcript, session panel with green/yellow/red agent connection chips, recent files (click to open), reset/clear controls, event log polled at 4 Hz.</p>
+    </div>
+    <div class="feat">
+      <h3>voice-mode permissions</h3>
+      <p>Claude runs with <code>--permission-mode bypassPermissions</code>; Codex with <code>-c approval_policy="never"</code>. You can't click "approve" by voice, so both agents are pre-configured to never prompt. Verified against official Claude Code + OpenAI Codex CLI docs.</p>
+    </div>
+    <div class="feat">
+      <h3><code>halo doctor</code></h3>
+      <p>Read-only diagnostic. Probes Ollama (HTTP), each agent's <code>--version</code>, Kokoro model files. Prints <code>[ok]/[warn]/[fail]</code> per dependency with the exact install command for any miss. Run after install to verify your environment.</p>
+    </div>
+  </section>
+
+  <section id="stack" class="stack">
+    <h2>stack</h2>
+    <table class="stack-table">
+      <thead><tr><th>layer</th><th>tech</th><th>notes</th></tr></thead>
+      <tbody>
+        <tr><td>wake word</td><td><a href="https://github.com/dscripka/openWakeWord">openWakeWord</a> + custom <code>halo.onnx</code></td><td>trained via <a href="https://github.com/bbarrick/wakeword_trainer">bbarrick/wakeword_trainer</a></td></tr>
+        <tr><td>mic</td><td><a href="https://python-sounddevice.readthedocs.io/">sounddevice</a></td><td>16 kHz mono int16</td></tr>
+        <tr><td>VAD</td><td><a href="https://github.com/snakers4/silero-vad">silero-vad v5</a></td><td>600 ms base silence, mode-adaptive</td></tr>
+        <tr><td>STT</td><td><a href="https://github.com/SYSTRAN/faster-whisper">faster-whisper</a> + distil-large-v3</td><td>int8_float16 on CUDA, ~500 ms / utterance</td></tr>
+        <tr><td>router</td><td><a href="https://ollama.com">Ollama</a> + <code>qwen2.5:1.5b-instruct</code></td><td>regex first, LLM only as fallback</td></tr>
+        <tr><td>TTS</td><td><a href="https://huggingface.co/hexgrad/Kokoro-82M">Kokoro-82M</a> ONNX (fp16)</td><td><code>af_heart</code> voice, sanitized for Markdown</td></tr>
+        <tr><td>agents</td><td><a href="https://github.com/anthropics/claude-code">Claude Code</a> + <a href="https://github.com/openai/codex">Codex CLI</a></td><td>persistent sessions, voice-mode permission flags</td></tr>
+        <tr><td>dashboard</td><td>Flask + single-file vanilla JS</td><td>auto-opens in default browser on startup</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="install" class="install">
+    <h2>install</h2>
+    <pre><span class="c"># 1. clone or pip install</span>
+pip install <span class="v">git+https://github.com/VW3st/halo.git@v1.1.0</span>
+
+<span class="c"># 2. fetch the Kokoro TTS model (~200 MB)</span>
+halo download-models
+
+<span class="c"># 3. start Ollama (if not already running)</span>
+ollama pull <span class="v">qwen2.5:1.5b-instruct</span>
+
+<span class="c"># 4. install at least one coding agent</span>
+npm install -g <span class="v">@anthropic-ai/claude-code</span>  <span class="c"># then: claude login</span>
+npm install -g <span class="v">@openai/codex</span>             <span class="c"># then: codex login</span>
+
+<span class="c"># 5. verify everything's wired</span>
+halo doctor
+
+<span class="c"># 6. run</span>
+halo</pre>
+    <p style="color: var(--text-dim); font-size: 13px; margin-top: 14px;">
+      Windows + NVIDIA GPU recommended (RTX 3060 12 GB is enough). Mac / Linux paths exist; CUDA-specific bits gracefully fall back to CPU. Python 3.11+.
+    </p>
+  </section>
+
+</main>
+
+<footer class="site-ftr wrap">
+  <div>halo v1.1.0 · MIT licensed · built on top of the open-source voice + agent stack</div>
+  <div>
+    <a href="https://github.com/VW3st/halo">github</a> ·
+    <a href="https://github.com/VW3st/halo/blob/main/CHANGELOG.md">changelog</a> ·
+    <a href="https://github.com/VW3st/halo/issues">issues</a>
+  </div>
+</footer>
+
+</body>
+</html>
