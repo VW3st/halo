@@ -7,10 +7,10 @@
 <meta name="description" content="Talk to Claude Code or Codex CLI by voice. Custom 'halo' wake word, persistent agent sessions, live dashboard. 100% local — no API keys to run." />
 <meta name="theme-color" content="#0b0f15" />
 <meta property="og:title" content="Halo · voice frontend for agentic coding tools" />
-<meta property="og:description" content="Talk to Claude Code or Codex CLI by voice. Custom 'halo' wake word, persistent agent sessions, live dashboard. 100% local — no API keys to run." />
+<meta property="og:description" content="Talk to Claude Code or Codex CLI by voice. Custom 'halo' wake word, persistent agent sessions, live dashboard." />
 <meta property="og:type" content="website" />
 <meta property="og:url" content="https://github.com/VW3st/halo" />
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22><circle cx=%228%22 cy=%228%22 r=%226%22 fill=%22none%22 stroke=%22%2300d4ff%22 stroke-width=%222%22/></svg>" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><defs><radialGradient id=%22g%22 cx=%22.5%22 cy=%22.5%22 r=%22.5%22><stop offset=%220%22 stop-color=%22%2300d4ff%22 stop-opacity=%220%22/><stop offset=%22.7%22 stop-color=%22%2300d4ff%22 stop-opacity=%22.3%22/><stop offset=%221%22 stop-color=%22%2300d4ff%22/></radialGradient></defs><circle cx=%2216%22 cy=%2216%22 r=%2213%22 fill=%22none%22 stroke=%22url(%23g)%22 stroke-width=%223%22/><circle cx=%2216%22 cy=%2216%22 r=%224%22 fill=%22%2300d4ff%22/></svg>" />
 <style>
 :root {
   --bg-0: #07090c;
@@ -43,14 +43,25 @@ body {
   line-height: 1.55;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  overflow-x: hidden;
 }
 
+/* ambient glow behind the hero */
 body::before {
   content: "";
   position: fixed;
-  inset: -20% -20% auto auto;
-  width: 60%; height: 60%;
-  background: radial-gradient(circle at 70% 30%, rgba(0, 212, 255, 0.06), transparent 60%);
+  inset: -30% -20% auto auto;
+  width: 80%; height: 80%;
+  background: radial-gradient(circle at 70% 30%, rgba(0, 212, 255, 0.08), transparent 55%);
+  pointer-events: none;
+  z-index: 0;
+}
+body::after {
+  content: "";
+  position: fixed;
+  inset: auto auto -30% -20%;
+  width: 70%; height: 70%;
+  background: radial-gradient(circle at 30% 70%, rgba(183, 148, 244, 0.06), transparent 55%);
   pointer-events: none;
   z-index: 0;
 }
@@ -75,22 +86,14 @@ a:hover { text-decoration: underline; }
   border-bottom: 1px solid var(--line-soft);
 }
 .brand {
+  display: flex; align-items: center; gap: 12px;
   font-family: var(--font-mono);
   font-size: 16px;
   letter-spacing: 0.36em;
   font-weight: 700;
-  display: flex; align-items: center; gap: 10px;
+  color: var(--text);
 }
-.brand .dot {
-  width: 9px; height: 9px; border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 12px var(--accent);
-  animation: pulse 2.4s ease-in-out infinite;
-}
-@keyframes pulse {
-  0%, 100% { opacity: 0.55; transform: scale(0.9); }
-  50%      { opacity: 1; transform: scale(1.05); }
-}
+.brand .mark { width: 28px; height: 28px; display: block; }
 .site-nav { display: flex; gap: 22px; font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.08em; }
 .site-nav a { color: var(--text-dim); }
 .site-nav a:hover { color: var(--text); text-decoration: none; }
@@ -98,13 +101,51 @@ a:hover { text-decoration: underline; }
 
 /* ---------- HERO ---------- */
 .hero {
-  padding: 80px 0 60px;
+  padding: 70px 0 60px;
   text-align: center;
+  position: relative;
 }
+.hero-logo {
+  width: 200px;
+  height: 200px;
+  margin: 0 auto 28px;
+  display: block;
+  position: relative;
+}
+.hero-logo svg { width: 100%; height: 100%; display: block; }
+
+/* sound-wave rings: outward pulse */
+.hero-logo .ring-pulse {
+  transform-origin: 100px 100px;
+  animation: ring-pulse 3.2s ease-out infinite;
+  opacity: 0;
+}
+.hero-logo .ring-pulse.d1 { animation-delay: 0s; }
+.hero-logo .ring-pulse.d2 { animation-delay: 1.06s; }
+.hero-logo .ring-pulse.d3 { animation-delay: 2.13s; }
+@keyframes ring-pulse {
+  0%   { transform: scale(0.55); opacity: 0; }
+  15%  { opacity: 0.7; }
+  100% { transform: scale(1.5); opacity: 0; }
+}
+.hero-logo .halo-ring { animation: halo-glow 4s ease-in-out infinite; }
+@keyframes halo-glow {
+  0%, 100% { opacity: 0.85; filter: drop-shadow(0 0 6px rgba(0,212,255,0.35)); }
+  50%      { opacity: 1;    filter: drop-shadow(0 0 16px rgba(0,212,255,0.65)); }
+}
+.hero-logo .core {
+  animation: core-pulse 2.4s ease-in-out infinite;
+  transform-origin: 100px 100px;
+}
+@keyframes core-pulse {
+  0%, 100% { transform: scale(0.92); opacity: 0.85; }
+  50%      { transform: scale(1.08); opacity: 1; }
+}
+
 .hero h1 {
   font-family: var(--font-ui);
   font-weight: 600;
-  font-size: clamp(36px, 6vw, 64px);
+  font-size: clamp(36px, 6vw, 60px);
   line-height: 1.05;
   letter-spacing: -0.02em;
   margin: 0 0 18px;
@@ -122,6 +163,7 @@ a:hover { text-decoration: underline; }
   max-width: 640px;
   margin: 0 auto 36px;
 }
+.hero .tagline code { font-family: var(--font-mono); color: var(--accent); font-size: 0.92em; }
 .hero .cta {
   display: inline-flex;
   gap: 12px;
@@ -134,12 +176,13 @@ a:hover { text-decoration: underline; }
   border-radius: 6px;
   text-decoration: none;
   font-weight: 500;
-  transition: transform .15s, background .15s;
+  transition: transform .15s, background .15s, border-color .15s, color .15s;
 }
 .cta a:hover { transform: translateY(-1px); }
 .cta .primary {
   background: var(--accent);
   color: var(--bg-0);
+  box-shadow: 0 0 24px rgba(0, 212, 255, 0.25);
 }
 .cta .primary:hover { background: #4ce0ff; }
 .cta .secondary {
@@ -148,6 +191,20 @@ a:hover { text-decoration: underline; }
   border: 1px solid var(--line);
 }
 .cta .secondary:hover { border-color: var(--accent); color: var(--accent); }
+
+.hero .badges {
+  margin-top: 28px;
+  display: inline-flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: var(--text-faint);
+  text-transform: uppercase;
+}
+.hero .badges span::before { content: "•  "; color: var(--accent); }
 
 /* ---------- DEMO TRANSCRIPT ---------- */
 .demo {
@@ -160,6 +217,7 @@ a:hover { text-decoration: underline; }
   line-height: 1.7;
   margin: 28px 0 60px;
   position: relative;
+  box-shadow: 0 30px 60px -30px rgba(0, 0, 0, 0.6);
 }
 .demo::before {
   content: "live conversation";
@@ -179,7 +237,9 @@ a:hover { text-decoration: underline; }
 
 /* ---------- PIPELINE ---------- */
 .pipeline-section { padding: 40px 0 20px; }
-.pipeline-section h2 {
+.pipeline-section h2,
+.stack h2,
+.install h2 {
   font-family: var(--font-mono);
   font-size: 11px;
   letter-spacing: 0.3em;
@@ -198,7 +258,9 @@ a:hover { text-decoration: underline; }
   border-radius: 6px;
   padding: 14px 12px;
   text-align: center;
+  transition: border-color .15s, transform .15s;
 }
+.stage:hover { border-color: var(--accent-dim); transform: translateY(-2px); }
 .stage .label {
   font-family: var(--font-mono);
   font-size: 10px;
@@ -226,7 +288,9 @@ a:hover { text-decoration: underline; }
   border: 1px solid var(--line-soft);
   border-radius: 10px;
   padding: 24px 26px;
+  transition: border-color .15s, transform .15s;
 }
+.feat:hover { border-color: var(--accent-dim); transform: translateY(-2px); }
 .feat h3 {
   font-family: var(--font-mono);
   font-size: 11px;
@@ -240,14 +304,6 @@ a:hover { text-decoration: underline; }
 
 /* ---------- STACK TABLE ---------- */
 .stack { padding: 40px 0 60px; }
-.stack h2 {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.3em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-  margin: 0 0 18px;
-}
 .stack-table {
   width: 100%;
   border-collapse: collapse;
@@ -282,14 +338,6 @@ a:hover { text-decoration: underline; }
 
 /* ---------- INSTALL ---------- */
 .install { padding: 40px 0 60px; }
-.install h2 {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.3em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-  margin: 0 0 18px;
-}
 .install pre {
   background: var(--bg-1);
   border: 1px solid var(--line-soft);
@@ -325,13 +373,27 @@ a:hover { text-decoration: underline; }
   .features { grid-template-columns: 1fr; }
   .pipeline { grid-template-columns: repeat(3, 1fr); }
   .site-nav { gap: 14px; font-size: 11px; }
+  .hero-logo { width: 150px; height: 150px; margin-bottom: 20px; }
+  .hero { padding: 40px 0 50px; }
 }
 </style>
 </head>
 <body>
 
 <header class="site-hdr wrap">
-  <div class="brand"><span class="dot"></span>HALO</div>
+  <div class="brand">
+    <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+      <defs>
+        <linearGradient id="hdr-ring" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#00d4ff"/>
+          <stop offset="100%" stop-color="#b794f4"/>
+        </linearGradient>
+      </defs>
+      <circle cx="16" cy="16" r="13" fill="none" stroke="url(#hdr-ring)" stroke-width="2.4"/>
+      <circle cx="16" cy="16" r="4" fill="#00d4ff"/>
+    </svg>
+    HALO
+  </div>
   <nav class="site-nav">
     <a href="#features">features</a>
     <a href="#stack">stack</a>
@@ -344,16 +406,48 @@ a:hover { text-decoration: underline; }
 <main class="wrap">
 
   <section class="hero">
-    <h1>Talk to <span class="accent">Claude Code</span> or <span class="accent">Codex CLI</span> by voice.</h1>
+    <div class="hero-logo" aria-hidden="true">
+      <svg viewBox="0 0 200 200">
+        <defs>
+          <linearGradient id="halo-grad" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#00d4ff"/>
+            <stop offset="100%" stop-color="#b794f4"/>
+          </linearGradient>
+          <radialGradient id="core-grad" cx=".5" cy=".5" r=".5">
+            <stop offset="0%" stop-color="#ffffff"/>
+            <stop offset="40%" stop-color="#00d4ff"/>
+            <stop offset="100%" stop-color="#007999"/>
+          </radialGradient>
+        </defs>
+        <!-- outgoing soundwave rings -->
+        <circle class="ring-pulse d1" cx="100" cy="100" r="50" fill="none" stroke="#00d4ff" stroke-width="1.5"/>
+        <circle class="ring-pulse d2" cx="100" cy="100" r="50" fill="none" stroke="#00d4ff" stroke-width="1.5"/>
+        <circle class="ring-pulse d3" cx="100" cy="100" r="50" fill="none" stroke="#00d4ff" stroke-width="1.5"/>
+        <!-- the halo ring -->
+        <circle class="halo-ring" cx="100" cy="100" r="62" fill="none" stroke="url(#halo-grad)" stroke-width="3"/>
+        <circle class="halo-ring" cx="100" cy="100" r="62" fill="none" stroke="url(#halo-grad)" stroke-width="1" opacity="0.4" transform="rotate(0 100 100) scale(1.08)" transform-origin="100 100"/>
+        <!-- inner mic / orb -->
+        <circle class="core" cx="100" cy="100" r="22" fill="url(#core-grad)"/>
+        <!-- mic slot -->
+        <rect x="96" y="90" width="8" height="20" rx="4" fill="#07090c" opacity="0.65"/>
+      </svg>
+    </div>
+    <h1>Talk to <span class="accent">Claude Code</span><br/>or <span class="accent">Codex CLI</span> by voice.</h1>
     <p class="tagline">
-      Custom <code style="font-family:var(--font-mono);color:var(--accent);">"halo"</code> wake word.
+      Custom <code>"halo"</code> wake word.
       One long-lived agent process per session.
-      Live dashboard at <code style="font-family:var(--font-mono);color:var(--accent);">localhost:7070</code>.
+      Live dashboard at <code>localhost:7070</code>.
       100% local — no API keys to run Halo itself.
     </p>
     <div class="cta">
       <a class="primary" href="#install">install</a>
       <a class="secondary" href="https://github.com/VW3st/halo">github →</a>
+    </div>
+    <div class="badges">
+      <span>v1.1.0</span>
+      <span>MIT</span>
+      <span>Windows / Mac / Linux</span>
+      <span>Python 3.11+</span>
     </div>
   </section>
 
