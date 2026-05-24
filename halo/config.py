@@ -113,6 +113,21 @@ CONVERSATION_IDLE_ENGAGED_SEC = 90.0
 # Per-agent override via `AgentConfig.cli_visible` (None = use this).
 AGENT_CLI_VISIBLE = True
 
+# Follow-up gate. After a dispatch puts Halo in direct-dialogue mode,
+# the mic stays hot so follow-ups ("now also add tests") don't need
+# to re-state the agent name. Without a gate, every transcribed
+# utterance — including phone-call audio and side conversations —
+# gets piped to the active agent.
+#
+# When True (default), each direct-mode utterance passes through
+# halo.followup_gate.passes() first. Side conversation is dropped
+# silently and a `side_convo.ignored` bus event is emitted so the
+# dashboard event log shows what was filtered.
+#
+# Set to False to disable the gate entirely (old v1.1.0 behaviour:
+# every direct-mode transcript reaches the agent).
+FOLLOWUP_GATE_ENABLED = True
+
 # Step 3.5 adaptive constants. Total silence-to-commit per mode
 # (silero base + orchestrator extra). See detect_mode() in halo/turn.py.
 MODE_SILENCE_SEC = {

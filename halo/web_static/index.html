@@ -431,6 +431,8 @@ body::before {
 .log .row.k-tts  .kind, .log .row.k-tts  .body  { color: var(--good); opacity: .85; }
 .log .row.k-err  .kind, .log .row.k-err  .body  { color: var(--bad); }
 .log .row.k-mode .kind, .log .row.k-mode .body  { color: var(--purple); }
+.log .row.k-side .kind, .log .row.k-side .body  { color: var(--text-faint); font-style: italic; }
+.log .row.k-side .kind::after                   { content: " (filtered)"; color: var(--text-faint); font-size: 10px; }
 
 /* scrollbars */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
@@ -599,6 +601,7 @@ body::before {
       "tts.spoke": "k-tts",
       "mode.changed": "k-mode", "session.reset": "k-mode",
       "convo.entered": "k-mode", "convo.exited": "k-mode",
+      "side_convo.ignored": "k-side",
     })[evt.kind] || "";
     row.className = "row " + klass;
     row.innerHTML =
@@ -612,6 +615,10 @@ body::before {
   function formatBody(evt) {
     const { seq, ts, kind, ...rest } = evt;
     if (Object.keys(rest).length === 0) return "";
+    if (kind === "side_convo.ignored") {
+      const reason = rest.reason ? `[${rest.reason}] ` : "";
+      return `${reason}${rest.text || ""}`;
+    }
     if ("text" in rest) return rest.text;
     if ("name" in rest && "sentence" in rest) return `${rest.name}: ${rest.sentence}`;
     if ("prompt" in rest) return rest.prompt;
@@ -670,6 +677,13 @@ body::before {
         setStage("tts", "speaking", 1500);
         setSpeaking(evt.who || "Halo", evt.text || "");
         setTimeout(() => setSpeaking(null, null), Math.max(1500, (evt.text || "").length * 60));
+        break;
+      case "side_convo.ignored":
+        // Flash the route stage so the user can SEE that an utterance
+        // got dropped by the follow-up gate. Reason is shown in the log
+        // row below ("agent_name" / "continuation" / "coding_intent" /
+        // "side_conversation" / "no_signal").
+        setStage("route", `side-talk dropped`, 1500);
         break;
     }
     pushLog(evt);

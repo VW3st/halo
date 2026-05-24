@@ -10,6 +10,84 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.1.1] — 2026-05-25
+
+Single feature, single failure mode killed.
+
+### Added (follow-up gate)
+
+- **`halo/followup_gate.py`** — new module gating every direct-dialogue
+  mode utterance before it reaches the agent. Background: once you say
+  *"Claude, build fizzbuzz"* Halo enters direct mode and the mic stays
+  hot so follow-ups don't need to re-state the agent name. Without a
+  filter, anything the mic captured in the next 90s (phone calls, side
+  conversations, your own muttering) would get transcribed and
+  dispatched straight to Claude. The gate is a 4-rule keyword filter:
+  - **Rule 1 — agent name mentioned.** Whole-word match against any
+    agent's `voice_triggers` + `fuzzy_triggers` (so Whisper-mangled
+    "Cloud" still counts). Most reliable signal.
+  - **Rule 2 — continuation marker on short utterance (≤ 12 words).**
+    Opens with `now` / `also` / `then` / `instead` / `and now` / `now
+    also` / `actually` / `wait` / `scratch that` / etc. Catches the
+    natural mid-session phrasings (*"now also add tests"*).
+  - **Rule 3 — coding imperative + technical signal.** Verb from a
+    65-word allowlist (`write` / `add` / `fix` / `refactor` / `delete`
+    / `test` / `commit` / `deploy` / …) **AND** at least one anchor:
+    coding noun (`file` / `function` / `bug` / `endpoint` / `branch` /
+    `commit` / `prop` / `state` / …), named tech (`Python` / `React` /
+    `TypeScript` / `Postgres` / …), or a continuation marker.
+  - **Rule 4 — explicit side-conversation patterns + default DROP.**
+    Phone openers (*"hello?"* / *"can you hear me"* / *"let me call you
+    back"*), social chatter (*"grab lunch"* / *"see you tomorrow"*),
+    and greetings to named third parties (*"hey John,"*) hard-drop
+    early. Anything else that didn't match Rules 1-3 also drops.
+- **`FOLLOWUP_GATE_ENABLED` config flag** (default `True`). Set to
+  `False` for the old v1.1.0 behaviour where every direct-mode utterance
+  reaches the agent.
+- **`side_convo.ignored` bus event** emitted on every drop with
+  `{text, reason, agent}`. Reason is one of `agent_name` /
+  `continuation` / `coding_intent` (allow tags) or `empty` /
+  `side_conversation` / `no_signal` (drop tags) for log/audit.
+- **Dashboard surfacing** — new `k-side` event-log style (greyed
+  italic, `(filtered)` suffix) so dropped utterances appear in the
+  event log with their rejection reason and the transcript that got
+  filtered. The route stage briefly flashes *"side-talk dropped"* when
+  the gate rejects so the user can see it happening live.
+
+### Changed
+- **`halo/__main__.py`** direct-dialogue branch (line ~662): wraps the
+  existing dispatch in `if not FOLLOWUP_GATE_ENABLED or
+  followup_gate_passes(cleaned, direct_agent)`. On drop, prints
+  `[side-talk dropped: <reason>] <text>` and emits the bus event;
+  stays in direct mode but does NOT reset `last_activity` (so an
+  ambient phone call doesn't keep the 90s engaged window alive
+  indefinitely).
+- README: new **Follow-up gate** section explaining the 4 rules with
+  examples. v1.1 highlights opens with the gate entry. File-layout
+  block lists `followup_gate.py`. Hero example shows the
+  phone-call-during-session scenario being filtered.
+
+### Rationale
+The gate is intentionally regex-only — no Ollama round-trip, no model
+load, ~0 ms latency. Rules 1-2 are nearly precision-perfect; Rule 3
+is the recall workhorse. Rule 4 (default DROP) does the heavy lifting:
+the cost of dropping a legitimate vague follow-up (*"make it bigger"*
+with no clear noun → drops) is one retry; the cost of dispatching a
+phone-call sentence to Claude is real damage. We chose safety.
+
+### Known limitations
+- A vague follow-up that lacks both a coding noun AND a continuation
+  marker (*"make it bigger"*, *"do that again"*) will drop. Workaround:
+  say *"Claude, make it bigger"* or rephrase with a noun (*"make the
+  button bigger"*). Future work: optional 300 ms Stage 2 fallback for
+  borderline Rule-3 cases.
+- The gate sees only the cleaned transcript, not speaker identity.
+  A second person in the room saying *"Claude, undo that"* would still
+  pass Rule 1. Speaker fingerprinting (`resemblyzer` / `pyannote`) is
+  the next layer if this becomes a real problem; not in this release.
+
+---
+
 ## [1.1.0] — 2026-05-24
 
 Big release — custom wake word, persistent Claude sessions, dashboard

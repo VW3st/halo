@@ -4,7 +4,7 @@ Voice front-end for agentic coding tools. Say a wake word, talk to
 Claude Code or Codex CLI in plain English, and hear the result back.
 Halo is the audio layer; the agents do the work.
 
-Status: **v1.1 — custom "halo" wake word, persistent Claude sessions, separate-console live feed, noise-suppression pipeline.** Live web dashboard at `http://127.0.0.1:7070`.
+Status: **v1.1.1 — follow-up gate keeps phone calls and side conversations out of your agent session.** Builds on v1.1 (custom "halo" wake word, persistent Claude sessions, separate-console live feed, noise-suppression pipeline). Live web dashboard at `http://127.0.0.1:7070`.
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full history. Licensed MIT
 ([LICENSE](./LICENSE)).
@@ -48,7 +48,13 @@ Halo: "On it. I'm calling this session Mercury."
 
 You: "now make it print goodbye instead."
         ... same Mercury session (persistent process, no spawn cost)
+        ... gate: continuation marker matched, sent
 Halo: "Done."
+
+[phone rings]
+You: "hey John, want to grab lunch?"
+        ... gate: side_conversation pattern matched, dropped silently
+        ... dashboard logs it; Mercury never sees it
 
 You: "ask Codex to refactor it into a function."
         ... verbal-dispatch regex catches this, skips Stage 2 LLM
@@ -85,6 +91,13 @@ fall back to CPU.
 
 ### v1.1 highlights
 
+- **Follow-up gate (v1.1.1)** — once you're in direct dialogue with an
+  agent, the mic stays hot for follow-ups but a 4-rule keyword filter
+  decides whether each utterance is actually for the agent. Phone calls,
+  side conversations to colleagues, and your own muttering get silently
+  dropped instead of being dispatched to Claude. See
+  [Follow-up gate](#follow-up-gate) below for the rules. Toggle with
+  `FOLLOWUP_GATE_ENABLED` in `halo/config.py`.
 - **Custom "halo" wake word** — single-word wake ("halo" alone fires
   it, no "hey" prefix needed). Trained on RTX 3060 in ~30 min via
   bbarrick's wakeword_trainer + ElevenLabs free-tier TTS.
@@ -312,6 +325,62 @@ the conversation stays open until you explicitly say `"goodbye"`,
 idle sleep only applies when you're in plain Halo mode (no direct
 dialogue and no running jobs).
 
+### Follow-up gate
+
+Once you've dispatched to an agent (vocative, verbal, or pure switch),
+Halo enters **direct-dialogue mode** — the mic stays hot so follow-ups
+("now also add tests") don't need to re-state the agent name.
+
+Without a filter, that hot mic would dispatch *everything it captures*
+to the agent: the phone call you take 10 seconds after the dispatch, the
+colleague who walks over, even you muttering at your own screen. **All
+of that audio would get transcribed and sent to Claude as if it were a
+command.**
+
+The **follow-up gate** (`halo/followup_gate.py`) runs every direct-mode
+transcript through 4 rules before dispatch. First match wins → SEND.
+If none match → drop silently and log to the dashboard.
+
+| Rule | Fires when… | Example that fires it |
+|---|---|---|
+| **1. Agent name** | The transcript mentions `claude`, `codex`, or any per-agent `fuzzy_triggers` (e.g. `cloud`, `clawed`, `kodex`) | *"Claude, undo that"* |
+| **2. Continuation marker on short utterance** | Opens with `now` / `also` / `then` / `instead` / `and now` / etc., and is ≤ 12 words | *"now also add tests"* |
+| **3. Coding imperative + technical signal** | Verb like `write` / `add` / `refactor` / `fix` + at least one coding noun (`file`, `function`, `bug`, `endpoint`, …) or named tech (`Python`, `React`, …) or a continuation marker | *"refactor the auth function"* |
+| **4. (default: drop)** | Side-conversation pattern fires explicitly (phone openers, lunch chatter, greetings to a third party) **OR** nothing above matched | *"hey John, want to grab lunch?"* — dropped |
+
+Examples:
+
+```
+You: "Claude, build a fizzbuzz in Python."
+   → vocative dispatch → Mercury starts
+   → direct-dialogue mode active
+
+[phone rings]
+You: "hey John, want to grab lunch?"
+   → gate: side_conversation → DROPPED  (logged to dashboard)
+   → Mercury never sees it. Direct mode stays on.
+
+You: "now also add tests."
+   → gate: continuation → SENT to Mercury
+```
+
+The dashboard event log marks dropped utterances with the
+`side_convo.ignored` event (greyed italic, `(filtered)` suffix) plus
+the rule that rejected it (`side_conversation` / `no_signal`), so you
+can see what got filtered and tweak the keyword sets in
+`halo/followup_gate.py` if needed.
+
+The gate is regex-only — zero LLM round-trip cost, ~0 ms latency. It
+deliberately errs on the side of dropping when ambiguous (a vague *"make
+it bigger"* with no clear noun probably drops; just say *"Claude, make
+it bigger"* or rephrase with a noun). The safety-vs-friction tradeoff
+favors safety: a missed legitimate command costs you one retry; a
+phone-call sentence dispatched to Claude can do real damage.
+
+Disable entirely with `FOLLOWUP_GATE_ENABLED = False` in
+`halo/config.py` if you want the old v1.1.0 behaviour (every direct-mode
+utterance reaches the agent).
+
 ### Mythology names
 
 When a new session starts for an agent, Halo assigns it a random
@@ -423,6 +492,7 @@ halo/
   router.py       Stage 1 rules + Stage 2 LLM (Ollama qwen2.5 + JSON schema)
   turn.py         per-turn orchestration (record/transcribe; routing in __main__)
   tools.py        cross-platform local tools (browser, calc, notepad, ...)
+  followup_gate.py 4-rule keyword filter for direct-dialogue mode (v1.1.1)
   agents.py       agent registry, dispatch, background jobs, session names
   voice.py        Kokoro TTS + Markdown sanitizer
   bus.py          thread-safe event bus (ring buffer of {kind, ts, ...})

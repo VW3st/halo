@@ -49,7 +49,12 @@ from halo.agents import (
     status_summary,
     summarize_for_speech,
 )
-from halo.config import CONVERSATION_IDLE_ENGAGED_SEC, CONVERSATION_IDLE_SEC
+from halo.config import (
+    CONVERSATION_IDLE_ENGAGED_SEC,
+    CONVERSATION_IDLE_SEC,
+    FOLLOWUP_GATE_ENABLED,
+)
+from halo.followup_gate import passes as followup_gate_passes
 from halo.record import preload_models as preload_audio_models
 from halo.router import preload_router, understand_and_route
 from halo.tools import execute_system_intent
@@ -662,6 +667,31 @@ def run_conversation() -> None:
             if not cleaned:
                 print("  direct-dialogue: empty after wake-strip, ignoring")
                 continue
+
+            # Follow-up gate: every direct-mode utterance has to look
+            # like it's addressed to the agent before we forward it.
+            # Without this, anything the mic captures while you're
+            # mid-session — phone calls, side conversations, the
+            # colleague who just walked over — gets dispatched to
+            # Claude as if it were a command. See halo/followup_gate.py
+            # for the 4-rule decision logic.
+            if FOLLOWUP_GATE_ENABLED:
+                allow, reason = followup_gate_passes(cleaned, direct_agent)
+                if not allow:
+                    print(f"  [side-talk dropped: {reason}] {cleaned!r}")
+                    bus.emit(
+                        "side_convo.ignored",
+                        text=cleaned,
+                        reason=reason,
+                        agent=direct_agent,
+                    )
+                    # Stay in direct mode. Don't reset last_activity —
+                    # we don't want a phone call to keep the engaged
+                    # window alive indefinitely; the existing 90s
+                    # idle clock should still apply.
+                    continue
+                print(f"  [direct-dialogue gate: {reason}]")
+
             print(f"  direct-dialogue -> {direct_agent}")
             bus.emit("route.matched", handler="direct", target=direct_agent)
             phrase = _start_agent_and_ack(direct_agent, cleaned)
