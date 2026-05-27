@@ -10,6 +10,86 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.2.3] — 2026-05-25
+
+UX fix — "hello, can you hear me?" no longer spawns a Claude session.
+
+### The bug
+v1.2.2 trace from live testing:
+```
+heard: "Hello, what's happening right now? What are you working on?
+        This is a test. Do you hear me?"
+no local handler matched -> Stage 2 LLM
+stage 2: 4667ms
+decision: status=ready  intent=system  agent=none
+no tool matched ... -> falling through to claude_code
+dispatching to Janus / claude (persistent session, starting)
+```
+The user said "hello, are you there?" and Halo spawned a fresh Claude
+session to answer it. 12-second round-trip, real tokens used, surprising
+behavior. Two layers conspired:
+- The 1.5B Stage 2 LLM mis-classified conversational pings as
+  `status=ready, intent=system` instead of `status=chitchat`.
+- The orchestrator's `intent=system + no tool matched` branch blanket-
+  dispatched to Claude on the theory that "falling through beats a flat
+  I-don't-know." That theory is wrong for chitchat.
+
+### Added (chitchat-to-Halo regex layer)
+- **`_CHITCHAT_PATTERNS`** in `halo/__main__.py` — 10 regex patterns
+  with hand-picked canned replies (multiple variants per pattern,
+  randomly picked so Halo doesn't sound robotic when you hammer her
+  with tests). Covers:
+  - existence/presence checks (*"are you there?"* / *"are you
+    listening?"* / *"are you awake?"*)
+  - audio checks (*"can you hear me?"* / *"do you hear me?"* / *"am I
+    coming through?"*)
+  - wake-only greetings (*"hi halo"* / *"hey there"* / *"yo"*)
+  - test pings — bare *"test"*, *"testing"*, repeated (*"test test"*),
+    counters (*"1 2 3"*, *"one two three"*, *"1 2 3 test"*), mic checks
+    (*"mic check"*, *"audio check"*, *"this is a test"*)
+  - activity checks (*"what are you doing?"* / *"what are you working
+    on?"* / *"what are you up to?"*)
+  - status pings (*"what's up?"* / *"what's happening?"* / *"how are
+    you?"*)
+  - thanks (*"thanks"* / *"good job"* — Halo says *"anytime."*)
+- **`_chitchat_reply(text)`** returns a canned reply string when any
+  pattern fires, else None. Random pick from the variant list.
+
+### Changed (orchestrator priority list)
+- New step **6b. Chitchat-to-Halo** inserted between Status/Replay
+  (step 6) and Tool fast-path (step 7). Runs BEFORE Stage 2 LLM —
+  saves the 4-5 s round-trip on every chitchat utterance. Halo speaks
+  the canned reply via Kokoro, stays awake (no return), and continues
+  to the next turn.
+- **Tightened `intent=system` fall-through.** New `_looks_like_real_task`
+  heuristic gates the auto-dispatch to Claude: only proceeds if the
+  cleaned text contains a coding-imperative verb (write / fix /
+  refactor / etc.) OR a technical noun (file / function / bug / route
+  / etc.). Otherwise Halo says *"I'm not sure what you'd like me to
+  do."* — polite refusal, no Claude session spawned, no surprise.
+
+### Verified
+- 19/19 chitchat detector cases pass (13 chitchat-shape + 6 real-task
+  must NOT match chitchat).
+- 7/7 real-task heuristic cases pass.
+- All 5 existing test suites still pass (50/50 total: 14 registry +
+  15 discovery + 7 agents_multicwd + 8 brain_routing + 6 summarize).
+
+### What this changes in practice
+| Said | Old (v1.2.2) | New (v1.2.3) |
+|---|---|---|
+| *"Hello, are you there?"* | spawn Claude → 12s round-trip | *"Yes, I'm here."* — instant |
+| *"Test test"* / *"1 2 3"* | spawn Claude | *"Test received."* |
+| *"What are you doing?"* | spawn Claude | *"Just listening. What would you like me to do?"* |
+| *"Open the dishwasher"* | spawn Claude (real-task heuristic still fires on "open") | spawn Claude — unchanged for actual unknown system commands |
+| *"Claude, build me a fizzbuzz"* | spawn Claude — unchanged | spawn Claude — unchanged |
+| *"open chrome"* | local tool fires — unchanged | local tool fires — unchanged |
+
+The chitchat layer never blocks a real command — it requires a clear
+conversational pattern at the start or as the whole utterance.
+
+---
+
 ## [1.2.2] — 2026-05-25
 
 Bug fix — discovery was missing real Claude sessions on Windows

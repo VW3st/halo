@@ -168,6 +168,111 @@ def _cwd_for_dispatch(target_session: str) -> Path:
     return DEFAULT_CWD
 
 
+# Chitchat-to-Halo phrases. These intercept BEFORE Stage 2 LLM fires so
+# (a) we save the 4-5 s round-trip and (b) we never accidentally
+# dispatch "hello, are you there?" to Claude as a coding task. Pattern
+# match → Halo speaks the canned reply and the turn ends.
+#
+# Order matters: more specific patterns first. Each entry is
+# (pattern, [reply variants...]). A random pick keeps it from sounding
+# robotic when you hammer Halo with test utterances.
+_CHITCHAT_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
+    # Existence / presence check
+    (re.compile(r"\b(are you (there|here|on|alive|listening|hearing me|with me|awake|around))\b", re.I),
+     ("Yes, I'm here.", "Still here.", "Right here.")),
+    (re.compile(r"\b(can you hear me|do you hear me|am i coming through|hearing me)\b", re.I),
+     ("Loud and clear.", "I hear you.", "Yes, clearly.")),
+    # Wake-only greetings (no follow-up content)
+    (re.compile(r"^\s*(hi|hey|hello|yo|sup|howdy)\s*(halo|there|you)?[.,!?\s]*$", re.I),
+     ("Hi. What can I do for you?", "Hey. Ready when you are.", "Hi there.")),
+    # Test pings — bare "test" / "testing" / repeated / mic check
+    (re.compile(r"^[\s.,!?]*(test|testing|mic check|audio check)"
+                r"([\s.,]+(test|testing|1 2 3|one two three|\d+))*[\s.,!?]*$", re.I),
+     ("Test received.", "I'm listening.", "Got it.")),
+    # Test pings — numeric / spoken counters ("1 2 3", "one two three")
+    (re.compile(r"^[\s.,!?]*(\d+|one|two|three|four|five)"
+                r"([\s.,]+(\d+|one|two|three|four|five|test|testing))+[\s.,!?]*$", re.I),
+     ("Test received.", "Mic check confirmed.", "Got it.")),
+    # Test pings — full sentence
+    (re.compile(r"^[\s.,!?]*(this is a |it'?s a |just a |running a |doing a )"
+                r"(test|mic check|audio check|system check)[\s.,!?]*$", re.I),
+     ("Test received.", "I'm listening.", "Got it.")),
+    # Activity check (no specific subject — clearly aimed at Halo)
+    (re.compile(r"^\s*(what are you (doing|working on|up to|busy with))[.,!?\s]*$", re.I),
+     ("Just listening. What would you like me to do?",
+      "Waiting on you. What's the task?",
+      "Standing by. What do you need?")),
+    # "What's up / what's happening" with no actionable content
+    (re.compile(r"^\s*(what'?s (up|happening|going on|new|the deal))[.,!?\s]*$", re.I),
+     ("All good. Ready when you are.", "Just here. What's the task?")),
+    # "How are you" style
+    (re.compile(r"^\s*(how are you|how'?s it going|how are things)[.,!?\s]*$", re.I),
+     ("Good. What's up?", "All good. What do you need?")),
+    # Compliments / thanks (no follow-up action)
+    (re.compile(r"^\s*(thanks|thank you|nice|cool|good job|well done|awesome)[.,!?\s]*$", re.I),
+     ("Anytime.", "Glad to help.", "Happy to.")),
+)
+
+
+def _chitchat_reply(text: str) -> str | None:
+    """If `text` is a clear conversational ping at Halo, return one of
+    the canned replies. Otherwise None — caller proceeds with normal
+    routing.
+
+    Pattern match wins over Stage 2 LLM because (a) it's free, (b) it
+    never accidentally dispatches a 'hello' to Claude.
+    """
+    import random
+    text = (text or "").strip()
+    if not text:
+        return None
+    for pattern, replies in _CHITCHAT_PATTERNS:
+        if pattern.search(text):
+            return random.choice(replies)
+    return None
+
+
+# Real-task signal — used by the `intent=system` fall-through to decide
+# whether to dispatch an unmatched utterance to Claude vs. politely
+# refuse. Reuses the followup_gate vocabulary (we already maintain a
+# coding-imperatives + technical-nouns dictionary there).
+_TASK_VERB_RE = re.compile(
+    r"\b(write|make|build|create|add|remove|delete|fix|update|change|"
+    r"rewrite|refactor|rename|test|run|deploy|ship|release|open|close|"
+    r"save|commit|push|pull|merge|rebase|clone|checkout|install|"
+    r"uninstall|upgrade|edit|modify|set|configure|generate|scaffold|"
+    r"format|lint|debug|implement|extract|inline|split|convert|port|"
+    r"show me|list|find|search|grep|read|explain|review|audit|"
+    r"summarize|undo|revert|continue|finish|complete|switch|toggle|"
+    r"enable|disable|hide|reveal|append|prepend|insert|replace|style|"
+    r"resize|launch|start|stop|kill|restart|build me|make me|write me)\b",
+    re.IGNORECASE,
+)
+_TASK_NOUN_RE = re.compile(
+    r"\b(file|files|function|method|class|variable|module|package|"
+    r"library|test|tests|bug|error|exception|component|page|route|"
+    r"endpoint|api|schema|model|view|hook|prop|state|css|html|"
+    r"database|table|column|query|migration|server|client|branch|"
+    r"commit|repo|repository|script|code|browser|chrome|calculator|"
+    r"notepad|terminal|explorer|directory|folder|path|filename)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_real_task(text: str) -> bool:
+    """Heuristic: does this utterance look like an actual task we should
+    fall through to Claude for, or is it conversational noise the
+    chitchat layer should have caught?
+
+    Returns True iff the cleaned text contains a coding-imperative verb
+    OR a technical noun. False otherwise — caller refuses politely
+    instead of burning a Claude session.
+    """
+    if not text:
+        return False
+    return bool(_TASK_VERB_RE.search(text) or _TASK_NOUN_RE.search(text))
+
+
 # Phrases that close the conversation and send us back to wake-listening.
 # Matched anywhere in the cleaned transcript (case-insensitive, word boundaries).
 _END_CONVERSATION_RE = re.compile(
@@ -715,20 +820,19 @@ def _handle_decision(decision: dict) -> str:
         if handled:
             print(f"  executed: {summary}")
             return summary
-        # No local tool matched. The Stage 2 LLM was confident this was
-        # a "system" intent (probably because the utterance started with
-        # an "open ..." verb), but none of our handlers cover it. Two
-        # paths lead here:
-        #   1. Mixed intent like "open hallo.html and change the colors"
-        #      where the open-file split couldn't pull the filename out
-        #      of mid-sentence AND the rest is a coding task. Claude can
-        #      do both: Read the file, Edit it, and report back.
-        #   2. Truly unknown ("open the dishwasher") — Claude politely
-        #      explains it can't help.
-        # Falling through to Claude beats a flat "I don't know" refusal.
-        print(f"  no tool matched {cleaned!r} -> falling through to claude_code")
-        cwd = _cwd_for_dispatch(target_session)
-        return _start_agent_and_ack("claude_code", cleaned, cwd=cwd)
+        # No local tool matched. v1.2.0 used to blanket-dispatch to
+        # Claude here, which surprised users who said "hello can you
+        # hear me?" and got a 12-second Claude session spun up to
+        # answer. v1.2.3 only falls through if the cleaned text looks
+        # like a real task — an imperative coding verb or a technical
+        # noun. Chitchat-shape utterances get a polite refusal so the
+        # user knows they were heard but nothing fired.
+        if _looks_like_real_task(cleaned):
+            print(f"  no tool matched {cleaned!r} -> falling through to claude_code")
+            cwd = _cwd_for_dispatch(target_session)
+            return _start_agent_and_ack("claude_code", cleaned, cwd=cwd)
+        print(f"  no tool, looks like chitchat -> refusing: {cleaned!r}")
+        return "I'm not sure what you'd like me to do."
 
     # Multi-session fan-out — brain says target_session='all'.
     if target_session == "all":
@@ -916,6 +1020,21 @@ def run_conversation() -> None:
                 )
                 say(summarize_for_speech(last.result) or "Nothing to repeat.",
                     blocking=True)
+            continue
+
+        # 6b. Chitchat-to-Halo intercept — pattern-match conversational
+        #     pings at Halo herself ("hello", "are you there?", "can you
+        #     hear me?", "what are you working on?") and speak a canned
+        #     reply WITHOUT touching Claude. Saves the 4-5s Stage 2
+        #     round-trip AND prevents the v1.2.2-era bug where Halo
+        #     would dispatch "Hello can you hear me?" as a coding task
+        #     to a fresh Claude session.
+        chitchat = _chitchat_reply(cleaned)
+        if chitchat is not None:
+            print(f"  chitchat-to-halo -> {chitchat!r}")
+            bus.emit("route.matched", handler="chitchat_halo", text=chitchat)
+            say(chitchat, blocking=True)
+            last_activity = time.monotonic()
             continue
 
         # 7. Tool fast-path — always wins for "open chrome" style commands,
