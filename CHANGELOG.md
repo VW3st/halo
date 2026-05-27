@@ -10,6 +10,46 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.2.2] — 2026-05-25
+
+Bug fix — discovery was missing real Claude sessions on Windows
+WinGet-installed Claude. v1.2.0 shipped with fingerprints written for
+the npm-installed Claude only; users with the WinGet binary saw
+`discovery: found 0` even when 5+ Claude sessions were running.
+
+### Fixed
+- **`halo/discovery.py:_classify_cmdline`** now slash-normalizes the
+  cmdline (`\` -> `/`) before fingerprint matching. Windows npm-installed
+  Claude (whose cmdline is `node ...\\@anthropic-ai\\claude-code\\...`)
+  now matches the same `@anthropic-ai/claude-code` fingerprint that
+  catches POSIX installs. v1.2.0's `claude-code\\cli` backslash variant
+  removed in favor of the normalized check.
+- **`_AGENT_FINGERPRINTS`** extended with `/WinGet/Links/claude.exe`
+  (Windows WinGet install path) and `/claude.exe` (any standalone
+  binary). Same treatment for codex.
+- **`_HALO_SPAWNED_MARKERS`** extended to filter out the Claude
+  Desktop Electron app (`/WindowsApps/Claude_`, `/Claude.app/Contents`)
+  and its child processes (`--type=renderer`, `--type=gpu-process`,
+  `--type=utility`, `--type=crashpad-handler`) so they don't get
+  mis-detected as CLI sessions.
+- **`DiscoveredSession.__str__`** uses ASCII `<-` instead of Unicode
+  `←` so the live-scan diagnostic doesn't crash with
+  `UnicodeEncodeError` on Windows cp1252 consoles.
+
+### Tests
+- 6 new cases in `scripts/test_discovery.py` covering WinGet install
+  paths, Claude Desktop app exclusion (renderer / gpu-process /
+  top-level), and an MCP-server false-positive guard.
+- Live-scan smoke now prints the discovered sessions (was crashing
+  silently before this fix on Windows).
+
+### Verified on V's machine
+`halo sessions` correctly enumerates all 5 interactive Claude sessions
+across `D:\\vclaude`, `D:\\livestream`, `D:\\AIPCLAUDE`, `D:\\Halo`,
+`D:\\socialmanager` — none of which v1.2.1 could see.
+
+---
+
 ## [1.2.1] — 2026-05-25
 
 Two surgical patches on top of v1.2.0:

@@ -62,6 +62,48 @@ def test_classify_excludes_halo_codex_oneshot():
     assert _classify_cmdline(cmdline) is None, "codex exec is Halo-spawned"
 
 
+def test_classify_winget_claude_continue():
+    """WinGet-installed Claude is a standalone .exe binary, no node shim."""
+    cmdline = [
+        "C:\\Users\\agenc\\AppData\\Local\\Microsoft\\WinGet\\Links\\claude.exe",
+        "--continue",
+    ]
+    assert_eq(_classify_cmdline(cmdline), "claude_code")
+
+
+def test_classify_winget_claude_bare():
+    cmdline = ["C:\\Users\\agenc\\AppData\\Local\\Microsoft\\WinGet\\Links\\claude.exe"]
+    assert_eq(_classify_cmdline(cmdline), "claude_code")
+
+
+def test_classify_excludes_claude_desktop_app():
+    """Claude Desktop is an Electron app at WindowsApps/Claude_*/app/Claude.exe.
+    Must NOT be mis-detected as the Claude Code CLI."""
+    cmdline = [
+        "C:\\Program Files\\WindowsApps\\Claude_1.8555.2.0_x64__pzs8sxrjxfjjc\\app\\Claude.exe",
+        "--type=renderer",
+        "--user-data-dir=C:\\Users\\agenc\\AppData\\Roaming\\Claude",
+    ]
+    assert_eq(_classify_cmdline(cmdline), None, "Electron renderer must be excluded")
+
+
+def test_classify_excludes_claude_desktop_top_level():
+    """The top-level desktop binary (no --type= arg) — still matches the
+    WindowsApps/Claude_ exclusion because the path is the giveaway."""
+    cmdline = [
+        "C:\\Program Files\\WindowsApps\\Claude_1.8555.2.0_x64__pzs8sxrjxfjjc\\app\\Claude.exe",
+    ]
+    assert_eq(_classify_cmdline(cmdline), None)
+
+
+def test_classify_excludes_claude_desktop_gpu_process():
+    cmdline = [
+        "C:\\Program Files\\WindowsApps\\Claude_1.8555.2.0_x64__pzs8sxrjxfjjc\\app\\Claude.exe",
+        "--type=gpu-process",
+    ]
+    assert_eq(_classify_cmdline(cmdline), None)
+
+
 def test_classify_unrelated_node():
     cmdline = ["node", "server.js"]
     assert_eq(_classify_cmdline(cmdline), None)
@@ -69,6 +111,17 @@ def test_classify_unrelated_node():
 
 def test_classify_unrelated_python():
     cmdline = ["python", "-m", "halo"]
+    assert_eq(_classify_cmdline(cmdline), None)
+
+
+def test_classify_unrelated_node_mcp_server():
+    """MCP server processes (playwright-mcp, context7-mcp, etc.) are
+    node processes living deep in npm-cache paths — must NOT be picked
+    up just because the path contains 'claude' somewhere."""
+    cmdline = [
+        "node",
+        "C:\\Users\\agenc\\AppData\\Local\\npm-cache\\_npx\\xyz\\node_modules\\@playwright\\mcp\\cli.js",
+    ]
     assert_eq(_classify_cmdline(cmdline), None)
 
 
@@ -116,8 +169,14 @@ def main() -> int:
         test_classify_codex_npm_shim,
         test_classify_excludes_halo_persistent,
         test_classify_excludes_halo_codex_oneshot,
+        test_classify_winget_claude_continue,
+        test_classify_winget_claude_bare,
+        test_classify_excludes_claude_desktop_app,
+        test_classify_excludes_claude_desktop_top_level,
+        test_classify_excludes_claude_desktop_gpu_process,
         test_classify_unrelated_node,
         test_classify_unrelated_python,
+        test_classify_unrelated_node_mcp_server,
         test_label_basename,
         test_label_drive_root,
         test_live_scan_does_not_crash,

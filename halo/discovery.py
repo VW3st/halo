@@ -50,32 +50,54 @@ DISCOVERY_INTERVAL_SEC = 2.0
 
 
 # Marker substrings we look for in process cmdlines to identify each
-# kind of agent. Keep these specific enough to avoid false positives —
-# matching bare `claude` would also catch "claude.md" file opens, etc.
+# kind of agent. Cmdlines are slash-normalized (\ -> /) before matching
+# so the same fingerprint catches both POSIX and Windows paths.
+#
+# Three install paths to cover:
+#   1. npm-installed: cmdline = `node .../@anthropic-ai/claude-code/cli.js`
+#   2. WinGet-installed: cmdline = `.../WinGet/Links/claude.exe --continue`
+#   3. POSIX binary: cmdline = `/usr/local/bin/claude` (just basename match)
 _AGENT_FINGERPRINTS: dict[str, tuple[str, ...]] = {
     "claude_code": (
+        # npm/node shim — works for POSIX and Windows after slash normalize
         "@anthropic-ai/claude-code",
         "claude-code/cli",
-        "claude-code\\cli",
-        # Direct binary names (POSIX `claude`, Windows shim entry).
         "claude.js",
+        # WinGet-installed binary on Windows
+        "/WinGet/Links/claude.exe",
+        # Generic standalone binary launches — interactive Claude Code
+        # CLI typically runs as just `claude` / `claude.exe` with no flags
+        # or `--continue` / `--resume`. The exclusion list below filters
+        # the Electron desktop app + Halo's own spawn.
+        "/claude.exe",  # any path ending in claude.exe (slash-normalized)
     ),
     "codex_cli": (
         "@openai/codex",
         "codex/cli",
-        "codex\\cli",
         "codex-cli",
+        "/WinGet/Links/codex.exe",
+        "/codex.exe",
     ),
 }
 
-# Halo's own Claude/Codex subprocesses have a tell-tale flag combination
-# (Claude: `--input-format stream-json`; Codex: `codex exec`). Filter
-# them so users don't see their own Halo-managed sessions in the
-# discovery list — those are already addressable as the "active" session
-# without going through discovery.
+# Cmdline substrings that DISQUALIFY a match. Cmdlines are slash-
+# normalized before checking. Covers:
+#   - Halo's own subprocesses (we manage them through halo.sessions,
+#     so they're already addressable as the "active" session without
+#     going through discovery)
+#   - the Claude / Codex Desktop apps (Electron — different product,
+#     not a CLI session)
+#   - Electron child processes (renderer / gpu-process / utility)
 _HALO_SPAWNED_MARKERS: tuple[str, ...] = (
-    "--input-format",  # only Halo's persistent Claude uses this
-    "codex exec",       # only Halo's one-shot Codex
+    "--input-format",       # only Halo's persistent Claude uses this
+    "codex exec",            # only Halo's one-shot Codex
+    "/WindowsApps/Claude_",   # Claude desktop app (Electron)
+    "/WindowsApps/Codex_",    # Codex desktop app (if installed)
+    "/Claude.app/Contents",   # macOS Claude desktop app bundle
+    "--type=renderer",       # Electron renderer child
+    "--type=gpu-process",    # Electron GPU child
+    "--type=utility",        # Electron utility child
+    "--type=crashpad-handler",
 )
 
 # Shell / terminal process names — used to walk back from an agent
@@ -116,7 +138,9 @@ class DiscoveredSession:
     seen_at: float
 
     def __str__(self) -> str:
-        parent = f" ← {self.parent_name}" if self.parent_name else ""
+        # ASCII-only — Windows console default codec (cp1252) chokes on
+        # unicode arrows when stdout isn't UTF-8.
+        parent = f" <- {self.parent_name}" if self.parent_name else ""
         return f"[{self.agent_key} #{self.pid}] {self.label}  ({self.cwd}){parent}"
 
 
@@ -126,10 +150,15 @@ def is_available() -> bool:
 
 
 def _classify_cmdline(cmdline_parts: Iterable[str]) -> Optional[str]:
-    """Return the agent_key whose fingerprint matches `cmdline_parts`, or None."""
-    joined = " ".join(cmdline_parts)
-    # Filter Halo-spawned processes first — they look like normal Claude
-    # to the fingerprint matcher otherwise.
+    """Return the agent_key whose fingerprint matches `cmdline_parts`, or None.
+
+    Cmdline is slash-normalized (backslash -> forward slash) before
+    matching so a single fingerprint catches both POSIX and Windows
+    paths. Halo-spawned processes and desktop-app variants are
+    filtered first.
+    """
+    joined = " ".join(cmdline_parts).replace("\\", "/")
+    # Filter Halo-spawned processes + Electron desktop apps first.
     for marker in _HALO_SPAWNED_MARKERS:
         if marker in joined:
             return None
