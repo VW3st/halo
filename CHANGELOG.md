@@ -10,6 +10,104 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.2.1] — 2026-05-25
+
+Two surgical patches on top of v1.2.0:
+- Hybrid streaming + one-sentence reply summaries (the user's request:
+  "when the model reply might be very long, our brain has to summarize
+  it in one sentence — so it's not reading a full story back").
+- Regex fallback layer for the 1.5B brain's session-action misses
+  (caught during v1.2 live testing: the model emits `target_session`
+  but forgets `session_action`, which was breaking switch / list /
+  where_am_i flows).
+
+### Added (Stage 3 — one-sentence summarizer)
+- **`router.py:summarize_reply()`** — new Ollama-backed compressor.
+  Schema-constrained output `{one_sentence: str}`, target 15-25 words.
+  Falls back to `_head_truncate()` on Ollama failure so the caller
+  always gets a speakable string. Includes 3 worked examples in the
+  prompt (short / medium / long) to anchor the model's brevity.
+- **Hybrid streaming in `__main__.py`** — `_StreamState` per job tracks
+  `sentences_spoken` / `chars_spoken` / `was_truncated`. For agents
+  with `streams_text_deltas=True` (Claude), the first
+  `LIVE_STREAM_MAX_SENTENCES` (default **2**) sentences are spoken
+  live via Kokoro as they generate. After the budget, `_speak_chunk`
+  silently buffers without calling `say()`. At job completion,
+  `_drain_completed_jobs` checks `was_truncated`; if true and the
+  unsaid remainder is ≥ 60 chars, calls `summarize_reply()` on the
+  remainder and speaks one cap sentence: *"And, I added bcrypt
+  verification and wired it into login_user."*
+- **Batch-agent summarization (Codex)** — same threshold. Replies
+  under `REPLY_SUMMARIZE_THRESHOLD_CHARS` (default **400**) speak as
+  before via `summarize_for_speech` head-trim; longer replies go
+  through `summarize_reply()` for a real LLM-backed one-sentence cap.
+
+### Added (config)
+- `LIVE_STREAM_MAX_SENTENCES = 2` — how many sentences a streaming
+  agent gets to speak live before Halo cuts to summary mode.
+- `REPLY_SUMMARIZE_THRESHOLD_CHARS = 400` — only summarize when the
+  reply is genuinely long. Short replies (< 400 chars) speak verbatim.
+
+### Added (regex fallback for session actions)
+- **`router.py:_apply_session_action_fallback()`** — applied inside
+  `understand_and_route()` after the LLM call. When `has_context=True`
+  AND the brain emitted `target_session` but no `session_action`, this
+  layer inspects `cleaned_text` for switch / list_sessions /
+  where_am_i patterns and synthesizes the action. Fixes the v1.2.0
+  failure mode where "switch to website" would resolve target_session
+  correctly but then fall through to a regular dispatch (sending the
+  literal string "Switch to website." as a prompt to Claude in the
+  website cwd).
+- Pure-switch detection requires a switch verb (switch / jump / move /
+  go / work on / use / activate / open) **without** a coding-imperative
+  verb (write / make / build / fix / refactor / etc.) — otherwise
+  "in website, fix the bug" would get mis-classified as a switch.
+
+### Tests
+- **`scripts/test_summarize.py`** (6 cases) — empty input, head-truncate
+  fallback, short/medium/long reply lengths under cap, single-sentence
+  shape (no internal newlines, <=2 terminators), compression ratio.
+  Ollama-dependent (graceful skip).
+- Updated `scripts/test_brain_routing.py` — all 8 cases now pass
+  (4/8 → 8/8) thanks to the session-action fallback layer.
+
+### Verified
+- 44/44 tests pass on a live machine with Ollama up (30 offline +
+  8 brain routing + 6 summarize).
+- `import halo.__main__` is warning-free under `-W error::SyntaxWarning`.
+
+### Why this exists
+Without summarization, every long Claude reply (e.g. "I refactored
+auth.py + test_auth.py + ratelimit.py and here's everything I did
+across 11 sentences") gets fully read aloud — exhausting, and you
+can't interrupt cleanly. With hybrid mode you hear *"On it. I'm
+calling this session Mercury. I refactored the authentication module
+to use bcrypt."* live, then silence while Claude finishes its work,
+then *"And, I added rate limiting and three new integration tests."*
+Total spoken: ~6 seconds instead of ~45 seconds. The full reply is
+still in your terminal scrollback if you want details.
+
+### Knobs to tune
+- Want even more live narration before summary? Bump
+  `LIVE_STREAM_MAX_SENTENCES`.
+- Want more replies to speak verbatim?
+  Raise `REPLY_SUMMARIZE_THRESHOLD_CHARS`.
+- Want the old "speak everything" v1.1 behavior?
+  Set both to very large numbers.
+
+### Known limitations
+- Summarization adds ~300 ms (one extra Ollama round-trip) at the end
+  of every long reply. Acceptable on a warm KV cache; cold the first
+  call after model load can be a few seconds.
+- If Ollama crashes mid-job the fallback head-truncates instead, so
+  you always hear *something* — but it'll be the lossy first-N-chars
+  cut, not a real summary.
+- Brain-summary quality is tied to qwen2.5:1.5b — usually fine but
+  occasionally re-orders or drops a detail. Full text in the
+  terminal is the source of truth; TTS is the executive summary.
+
+---
+
 ## [1.2.0] — 2026-05-25
 
 The "talk to whichever Claude I want" release. v1.1 bound Halo to one

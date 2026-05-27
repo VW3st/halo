@@ -624,6 +624,86 @@ def check_turn_complete(partial_transcript: str) -> bool:
     return True
 
 
+# --- session_action fallback ----------------------------------------------
+# The 1.5B router model frequently emits target_session correctly but
+# forgets to set session_action — or skips both for clear list/where_am_i
+# phrases. These regex layers post-process the brain's decision so the
+# orchestrator sees consistent {session_action, target_session} even on
+# small-model misses.
+
+_LIST_PATTERN = re.compile(
+    r"\b("
+    r"what(?:'s| is)?\s+(?:running|open|going|sessions)|"
+    r"what\s+(?:sessions|projects)|"
+    r"list\s+(?:sessions|projects|everything)|"
+    r"show\s+(?:me\s+)?(?:sessions|projects)"
+    r")\b",
+    re.IGNORECASE,
+)
+_WHERE_PATTERN = re.compile(
+    r"\b("
+    r"where\s+am\s+i|"
+    r"what(?:'s| is)?\s+(?:my\s+)?(?:active|current)(?:\s+(?:session|project))?|"
+    r"what\s+project\s+am\s+i\s+on|"
+    r"which\s+(?:session|project)\s+am\s+i"
+    r")\b",
+    re.IGNORECASE,
+)
+_SWITCH_VERB_PATTERN = re.compile(
+    r"\b(switch|jump|move|go|work on|use|activate|open)\b",
+    re.IGNORECASE,
+)
+_CODING_VERB_PATTERN = re.compile(
+    r"\b(write|make|build|create|add|fix|refactor|delete|update|"
+    r"test|run|deploy|implement|change|edit)\b",
+    re.IGNORECASE,
+)
+
+
+def _apply_session_action_fallback(decision: dict, has_context: bool) -> None:
+    """Mutate decision in-place to synthesize session_action when the
+    brain emitted target_session but forgot the action, or when the
+    cleaned_text obviously asks for list/where_am_i.
+
+    No-op when has_context=False (single-session mode has no session
+    actions to fire) or when the brain already populated session_action.
+    """
+    if not has_context:
+        return
+    if decision.get("session_action"):
+        return
+
+    cleaned = (decision.get("cleaned_text") or "").strip()
+    if not cleaned:
+        return
+
+    if _LIST_PATTERN.search(cleaned):
+        decision["session_action"] = "list_sessions"
+        decision["intent"] = "question"
+        decision["agent"] = "none"
+        decision["target_session"] = ""
+        return
+
+    if _WHERE_PATTERN.search(cleaned):
+        decision["session_action"] = "where_am_i"
+        decision["intent"] = "question"
+        decision["agent"] = "none"
+        decision["target_session"] = ""
+        return
+
+    target = (decision.get("target_session") or "").strip()
+    if target and target not in ("active", "focused", "all"):
+        # Pure-switch detection: looks like a switch verb AND has no
+        # coding-imperative verb (otherwise it's a cross-session dispatch
+        # like "in website, fix the bug").
+        looks_like_switch = _SWITCH_VERB_PATTERN.search(cleaned) is not None
+        is_coding_verb = _CODING_VERB_PATTERN.search(cleaned) is not None
+        if looks_like_switch and not is_coding_verb:
+            decision["session_action"] = "switch"
+            decision["intent"] = "system"
+            decision["agent"] = "none"
+
+
 def understand_and_route(
     full_transcript: str,
     context: Optional[SessionContext] = None,
@@ -661,6 +741,12 @@ def understand_and_route(
         # new fields. Make sure callers always see them as strings.
         decision.setdefault("target_session", "")
         decision.setdefault("session_action", "")
+        # Post-process: 1.5B brain frequently emits target_session but
+        # forgets session_action. Regex fallback synthesizes the missing
+        # action so the orchestrator sees consistent decisions.
+        _apply_session_action_fallback(
+            decision, has_context=ctx_block != "",
+        )
         return decision
     except Exception as exc:
         return {**_FALLBACK_DECISION, "cleaned_text": full_transcript, "_error": str(exc)}
@@ -672,3 +758,123 @@ def preload_router() -> None:
     so it doesn't need a warmup."""
     print("warming up router model (Stage 2)...")
     understand_and_route("hello")
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 — one-sentence summarizer (v1.2.1)
+# ---------------------------------------------------------------------------
+
+SUMMARIZE_PROMPT = """\
+You are a voice-channel summarizer. The user asked an AI coding agent a
+question; the agent's full reply is below. The user will hear YOUR
+summary read aloud through text-to-speech.
+
+Compress the agent's reply into ONE short sentence (target 15-25 words,
+absolute max ~30). Capture the most important outcome: what was done,
+the answer, or the key result. Skip implementation detail — the user
+can read the full reply in their terminal.
+
+ABSOLUTE RULES:
+- Exactly one sentence. No markdown. No code. No fenced blocks.
+- File basenames only — never full paths.
+- Write in first person AS the agent. No "The agent did X" / "Claude
+  says" preamble; Halo prepends the agent name itself.
+- If the reply is itself short and clean, just trim/lightly rephrase
+  — don't add fluff.
+
+Examples:
+
+Reply: "I added a `verify_password` function to `auth.py` that uses
+bcrypt with cost factor 12 for the work parameter. I also wired it
+into the existing `login_user` flow at line 47, replacing the previous
+plaintext check. The tests in `test_auth.py` cover both correct and
+incorrect passwords."
+Summary: "I added bcrypt password verification to auth.py and wired
+it into login_user with tests."
+
+Reply: "Done. I refactored the routes file."
+Summary: "I refactored the routes file."
+
+Reply: "The function exists in utils/helpers.py on line 84. It takes
+a list of dicts and returns the unique values by key. It's used in
+three places: the data importer, the dedup script, and the merge
+worker."
+Summary: "It's in helpers.py line 84 — dedupes a list of dicts by key,
+used by the importer, dedup, and merge worker."
+
+# USER'S ORIGINAL REQUEST
+{ORIGINAL}
+
+# AGENT'S REPLY TO SUMMARIZE
+{REPLY}
+
+Return JSON: {{"one_sentence": "..."}}.
+"""
+
+_SUMMARIZE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "one_sentence": {"type": "string"},
+    },
+    "required": ["one_sentence"],
+}
+
+
+def summarize_reply(
+    reply_text: str,
+    original_prompt: str = "",
+    *,
+    max_chars: int = 220,
+) -> str:
+    """Use the brain to compress a long agent reply into one spoken sentence.
+
+    Falls back to head-truncation on Ollama failure so the caller always
+    gets a non-empty speakable string when reply_text is non-empty.
+
+    `max_chars` is a safety cap on the output; if the brain ignores the
+    word-count instruction and returns a long sentence, we head-truncate
+    to the nearest sentence boundary under max_chars.
+    """
+    if not reply_text or not reply_text.strip():
+        return ""
+
+    prompt = SUMMARIZE_PROMPT.format(
+        ORIGINAL=(original_prompt or "(not provided)")[:500],
+        REPLY=reply_text[:4000],  # cap input length to bound latency
+    )
+
+    try:
+        response = _get_client().chat(
+            model=OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            format=_SUMMARIZE_SCHEMA,
+            options={"temperature": 0.2},
+            keep_alive=_KEEP_ALIVE,
+        )
+        data = json.loads(response["message"]["content"])
+        sentence = (data.get("one_sentence") or "").strip()
+        if not sentence:
+            return _head_truncate(reply_text, max_chars)
+        # Cap output length even if brain ignored the word limit.
+        if len(sentence) > max_chars:
+            return _head_truncate(sentence, max_chars)
+        return sentence
+    except Exception as exc:
+        # Brain unreachable / errored — head-truncate so the user still
+        # hears something instead of dead silence.
+        print(f"  [summarize] brain unreachable ({exc}) — head-truncating")
+        return _head_truncate(reply_text, max_chars)
+
+
+def _head_truncate(text: str, max_chars: int) -> str:
+    """Pure-string fallback for summarize_reply: trim at the nearest
+    sentence terminator under max_chars, else hard-cap with ellipsis."""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    head = text[:max_chars]
+    for stop in (". ", "! ", "? ", "\n\n"):
+        idx = head.rfind(stop)
+        if idx > max_chars * 0.4:
+            return head[: idx + 1].strip()
+    return head.rstrip() + "..."

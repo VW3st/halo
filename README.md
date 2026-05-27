@@ -4,7 +4,7 @@ Voice front-end for agentic coding tools. Say a wake word, talk to
 Claude Code or Codex CLI in plain English, and hear the result back.
 Halo is the audio layer; the agents do the work.
 
-Status: **v1.2.0 — multi-session mode.** Halo auto-discovers every running Claude / Codex session on your machine and the brain routes by voice (*"switch to website"*, *"in AIP, fix the bug"*, *"what sessions do I have?"*) — no manual registration. Builds on v1.1 (custom "halo" wake word, persistent Claude sessions, follow-up gate, separate-console live feed, noise-suppression pipeline). Live web dashboard at `http://127.0.0.1:7070`.
+Status: **v1.2.1 — hybrid streaming + one-sentence reply summaries.** Long agent replies no longer monologue at you — Halo speaks the first 2 sentences live so you know the agent is working, then summarizes the rest into one sentence via the local brain. Full text still prints to the terminal. Builds on v1.2 (multi-session mode), v1.1.1 (follow-up gate), v1.1 (custom "halo" wake word, persistent Claude sessions, separate-console live feed, noise-suppression pipeline). Live web dashboard at `http://127.0.0.1:7070`.
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full history. Licensed MIT
 ([LICENSE](./LICENSE)).
@@ -91,6 +91,19 @@ fall back to CPU.
 
 ### v1.2 highlights
 
+- **Hybrid streaming + one-sentence reply summaries (v1.2.1)** —
+  Streaming agents (Claude) speak the **first 2 sentences live** as
+  they're generated, so you immediately know the agent is alive and
+  working. After that, Halo stops speaking and silently buffers the
+  rest. When the agent finishes, if the reply ran past the live budget
+  Halo sends the remainder through the brain (qwen2.5:1.5b) for a
+  one-sentence cap: *"And, I added bcrypt password verification to auth
+  dot py and wired it into login user."* For batch agents (Codex),
+  same idea — speak short replies as-is, summarize when long
+  (> 400 chars). Tunable via `LIVE_STREAM_MAX_SENTENCES` and
+  `REPLY_SUMMARIZE_THRESHOLD_CHARS` in `halo/config.py`. The full
+  reply still prints to your terminal so nothing's lost — TTS is
+  just the summary.
 - **Multi-session mode (v1.2.0)** — Halo runs a process discovery
   scanner that finds every `claude` / `codex` session on your machine
   and feeds the list to the routing brain. You no longer talk to one

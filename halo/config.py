@@ -128,6 +128,24 @@ AGENT_CLI_VISIBLE = True
 # every direct-mode transcript reaches the agent).
 FOLLOWUP_GATE_ENABLED = True
 
+# --- v1.2.1 reply-summarization knobs ---------------------------------
+# Long agent replies are exhausting to listen to. The brain (qwen2.5)
+# summarizes them to one spoken sentence; the full text is still
+# printed to the terminal so nothing is lost.
+#
+# Streaming agents (Claude): speak the first N sentences live as the
+# agent generates them (so the user gets immediate feedback that the
+# agent is alive and working). After that, stop speaking; buffer
+# silently. At job completion, if the reply turned out long, send the
+# untold remainder through summarize_reply() and speak ONE sentence
+# capping the result.
+#
+# Batch agents (Codex): no sentence streaming. If the full result
+# is shorter than REPLY_SUMMARIZE_THRESHOLD_CHARS, speak it as-is.
+# Otherwise summarize.
+LIVE_STREAM_MAX_SENTENCES = 2
+REPLY_SUMMARIZE_THRESHOLD_CHARS = 400
+
 # Step 3.5 adaptive constants. Total silence-to-commit per mode
 # (silero base + orchestrator extra). See detect_mode() in halo/turn.py.
 MODE_SILENCE_SEC = {

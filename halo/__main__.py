@@ -56,12 +56,14 @@ from halo.config import (
     CONVERSATION_IDLE_ENGAGED_SEC,
     CONVERSATION_IDLE_SEC,
     FOLLOWUP_GATE_ENABLED,
+    LIVE_STREAM_MAX_SENTENCES,
+    REPLY_SUMMARIZE_THRESHOLD_CHARS,
 )
 from halo.discovery import DiscoveryThread, is_available as discovery_available
 from halo.followup_gate import passes as followup_gate_passes
 from halo.record import preload_models as preload_audio_models
 from halo.registry import SessionRegistry
-from halo.router import SessionContext, preload_router, understand_and_route
+from halo.router import SessionContext, preload_router, summarize_reply, understand_and_route
 from halo.tools import execute_system_intent
 from halo.turn import run_turn
 from halo.voice import is_available as voice_available
@@ -77,6 +79,43 @@ from halo.web import start_server as start_web_server
 # case the orchestrator behaves exactly like v1.1.
 REGISTRY = SessionRegistry()
 _DISCOVERY: DiscoveryThread | None = None
+
+
+class _StreamState:
+    """Per-job streaming-speech state (v1.2.1 hybrid mode).
+
+    For streaming agents (Claude), the first LIVE_STREAM_MAX_SENTENCES
+    chunks are spoken live as they arrive — gives the user immediate
+    feedback that the agent is alive. After the budget, we keep
+    accumulating text silently and emit one brain-summarized sentence
+    in _drain_completed_jobs.
+
+    The state object is owned by _start_agent_and_ack and registered
+    in _stream_states[job_id] right after start_job returns. _drain
+    pops it on consumption.
+    """
+
+    __slots__ = (
+        "max_live_sentences",
+        "sentences_spoken",
+        "chars_spoken",
+        "was_truncated",
+        "spoken_text",
+    )
+
+    def __init__(self, max_live_sentences: int) -> None:
+        self.max_live_sentences = max_live_sentences
+        self.sentences_spoken = 0
+        self.chars_spoken = 0
+        self.was_truncated = False
+        # Joined live-spoken text — used to subtract from the full
+        # reply when summarizing the remainder.
+        self.spoken_text = ""
+
+
+# Stream state keyed by AgentJob.job_id. Populated by _start_agent_and_ack,
+# consumed by _drain_completed_jobs.
+_stream_states: dict[int, _StreamState] = {}
 
 
 def _on_discovery_change(sessions) -> None:
@@ -417,17 +456,45 @@ def _drain_completed_jobs() -> None:
         _print_full_result(
             full_label, bool(job.ok), job.result, job.elapsed_sec
         )
+        # Pop and consume the per-job stream state (v1.2.1 hybrid mode).
+        stream_state = _stream_states.pop(job.job_id, None)
         if job.ok:
             if cfg.streams_text_deltas:
-                # Streaming agent already spoke its full response via the
-                # on_text_chunk callback during the job. Adding "X is done."
-                # on top was just noise — the user can hear the response
-                # ended (TTS playback finished). Skip the cap entirely.
-                pass
+                # Streaming agent: spoke first N sentences live. If the
+                # reply ran past the live budget, summarize the
+                # remainder into one cap sentence so the user gets the
+                # rest of the story without sitting through a monologue.
+                full_reply = (job.result or "").strip()
+                if stream_state is not None and stream_state.was_truncated:
+                    spoken_already = stream_state.spoken_text.strip()
+                    remainder = full_reply
+                    if spoken_already and full_reply.startswith(spoken_already):
+                        remainder = full_reply[len(spoken_already):].strip()
+                    if remainder and len(remainder) >= 60:
+                        # Only summarize if there's meaningful content
+                        # left — a stray trailing word doesn't warrant
+                        # an extra TTS round-trip.
+                        summary = summarize_reply(remainder, job.prompt)
+                        if summary:
+                            say(f"And, {summary}", blocking=True)
+                # If was_truncated=False the user already heard the
+                # whole reply via the live stream. Skip the cap.
             else:
-                short = summarize_for_speech(job.result) or f"{spoken_name} is done."
-                say(f"{spoken_name} says, {short}", blocking=True)
+                # Batch agent (Codex): no live streaming. If short,
+                # speak the cleaned head; if long, brain-summarize.
+                full_reply = (job.result or "").strip()
+                if len(full_reply) > REPLY_SUMMARIZE_THRESHOLD_CHARS:
+                    summary = summarize_reply(full_reply, job.prompt)
+                    if summary:
+                        say(f"{spoken_name} says, {summary}", blocking=True)
+                    else:
+                        say(f"{spoken_name} is done.", blocking=True)
+                else:
+                    short = summarize_for_speech(full_reply) or f"{spoken_name} is done."
+                    say(f"{spoken_name} says, {short}", blocking=True)
         else:
+            # Error path: short caps still use the legacy head-trim
+            # (errors are usually short stderr tails, not paragraphs).
             say(
                 f"{spoken_name} had a problem. {summarize_for_speech(job.result, 120)}",
                 blocking=True,
@@ -494,18 +561,48 @@ def _start_agent_and_ack(
     print(f"  dispatching to {spoken}{where} / {config.spoken_name.lower()} "
           f"({suffix}): {prompt!r}")
 
+    # Hybrid streaming state (v1.2.1). Only used for agents with
+    # streams_text_deltas=True. The first N sentences are spoken live;
+    # the rest is buffered silently and summarized in _drain.
+    stream_state = _StreamState(max_live_sentences=LIVE_STREAM_MAX_SENTENCES)
+
     def _speak_chunk(sentence: str) -> None:
         # Non-blocking so a long monologue queues sentence-by-sentence
         # without stalling the agent's stdout reader thread. The
         # sanitizer inside voice.say() strips any markdown the agent
         # leaks despite the voice system prompt.
-        print(f"    [{config.key}{where} -> tts] {sentence!r}")
-        say(sentence, blocking=False)
+        if stream_state.sentences_spoken < stream_state.max_live_sentences:
+            print(f"    [{config.key}{where} -> tts live] {sentence!r}")
+            say(sentence, blocking=False)
+            stream_state.sentences_spoken += 1
+            stream_state.chars_spoken += len(sentence)
+            stream_state.spoken_text = (
+                stream_state.spoken_text + " " + sentence
+                if stream_state.spoken_text
+                else sentence
+            )
+        else:
+            # Past the live budget — buffer silently, summarize at end.
+            if not stream_state.was_truncated:
+                stream_state.was_truncated = True
+                print(
+                    f"    [{config.key}{where} -> tts] "
+                    f"silenced past {stream_state.max_live_sentences} live "
+                    f"sentences; will summarize at end"
+                )
 
     on_chunk = _speak_chunk if config.streams_text_deltas else None
 
     try:
         job = start_job(agent_key, prompt, cwd=workdir, on_text_chunk=on_chunk)
+        # Register the stream state for _drain to consume on completion.
+        # We register even when streams_text_deltas=False so batch agents
+        # (Codex) also get the summarize-when-long behaviour — their
+        # state will just have was_truncated=False and we'll branch on
+        # full-text length instead.
+        _stream_states[job.job_id] = stream_state
+        # Stash the original prompt for the summarizer to use as context.
+        job.prompt  # already on the job
         print(f"  job #{job.job_id} started in background"
               f"{' (streaming)' if config.streams_text_deltas else ''}")
         if active == "starting":
@@ -519,6 +616,11 @@ def _start_agent_and_ack(
 
 def _handle_session_action(decision: dict) -> str | None:
     """v1.2: handle brain-emitted session_action / target_session.
+
+    The brain's `understand_and_route()` already applies a regex
+    fallback for the small-model misses (forgotten session_action for
+    obvious switch/list/where_am_i phrases) before returning the
+    decision, so this function just acts on whatever's present.
 
     Returns:
       str  — a phrase to speak back (action handled here, no agent dispatch)
