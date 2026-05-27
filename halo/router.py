@@ -9,13 +9,21 @@ Stage 2: full understanding + routing. Called once when Stage 1 (or a
          JSON-schema-constrained output via Ollama's structured-output
          feature, so we never have to defend against malformed JSON.
          Latency target: <500 ms.
+
+v1.2 adds **session context injection**: when Halo has discovered other
+running Claude/Codex sessions on the machine, every Stage 2 call gets a
+CURRENT CONTEXT block listing them. The schema gains `target_session`
+and `session_action` fields so the brain can route to a specific
+discovered session, switch the active one, or list what's running —
+without us having to write more orchestrator regex.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import ollama
 
@@ -169,6 +177,41 @@ The confirmation field is spoken aloud back to the user before execution.
 - Good: "Which project, the dashboard or the landing page?"
 - Bad: "Could you provide more details about what you'd like me to do?"
 
+# SESSION-AWARE ROUTING (v1.2)
+Halo may have discovered other Claude/Codex sessions running on the
+machine. When a CURRENT CONTEXT block is prepended to the user's
+transcript, you have these extra responsibilities:
+
+  - Set `target_session` to direct the dispatch:
+      * a label from discovered_sessions  → dispatch to that one
+      * "active"                          → use the active_session
+      * "focused"                         → use the user's focused terminal
+      * "all"                             → fan out to every discovered session
+      * ""                                → default routing (active session)
+  - Set `session_action` for meta-operations:
+      * "switch"          — user wants to change the active session.
+                            Put the target label in `target_session`.
+                            confirmation should be e.g. "Switched to halo."
+      * "list_sessions"   — user asked what's running ("what sessions",
+                            "what's open", "what do I have"). agent="none",
+                            intent="question".
+      * "where_am_i"      — user asked which project is active. agent="none",
+                            intent="question".
+      * ""                — none, behave as a normal dispatch.
+
+Important matching rules:
+  - Spoken labels are noisy. "the website one" should resolve to a
+    discovered_sessions entry whose label is "website" (substring or
+    token match). Use the closest label.
+  - If no CURRENT CONTEXT block is present (single-session mode), leave
+    `target_session` = "" and `session_action` = "". Behave exactly as
+    in v1.1.
+  - "send X to all" / "ask everyone to Y" → target_session="all",
+    session_action="", normal dispatch to every session.
+  - "in <label>, do X" / "ask the <label> one to Y" → cross-session
+    one-shot. target_session=<label>, session_action="", dispatch
+    happens there without changing the active session.
+
 # OUTPUT SCHEMA
 You MUST return valid JSON matching this exact structure:
 {
@@ -177,7 +220,9 @@ You MUST return valid JSON matching this exact structure:
   "intent": "code" | "question" | "system" | "cancel",
   "agent": "claude_code" | "codex_cli" | "none",
   "confirmation": "string -- spoken back before execution (only if status=ready)",
-  "clarification": "string -- question to ask user (only if status=unclear)"
+  "clarification": "string -- question to ask user (only if status=unclear)",
+  "target_session": "string -- label / 'active' / 'focused' / 'all' / ''",
+  "session_action": "" | "switch" | "list_sessions" | "where_am_i"
 }
 
 Fields that don't apply for the given status should be empty string "".
@@ -334,13 +379,126 @@ Output:
   "intent": "system",
   "agent": "none",
   "confirmation": "",
-  "clarification": "Which app should I open after calculator?"
+  "clarification": "Which app should I open after calculator?",
+  "target_session": "",
+  "session_action": ""
+}
+
+# SESSION-AWARE EXAMPLES (only fire when CURRENT CONTEXT block is present)
+
+Context block:
+  active_session: halo
+  discovered_sessions:
+    - label: halo       agent: claude_code  cwd: D:/Halo
+    - label: website    agent: claude_code  cwd: D:/website-redesign
+    - label: aip        agent: claude_code  cwd: D:/AIP-Claude
+
+Input: "switch to website"
+Output:
+{
+  "status": "ready",
+  "cleaned_text": "Switch to website",
+  "intent": "system",
+  "agent": "none",
+  "confirmation": "Switched to website.",
+  "clarification": "",
+  "target_session": "website",
+  "session_action": "switch"
+}
+
+Input: "work on the AIP one now"
+Output:
+{
+  "status": "ready",
+  "cleaned_text": "Work on AIP",
+  "intent": "system",
+  "agent": "none",
+  "confirmation": "Switched to aip.",
+  "clarification": "",
+  "target_session": "aip",
+  "session_action": "switch"
+}
+
+Input: "what sessions do I have"
+Output:
+{
+  "status": "ready",
+  "cleaned_text": "What sessions do I have",
+  "intent": "question",
+  "agent": "none",
+  "confirmation": "",
+  "clarification": "",
+  "target_session": "",
+  "session_action": "list_sessions"
+}
+
+Input: "where am I"
+Output:
+{
+  "status": "ready",
+  "cleaned_text": "Where am I",
+  "intent": "question",
+  "agent": "none",
+  "confirmation": "",
+  "clarification": "",
+  "target_session": "",
+  "session_action": "where_am_i"
+}
+
+Input: "in website, ask Claude to add dark mode"
+Output:
+{
+  "status": "ready",
+  "cleaned_text": "Add dark mode",
+  "intent": "code",
+  "agent": "claude_code",
+  "confirmation": "Adding dark mode in website.",
+  "clarification": "",
+  "target_session": "website",
+  "session_action": ""
+}
+
+Input: "tell all of them to run their tests"
+Output:
+{
+  "status": "ready",
+  "cleaned_text": "Run the tests",
+  "intent": "code",
+  "agent": "claude_code",
+  "confirmation": "Running tests on all sessions.",
+  "clarification": "",
+  "target_session": "all",
+  "session_action": ""
+}
+
+Input: "add a docstring"     (active_session: halo, no per-turn override)
+Output:
+{
+  "status": "ready",
+  "cleaned_text": "Add a docstring",
+  "intent": "code",
+  "agent": "claude_code",
+  "confirmation": "Adding a docstring.",
+  "clarification": "",
+  "target_session": "active",
+  "session_action": ""
 }
 """
 
 # JSON schema passed to Ollama's `format` parameter so the model is
 # decode-time constrained to valid output — no JSON parsing errors,
 # no missing fields.
+#
+# v1.2 additions:
+#   target_session  — label of a discovered session to dispatch to, OR
+#                     one of the pseudo-targets "active" / "focused" /
+#                     "all", OR empty string to use the default routing.
+#   session_action  — when set, this turn is a meta-operation on the
+#                     registry rather than a normal agent dispatch:
+#                       "switch"          — change active session
+#                       "list_sessions"   — speak what's running
+#                       "where_am_i"      — speak the active session
+#                       ""                — none, behave normally
 ROUTE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -350,8 +508,17 @@ ROUTE_SCHEMA: dict[str, Any] = {
         "agent": {"type": "string", "enum": ["claude_code", "codex_cli", "none"]},
         "confirmation": {"type": "string"},
         "clarification": {"type": "string"},
+        "target_session": {"type": "string"},
+        "session_action": {
+            "type": "string",
+            "enum": ["", "switch", "list_sessions", "where_am_i"],
+        },
     },
-    "required": ["status", "cleaned_text", "intent", "agent", "confirmation", "clarification"],
+    "required": [
+        "status", "cleaned_text", "intent", "agent",
+        "confirmation", "clarification",
+        "target_session", "session_action",
+    ],
 }
 
 _FALLBACK_DECISION = {
@@ -361,7 +528,57 @@ _FALLBACK_DECISION = {
     "agent": "none",
     "confirmation": "",
     "clarification": "Sorry, the router brain didn't respond. Try again.",
+    "target_session": "",
+    "session_action": "",
 }
+
+
+@dataclass(frozen=True)
+class SessionContext:
+    """Snapshot of session state passed into Stage 2 for every turn.
+
+    `active_label` is what Halo currently considers the default target;
+    `discovered` is the list of {label, cwd, agent_kind} dicts from the
+    registry. When `discovered` is empty, Stage 2 behaves as in v1.1
+    (single-session, no target_session output).
+    """
+
+    active_label: Optional[str]
+    discovered: list[dict]  # each: {"label", "cwd", "agent"}
+    focused_label: Optional[str] = None  # Phase 2 (focus binding) — unused for now
+
+
+def _format_context_block(ctx: Optional[SessionContext]) -> str:
+    """Render the SessionContext into the prefix block we prepend to the
+    user's transcript before Stage 2.
+
+    Returns "" when there's no context worth providing (single-session
+    mode or registry empty) — keeps the prompt token-cheap on the happy
+    path."""
+    if ctx is None:
+        return ""
+    if not ctx.discovered and ctx.active_label is None:
+        return ""
+
+    lines = ["# CURRENT CONTEXT (you decide target_session from this)"]
+    if ctx.active_label:
+        lines.append(f"active_session: {ctx.active_label}")
+    else:
+        lines.append("active_session: (none)")
+    if ctx.focused_label:
+        lines.append(f"focused_terminal_session: {ctx.focused_label}")
+    if ctx.discovered:
+        lines.append("discovered_sessions:")
+        for s in ctx.discovered:
+            lines.append(
+                f"  - label: {s.get('label')}  "
+                f"agent: {s.get('agent')}  "
+                f"cwd: {s.get('cwd')}"
+            )
+    else:
+        lines.append("discovered_sessions: (none — only the active session is targetable)")
+    lines.append("")  # blank line between context and the user's actual transcript
+    return "\n".join(lines)
 
 _client: ollama.Client | None = None
 
@@ -407,24 +624,44 @@ def check_turn_complete(partial_transcript: str) -> bool:
     return True
 
 
-def understand_and_route(full_transcript: str) -> dict:
+def understand_and_route(
+    full_transcript: str,
+    context: Optional[SessionContext] = None,
+) -> dict:
     """Stage 2: clean + route the full transcript. Returns the schema dict.
 
+    `context` (v1.2) — when provided and non-empty, a CURRENT CONTEXT
+    block is prepended to the user message describing the active session
+    and discovered sessions. The brain uses this to set `target_session`
+    and `session_action`. When None or empty, behaves exactly as v1.1
+    (single-session mode).
+
     On any error, returns a safe `unclear` fallback so callers can keep
-    going without exception handling.
+    going without exception handling. The fallback also contains the new
+    v1.2 fields as empty strings so callers can read them unconditionally.
     """
+    user_payload = full_transcript
+    ctx_block = _format_context_block(context)
+    if ctx_block:
+        user_payload = ctx_block + "\n# USER TRANSCRIPT\n" + full_transcript
+
     try:
         response = _get_client().chat(
             model=OLLAMA_MODEL,
             messages=[
                 {"role": "system", "content": STAGE2_PROMPT},
-                {"role": "user", "content": full_transcript},
+                {"role": "user", "content": user_payload},
             ],
             format=ROUTE_SCHEMA,
             options={"temperature": 0.2},
             keep_alive=_KEEP_ALIVE,
         )
-        return json.loads(response["message"]["content"])
+        decision = json.loads(response["message"]["content"])
+        # Defensive: older models or rare schema misses might omit the
+        # new fields. Make sure callers always see them as strings.
+        decision.setdefault("target_session", "")
+        decision.setdefault("session_action", "")
+        return decision
     except Exception as exc:
         return {**_FALLBACK_DECISION, "cleaned_text": full_transcript, "_error": str(exc)}
 

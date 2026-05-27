@@ -328,34 +328,60 @@ def available_agents() -> list[str]:
     ]
 
 
-# Per-agent session-continuation flag. Persists for the Halo process
-# lifetime so a follow-up after a wake reuses the same thread.
-_sessions_active: dict[str, bool] = {key: False for key in AGENTS}
-# Per-agent spoken session name ("Mars", "Juno", ...). Reset when the
-# user starts a new session for that agent.
+# Session state is keyed by (agent_key, cwd). v1.1 was keyed by
+# agent_key only, which forced one Claude session per agent across the
+# entire Halo process. v1.2's multi-project mode means we can have
+# one persistent Claude per project directory all running at once.
+#
+# `session_key(agent_key, cwd)` returns a stable composite string used
+# everywhere session state is keyed. cwd is normalized via Path.resolve
+# so "D:\\Halo" and "D:/Halo/." both hash to the same key.
+def session_key(agent_key: str, cwd: Path | str | None) -> str:
+    """Stable composite key for per-(agent, cwd) session state.
+
+    cwd=None falls back to DEFAULT_CWD (Halo's launch dir) so v1.1
+    single-project callers keep working without changes.
+    """
+    path = Path(cwd) if cwd is not None else DEFAULT_CWD
+    try:
+        norm = str(path.resolve())
+    except Exception:
+        norm = str(path)
+    return f"{agent_key}@{norm}"
+
+
+# Per-(agent, cwd) session-continuation flag.
+_sessions_active: dict[str, bool] = {}
+# Per-(agent, cwd) spoken session name ("Mars", "Juno", ...).
 _session_names: dict[str, str] = {}
 
 
-def _new_session_name(agent_key: str) -> str:
-    # Don't repeat the current name for the same agent if we can help it.
-    current = _session_names.get(agent_key)
+def _new_session_name(skey: str) -> str:
+    # Don't repeat the current name for the same session if we can help it.
+    current = _session_names.get(skey)
     pool = [n for n in _MYTHOLOGY_NAMES if n != current] or list(_MYTHOLOGY_NAMES)
     return random.choice(pool)
 
 
-def session_name(agent_key: str) -> str:
-    """Spoken name for the live (or last) session of `agent_key`."""
-    if agent_key not in _session_names:
-        _session_names[agent_key] = _new_session_name(agent_key)
-    return _session_names[agent_key]
+def session_name(agent_key: str, cwd: Path | str | None = None) -> str:
+    """Spoken name for the live (or last) session of `agent_key` in `cwd`."""
+    skey = session_key(agent_key, cwd)
+    if skey not in _session_names:
+        _session_names[skey] = _new_session_name(skey)
+    return _session_names[skey]
 
 
-def reset_session(agent: str | None = None) -> None:
-    """Drop the continuation pointer for one agent or all of them.
+def reset_session(agent: str | None = None, cwd: Path | str | None = None) -> None:
+    """Drop the continuation pointer for one (agent, cwd) — or all sessions.
 
     For persistent-session agents (Claude), also kills the long-lived
     subprocess so the next dispatch spawns a fresh one. Rotates the
     spoken name so the next dispatch introduces itself fresh.
+
+    Behavior:
+      reset_session()                     -> reset every session, every cwd
+      reset_session("claude_code")        -> reset every cwd for that agent
+      reset_session("claude_code", cwd)   -> reset just one (agent, cwd) pair
 
     Use on explicit "new task" / "start over" / "fresh session" cues —
     NOT between conversations.
@@ -364,17 +390,50 @@ def reset_session(agent: str | None = None) -> None:
     # _SentenceBuffer + _extract_* helpers from this module.
     from halo import sessions as _sessions
 
-    targets = list(_sessions_active.keys()) if agent is None else [agent]
-    for key in targets:
-        if key in _sessions_active:
-            _sessions_active[key] = False
-            _session_names[key] = _new_session_name(key)
-            if AGENTS.get(key) and AGENTS[key].session_kind == "persistent":
-                _sessions.close(key)
+    if agent is None:
+        targets = list(_sessions_active.keys())
+    elif cwd is not None:
+        targets = [session_key(agent, cwd)]
+    else:
+        prefix = f"{agent}@"
+        targets = [k for k in _sessions_active if k.startswith(prefix)]
+        # Also catch sessions that were named but never marked active.
+        targets += [k for k in _session_names if k.startswith(prefix) and k not in targets]
+
+    for skey in targets:
+        if skey in _sessions_active:
+            _sessions_active[skey] = False
+        if skey in _session_names:
+            _session_names[skey] = _new_session_name(skey)
+        # Persistent process teardown — only for Claude-style agents.
+        agent_key = skey.split("@", 1)[0]
+        if AGENTS.get(agent_key) and AGENTS[agent_key].session_kind == "persistent":
+            _sessions.close(skey)
 
 
 def session_status() -> dict[str, bool]:
-    """Which agents have a live session in this Halo process."""
+    """Per-agent session-active aggregate. Keys are agent_keys.
+
+    Back-compat shape from v1.1: `{agent_key: True}` if ANY cwd has a
+    live session for that agent. v1.2 callers that need per-cwd detail
+    should use `session_status_detail()` instead.
+    """
+    agg: dict[str, bool] = {key: False for key in AGENTS}
+    for skey, active in _sessions_active.items():
+        if not active:
+            continue
+        agent_key = skey.split("@", 1)[0]
+        if agent_key in agg:
+            agg[agent_key] = True
+    return agg
+
+
+def session_status_detail() -> dict[str, bool]:
+    """Per-(agent, cwd) session-active map. Keys are session_key() strings.
+
+    New in v1.2 — exposes the full per-project state for the dashboard,
+    registry, and orchestrator.
+    """
     return dict(_sessions_active)
 
 
@@ -648,12 +707,15 @@ def _dispatch_persistent(
     timeout: float,
     on_text_chunk: Optional[Callable[[str], None]],
 ) -> tuple[bool, str, str]:
-    """Send `prompt` to the long-lived process for `config.key`.
+    """Send `prompt` to the long-lived process for `(config.key, cwd)`.
 
     Lazy-spawns the process on first call, reuses it on every
     subsequent call. On a dead-process detection (broken pipe, exit)
     the next call transparently respawns once. Returns the same
     `(ok, stdout, stderr_tail)` shape as `_run`.
+
+    v1.2: keyed by session_key(config.key, cwd) so multiple projects
+    each get their own persistent Claude.
     """
     from halo import sessions as _sessions
 
@@ -675,13 +737,19 @@ def _dispatch_persistent(
         else AGENT_CLI_VISIBLE
     )
 
+    # Session is per-(agent, cwd). Label = "<agent>@<basename>" so the
+    # popup window title and log filename stay readable when several
+    # projects are live at once.
+    skey = session_key(config.key, cwd)
+    label = f"{config.key}-{Path(cwd).name or 'root'}"
+
     # Try once, retry once on a respawn-after-death; bail on a second
     # consecutive failure so we don't spin.
     last_err = ""
     for attempt in (1, 2):
         try:
             sess, was_new = _sessions.get_or_create(
-                config.key, argv, cwd=cwd, label=config.key, verbose=verbose,
+                skey, argv, cwd=cwd, label=label, verbose=verbose,
             )
         except _sessions.SessionStartupError as exc:
             _persistent_disabled[config.key] = str(exc)
@@ -691,12 +759,13 @@ def _dispatch_persistent(
             bus.emit(
                 "agent.session_spawned",
                 agent=config.key,
+                cwd=cwd,
                 send_no=sess.send_count + 1,
             )
-            print(f"    [{config.key}] persistent session spawned")
+            print(f"    [{label}] persistent session spawned")
         else:
             print(
-                f"    [{config.key}] reusing persistent session "
+                f"    [{label}] reusing persistent session "
                 f"(send #{sess.send_count + 1})"
             )
 
@@ -708,9 +777,9 @@ def _dispatch_persistent(
             # Pipe broke / process died. Close the corpse and let the
             # next attempt respawn.
             last_err = str(exc)
-            print(f"    [{config.key}] persistent session died: {exc} — respawning")
-            bus.emit("agent.respawn", agent=config.key, reason=last_err)
-            _sessions.close(config.key)
+            print(f"    [{label}] persistent session died: {exc} — respawning")
+            bus.emit("agent.respawn", agent=config.key, cwd=cwd, reason=last_err)
+            _sessions.close(skey)
             if attempt == 2:
                 break
             continue
@@ -736,6 +805,12 @@ def dispatch(
     Most callers should use `start_job(...)` instead so the
     conversation loop isn't blocked while the agent runs.
 
+    `cwd` (v1.2) — working directory for this dispatch. Defaults to the
+    Halo launch dir (DEFAULT_CWD) when None, matching v1.1 behavior.
+    Session state (continuation flag, spoken name, persistent process)
+    is keyed by (agent_key, cwd) so multiple projects can each have
+    their own live Claude session.
+
     `on_text_chunk` is invoked per sentence while the agent generates
     its response (only for agents with `streams_text_deltas=True`).
     """
@@ -743,8 +818,11 @@ def dispatch(
     if config is None:
         return False, f"Unknown agent: {agent_key!r}. Known: {known_agents()}"
 
-    # Assign / reuse a spoken name for this session.
-    name = session_name(config.key)
+    workdir = str(cwd) if cwd else str(DEFAULT_CWD)
+    skey = session_key(config.key, workdir)
+
+    # Assign / reuse a spoken name for this (agent, cwd) session.
+    name = session_name(config.key, workdir)
     system_prompt = VOICE_SYSTEM_PROMPT.replace("{NAME}", name)
 
     # For agents that don't take a system-prompt flag (Codex), prepend
@@ -759,8 +837,6 @@ def dispatch(
             + prompt
         )
 
-    workdir = str(cwd) if cwd else str(DEFAULT_CWD)
-
     persistent_first_choice = (
         config.session_kind == "persistent"
         and config.key not in _persistent_disabled
@@ -771,7 +847,7 @@ def dispatch(
     err = ""
 
     if persistent_first_choice:
-        _sessions_active[config.key] = True  # process IS the session
+        _sessions_active[skey] = True  # process IS the session
         ok, stdout, err = _dispatch_persistent(
             config,
             prompt=prompt,
@@ -785,30 +861,31 @@ def dispatch(
         # Fall through to one-shot for THIS call so the user isn't left
         # hanging.
         if not ok and config.key not in _persistent_disabled:
-            _sessions_active[config.key] = False
+            _sessions_active[skey] = False
             return False, f"{config.spoken_name} failed: {err}"
         if not ok:
-            _sessions_active[config.key] = False
+            _sessions_active[skey] = False
 
     if not ok:
         # One-shot dispatch — either the agent is one-shot by design
         # (Codex) or persistent spawn fell back due to CLI mismatch.
         # See _persistent_disabled note above for the latter case.
-        template = config.continue_call if _sessions_active[config.key] else config.first_call
-        _sessions_active[config.key] = True
+        was_active = _sessions_active.get(skey, False)
+        template = config.continue_call if was_active else config.first_call
+        _sessions_active[skey] = True
         cmd = _build_cmd(
             template, prompt=prompt, cwd=workdir, system_prompt=system_prompt,
         )
         ok, stdout, err = _run(
             cmd, cwd=workdir, timeout=timeout,
-            label=config.key,
+            label=f"{config.key}-{Path(workdir).name or 'root'}",
             on_voice_tick=on_voice_tick,
             on_text_chunk=on_text_chunk if config.streams_text_deltas else None,
             stream_text_deltas=config.streams_text_deltas,
             json_result_field=config.json_result_field,
         )
         if not ok:
-            _sessions_active[config.key] = False
+            _sessions_active[skey] = False
             return False, f"{config.spoken_name} failed: {err}"
 
     if config.streams_text_deltas:
@@ -842,12 +919,17 @@ def dispatch_codex(prompt: str, **kwargs) -> tuple[bool, str]:
 
 @dataclass
 class AgentJob:
-    """One in-flight or finished agent invocation."""
+    """One in-flight or finished agent invocation.
+
+    v1.2 adds `cwd` so the dashboard and registry can distinguish jobs
+    that target the same agent across different projects.
+    """
 
     job_id: int
     agent_key: str
     prompt: str
     started_at: float
+    cwd: str = ""  # filled at start_job; "" means DEFAULT_CWD
     completed_at: Optional[float] = None
     ok: Optional[bool] = None
     result: str = ""
@@ -863,16 +945,22 @@ class AgentJob:
         end = self.completed_at if self.completed_at is not None else time.monotonic()
         return end - self.started_at
 
+    @property
+    def session_key(self) -> str:
+        return session_key(self.agent_key, self.cwd or None)
+
 
 _jobs: list[AgentJob] = []
 _jobs_lock = threading.Lock()
 _job_id_seq = itertools.count(1)
-_last_by_agent: dict[str, AgentJob] = {}
+# Keyed by session_key (agent_key@cwd) so cross-project lookups work.
+_last_by_session: dict[str, AgentJob] = {}
 
 
 class AgentBusy(RuntimeError):
     """Raised when start_job is called for an agent that already has an
-    active job. v0.1 keeps it simple — at most one job per agent."""
+    active job in the same cwd. v1.2 allows one concurrent job per
+    (agent, cwd) pair — different cwds can run in parallel."""
 
 
 def start_job(
@@ -885,24 +973,30 @@ def start_job(
 ) -> AgentJob:
     """Spawn an agent in the background. Returns immediately.
 
+    `cwd` (v1.2) — working directory; defaults to DEFAULT_CWD. Per-(agent,
+    cwd) busy-check means the same agent can have parallel jobs across
+    different projects, but not two jobs in the same project.
+
     `on_text_chunk(sentence)` fires once per sentence while the agent
     generates its response (streaming-capable agents only). The
     orchestrator passes a TTS-speaker callback so Halo narrates the
     response live instead of going dead-air on long jobs.
 
-    Raises AgentBusy if the agent already has a job running. v0.1
-    allows concurrent jobs across different agents (Claude + Codex
-    can both work at once) but not within the same agent.
+    Raises AgentBusy if the agent already has a job running in `cwd`.
     """
     if agent_key not in AGENTS:
         raise ValueError(f"Unknown agent {agent_key!r}. Known: {known_agents()}")
 
+    workdir = str(cwd) if cwd else str(DEFAULT_CWD)
+    skey = session_key(agent_key, workdir)
+
     with _jobs_lock:
         for j in _jobs:
-            if j.agent_key == agent_key and not j.is_done:
+            if j.session_key == skey and not j.is_done:
                 raise AgentBusy(
                     f"{AGENTS[agent_key].spoken_name} is already working on "
-                    f"job {j.job_id} ({int(j.elapsed_sec)}s in)."
+                    f"job {j.job_id} in {Path(workdir).name or workdir} "
+                    f"({int(j.elapsed_sec)}s in)."
                 )
 
         job = AgentJob(
@@ -910,25 +1004,31 @@ def start_job(
             agent_key=agent_key,
             prompt=prompt,
             started_at=time.monotonic(),
+            cwd=workdir,
         )
 
         # Wrap the user's on_text_chunk so we can also push streaming
         # sentences onto the bus for the web dashboard.
-        spoken = session_name(agent_key)
+        spoken = session_name(agent_key, workdir)
 
         def _on_chunk(sentence: str) -> None:
-            bus.emit("agent.streaming", agent=agent_key, name=spoken, sentence=sentence)
+            bus.emit(
+                "agent.streaming",
+                agent=agent_key, name=spoken, cwd=workdir, sentence=sentence,
+            )
             if on_text_chunk is not None:
                 on_text_chunk(sentence)
 
         def _runner() -> None:
-            bus.emit("agent.dispatched",
-                     agent=agent_key, name=spoken, prompt=prompt,
-                     job_id=job.job_id)
+            bus.emit(
+                "agent.dispatched",
+                agent=agent_key, name=spoken, cwd=workdir, prompt=prompt,
+                job_id=job.job_id,
+            )
             try:
                 ok, text = dispatch(
                     agent_key, prompt,
-                    cwd=cwd, timeout=timeout,
+                    cwd=Path(workdir), timeout=timeout,
                     on_text_chunk=_on_chunk,
                 )
             except Exception as exc:  # safety net so the thread never crashes silently
@@ -936,10 +1036,10 @@ def start_job(
             job.ok = ok
             job.result = text
             job.completed_at = time.monotonic()
-            _last_by_agent[agent_key] = job
+            _last_by_session[skey] = job
             bus.emit(
                 "agent.done" if ok else "agent.error",
-                agent=agent_key, name=spoken,
+                agent=agent_key, name=spoken, cwd=workdir,
                 job_id=job.job_id,
                 elapsed_sec=job.elapsed_sec,
                 text=text,
@@ -968,29 +1068,50 @@ def mark_consumed(job: AgentJob) -> None:
     job._consumed = True
 
 
-def last_result_for(agent_key: str) -> Optional[AgentJob]:
-    """Most recent completed job for an agent — used by 'what did X say' queries."""
-    return _last_by_agent.get(agent_key)
+def last_result_for(agent_key: str, cwd: Path | str | None = None) -> Optional[AgentJob]:
+    """Most recent completed job for an agent — used by 'what did X say' queries.
+
+    v1.2: cwd=None matches the most recent job for `agent_key` across
+    ALL projects (back-compat with v1.1 callers). Pass a cwd to scope
+    to one project.
+    """
+    if cwd is not None:
+        return _last_by_session.get(session_key(agent_key, cwd))
+    # Find the most recent across any cwd.
+    best: Optional[AgentJob] = None
+    for j in _last_by_session.values():
+        if j.agent_key != agent_key or j.completed_at is None:
+            continue
+        if best is None or (j.completed_at or 0) > (best.completed_at or 0):
+            best = j
+    return best
 
 
 def status_summary() -> str:
-    """One-line voice-friendly status across all agents."""
+    """One-line voice-friendly status across all (agent, cwd) pairs."""
     actives = active_jobs()
     if not actives:
-        # Mention the most recent completed job per agent if any.
-        if not _last_by_agent:
+        # Mention the most recent completed job per session if any.
+        if not _last_by_session:
             return "Everything is idle."
-        parts = [
-            f"{AGENTS[a].spoken_name} finished {int(time.monotonic() - j.completed_at)} seconds ago"
-            for a, j in _last_by_agent.items()
-            if j.completed_at is not None
-        ]
+        parts = []
+        for j in _last_by_session.values():
+            if j.completed_at is None:
+                continue
+            cfg = AGENTS[j.agent_key]
+            where = Path(j.cwd).name if j.cwd else ""
+            tag = f"{cfg.spoken_name} in {where}" if where else cfg.spoken_name
+            parts.append(
+                f"{tag} finished {int(time.monotonic() - j.completed_at)} seconds ago"
+            )
         return "Idle. " + ". ".join(parts) + "." if parts else "Everything is idle."
     parts = []
     for j in actives:
         cfg = AGENTS[j.agent_key]
         snippet = j.prompt if len(j.prompt) <= 60 else j.prompt[:57] + "..."
-        parts.append(f"{cfg.spoken_name} is working on '{snippet}', {int(j.elapsed_sec)} seconds in")
+        where = Path(j.cwd).name if j.cwd else ""
+        tag = f"{cfg.spoken_name} in {where}" if where else cfg.spoken_name
+        parts.append(f"{tag} is working on '{snippet}', {int(j.elapsed_sec)} seconds in")
     return ". ".join(parts) + "."
 
 

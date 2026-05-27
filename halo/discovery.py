@@ -1,0 +1,312 @@
+"""Discovery — find running coding-agent CLI processes on the machine.
+
+On a developer's box at any moment there may be N terminals open, each
+running a `claude` / `codex` / etc. session against a different project.
+Halo's old "spawn-my-own-Claude in the launch cwd" model ignored all of
+that and gave the user a parallel, deaf-to-existing-work Claude. This
+module is the first half of the fix: a process scanner that reports
+every coding-agent session it can see, with its cwd and parent terminal.
+
+The orchestrator feeds this list (and the user's currently-spoken target)
+into the Stage 2 LLM so the brain can route to the right session by name
+("work on website") instead of forcing the user to manually register
+projects.
+
+Design notes:
+- Pure psutil. No win32 hacks. Cross-platform-friendly (Mac/Linux mostly
+  work — child cmdlines are POSIX-portable; cwd lookup is universal).
+- Cheap. One scan = O(n_processes) with two cheap calls per match. We
+  run it on a daemon thread every DISCOVERY_INTERVAL_SEC.
+- Identification is by cmdline substring, not binary name — `claude` on
+  Windows is a `.cmd` shim that spawns `node.exe <path-to-cli-js>`. We
+  match the JS path or the node argv, not the binary, so both Windows
+  shims and POSIX direct execs are caught.
+- Excludes ourselves: Halo spawns its own Claude subprocesses via
+  halo.sessions; those have well-known argv patterns and are filtered
+  out so they don't show up as "discovered" sessions to the user.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterable, Optional
+
+try:
+    import psutil
+except ImportError as _exc:  # pragma: no cover
+    psutil = None
+    _PSUTIL_IMPORT_ERROR = _exc
+else:
+    _PSUTIL_IMPORT_ERROR = None
+
+
+# How often the background thread re-scans process state. 2 s is short
+# enough that the brain sees new terminals/sessions within one turn; long
+# enough that we don't burn CPU on a busy laptop.
+DISCOVERY_INTERVAL_SEC = 2.0
+
+
+# Marker substrings we look for in process cmdlines to identify each
+# kind of agent. Keep these specific enough to avoid false positives —
+# matching bare `claude` would also catch "claude.md" file opens, etc.
+_AGENT_FINGERPRINTS: dict[str, tuple[str, ...]] = {
+    "claude_code": (
+        "@anthropic-ai/claude-code",
+        "claude-code/cli",
+        "claude-code\\cli",
+        # Direct binary names (POSIX `claude`, Windows shim entry).
+        "claude.js",
+    ),
+    "codex_cli": (
+        "@openai/codex",
+        "codex/cli",
+        "codex\\cli",
+        "codex-cli",
+    ),
+}
+
+# Halo's own Claude/Codex subprocesses have a tell-tale flag combination
+# (Claude: `--input-format stream-json`; Codex: `codex exec`). Filter
+# them so users don't see their own Halo-managed sessions in the
+# discovery list — those are already addressable as the "active" session
+# without going through discovery.
+_HALO_SPAWNED_MARKERS: tuple[str, ...] = (
+    "--input-format",  # only Halo's persistent Claude uses this
+    "codex exec",       # only Halo's one-shot Codex
+)
+
+# Shell / terminal process names — used to walk back from an agent
+# process to identify the parent terminal window the user is interacting
+# with. Helps the focus tracker (Phase 2) and improves the spoken label
+# when two projects share a basename.
+_TERMINAL_NAMES = {
+    "pwsh.exe", "powershell.exe", "cmd.exe",
+    "WindowsTerminal.exe", "wt.exe", "conhost.exe",
+    "bash", "zsh", "fish", "sh",
+    "alacritty", "kitty", "wezterm", "iterm2", "Terminal",
+}
+
+
+@dataclass(frozen=True)
+class DiscoveredSession:
+    """One detected agent process on the machine.
+
+    Fields:
+      agent_key:       "claude_code" | "codex_cli" | future agents
+      pid:             process id of the agent itself
+      cwd:             working directory (absolute path)
+      label:           short spoken/displayed name (basename of cwd by default;
+                       see registry.py for collision handling)
+      parent_pid:      parent process pid (usually a shell)
+      parent_name:     parent process name (powershell.exe, bash, ...)
+      cmdline:         the agent's full argv as a string (truncated for display)
+      seen_at:         monotonic timestamp of last scan that confirmed it
+    """
+
+    agent_key: str
+    pid: int
+    cwd: str
+    label: str
+    parent_pid: Optional[int]
+    parent_name: Optional[str]
+    cmdline: str
+    seen_at: float
+
+    def __str__(self) -> str:
+        parent = f" ← {self.parent_name}" if self.parent_name else ""
+        return f"[{self.agent_key} #{self.pid}] {self.label}  ({self.cwd}){parent}"
+
+
+def is_available() -> bool:
+    """True if process discovery is supported on this machine."""
+    return psutil is not None
+
+
+def _classify_cmdline(cmdline_parts: Iterable[str]) -> Optional[str]:
+    """Return the agent_key whose fingerprint matches `cmdline_parts`, or None."""
+    joined = " ".join(cmdline_parts)
+    # Filter Halo-spawned processes first — they look like normal Claude
+    # to the fingerprint matcher otherwise.
+    for marker in _HALO_SPAWNED_MARKERS:
+        if marker in joined:
+            return None
+    for agent_key, fingerprints in _AGENT_FINGERPRINTS.items():
+        for fp in fingerprints:
+            if fp in joined:
+                return agent_key
+    return None
+
+
+def _safe_cwd(proc: "psutil.Process") -> Optional[str]:
+    try:
+        return proc.cwd()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return None
+
+
+def _safe_cmdline(proc: "psutil.Process") -> Optional[list[str]]:
+    try:
+        return proc.cmdline()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return None
+
+
+def _safe_parent(proc: "psutil.Process") -> Optional["psutil.Process"]:
+    try:
+        return proc.parent()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return None
+
+
+def _label_for(cwd: str) -> str:
+    """Default human label = basename of cwd. Falls back to drive root.
+
+    Collisions (two projects with the same basename) are resolved one
+    level up by the registry; this function stays simple.
+    """
+    try:
+        path = Path(cwd)
+        base = path.name
+        if base:
+            return base
+        # Drive roots: "D:\\" -> "D:"
+        return str(path).rstrip("\\/").rstrip(":") + ":"
+    except Exception:
+        return cwd
+
+
+def scan_once() -> list[DiscoveredSession]:
+    """Walk all processes once. Returns the current detected agent sessions.
+
+    Errors on individual processes are swallowed (race vs. process exit
+    is common during a sweep; the next scan will catch up).
+    """
+    if psutil is None:
+        return []
+
+    now = time.monotonic()
+    out: list[DiscoveredSession] = []
+    self_pid = None
+    try:
+        self_pid = psutil.Process().pid
+    except Exception:
+        pass
+
+    for proc in psutil.process_iter(attrs=["pid", "name"]):
+        try:
+            if self_pid is not None and proc.pid == self_pid:
+                continue
+            cmdline = _safe_cmdline(proc)
+            if not cmdline:
+                continue
+            agent_key = _classify_cmdline(cmdline)
+            if agent_key is None:
+                continue
+            cwd = _safe_cwd(proc)
+            if not cwd:
+                continue
+            parent = _safe_parent(proc)
+            parent_pid: Optional[int] = None
+            parent_name: Optional[str] = None
+            if parent is not None:
+                try:
+                    parent_pid = parent.pid
+                    parent_name = parent.name()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            joined = " ".join(cmdline)
+            if len(joined) > 200:
+                joined = joined[:197] + "..."
+            out.append(
+                DiscoveredSession(
+                    agent_key=agent_key,
+                    pid=proc.pid,
+                    cwd=cwd,
+                    label=_label_for(cwd),
+                    parent_pid=parent_pid,
+                    parent_name=parent_name,
+                    cmdline=joined,
+                    seen_at=now,
+                )
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+        except Exception:
+            # Don't let a single bad row kill the whole scan.
+            continue
+    return out
+
+
+class DiscoveryThread:
+    """Background scanner. Owns the current snapshot; callers read it
+    via `snapshot()` whenever they need fresh data.
+
+    Cheap enough that we just always run it when Halo is in multi-session
+    mode. Stop it explicitly on shutdown to avoid the daemon thread
+    leaking past the process exit during pytest.
+    """
+
+    def __init__(
+        self,
+        interval_sec: float = DISCOVERY_INTERVAL_SEC,
+        on_change: Optional[Callable[[list[DiscoveredSession]], None]] = None,
+    ) -> None:
+        self._interval = interval_sec
+        self._on_change = on_change
+        self._snapshot: list[DiscoveredSession] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="halo-discovery", daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def snapshot(self) -> list[DiscoveredSession]:
+        with self._lock:
+            return list(self._snapshot)
+
+    def refresh_now(self) -> list[DiscoveredSession]:
+        """Force a synchronous scan and update the snapshot. Useful for
+        `halo sessions` CLI and tests."""
+        sessions = scan_once()
+        self._set_snapshot(sessions)
+        return sessions
+
+    def _loop(self) -> None:
+        # First scan is synchronous so callers that start() and immediately
+        # snapshot() get real data instead of an empty list.
+        self.refresh_now()
+        while not self._stop.wait(self._interval):
+            try:
+                sessions = scan_once()
+            except Exception as exc:
+                print(f"  [discovery] scan error: {exc}")
+                continue
+            self._set_snapshot(sessions)
+
+    def _set_snapshot(self, sessions: list[DiscoveredSession]) -> None:
+        changed = False
+        with self._lock:
+            old_keys = {(s.pid, s.cwd) for s in self._snapshot}
+            new_keys = {(s.pid, s.cwd) for s in sessions}
+            if old_keys != new_keys:
+                changed = True
+            self._snapshot = sessions
+        if changed and self._on_change is not None:
+            try:
+                self._on_change(list(sessions))
+            except Exception as exc:
+                print(f"  [discovery] on_change error: {exc}")

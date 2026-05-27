@@ -4,7 +4,7 @@ Voice front-end for agentic coding tools. Say a wake word, talk to
 Claude Code or Codex CLI in plain English, and hear the result back.
 Halo is the audio layer; the agents do the work.
 
-Status: **v1.1.1 — follow-up gate keeps phone calls and side conversations out of your agent session.** Builds on v1.1 (custom "halo" wake word, persistent Claude sessions, separate-console live feed, noise-suppression pipeline). Live web dashboard at `http://127.0.0.1:7070`.
+Status: **v1.2.0 — multi-session mode.** Halo auto-discovers every running Claude / Codex session on your machine and the brain routes by voice (*"switch to website"*, *"in AIP, fix the bug"*, *"what sessions do I have?"*) — no manual registration. Builds on v1.1 (custom "halo" wake word, persistent Claude sessions, follow-up gate, separate-console live feed, noise-suppression pipeline). Live web dashboard at `http://127.0.0.1:7070`.
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full history. Licensed MIT
 ([LICENSE](./LICENSE)).
@@ -89,8 +89,23 @@ Hardware target: Windows + NVIDIA GPU (RTX 3060 is enough). Mac /
 Linux paths exist for tools and TTS; CUDA-specific bits gracefully
 fall back to CPU.
 
-### v1.1 highlights
+### v1.2 highlights
 
+- **Multi-session mode (v1.2.0)** — Halo runs a process discovery
+  scanner that finds every `claude` / `codex` session on your machine
+  and feeds the list to the routing brain. You no longer talk to one
+  Claude bound to Halo's launch dir — you talk to **whichever session
+  you name**. Voice commands:
+  - *"switch to website"* / *"work on the AIP one"* → set active session
+  - *"what sessions do I have?"* → spoken list
+  - *"where am I?"* / *"what project am I on?"* → speak the active one
+  - *"in website, ask Claude to add dark mode"* → one-shot dispatch to
+    another session without changing the active one
+  - *"tell all of them to run their tests"* → fanout to every session
+  Each project gets its own persistent Claude subprocess (LRU-bounded),
+  so the same agent can have parallel jobs across N projects at once.
+  Brain decisions live in the Stage 2 LLM prompt — no new regex.
+  See [Multi-session mode](#multi-session-mode) below.
 - **Follow-up gate (v1.1.1)** — once you're in direct dialogue with an
   agent, the mic stays hot for follow-ups but a 4-rule keyword filter
   decides whether each utterance is actually for the agent. Phone calls,
@@ -222,6 +237,7 @@ halo                  start the voice loop (default)
 halo run              same as above
 halo download-models  fetch Kokoro TTS model files
 halo doctor           check Ollama, agents (claude/codex), models — read-only
+halo sessions         list running coding-agent sessions on this machine (v1.2)
 halo version          print installed version
 halo --help           show help
 ```
@@ -324,6 +340,83 @@ the conversation stays open until you explicitly say `"goodbye"`,
 `"go to sleep"`, `"over and out"`, or any of the end phrases. The 5-second
 idle sleep only applies when you're in plain Halo mode (no direct
 dialogue and no running jobs).
+
+### Multi-session mode
+
+By default, Halo scans your machine every 2 seconds for running
+coding-agent CLIs (`claude` and `codex`, including their npm shims),
+records each one's cwd and parent terminal, and exposes the list to the
+Stage 2 LLM brain as **discovered sessions**. The brain then routes
+voice commands accordingly — no manual `halo project add` step, no
+focus-binding to set up, no keystroke-injection trickery.
+
+#### What you can say
+
+| Spoken | What happens |
+|---|---|
+| *"halo, what sessions do I have?"* | Brain emits `session_action: list_sessions` → Halo speaks: *"three sessions: halo, website, AIP. You're on halo."* |
+| *"halo, switch to website"* / *"work on the AIP one"* | Brain emits `session_action: switch` → active session changes; next dispatch goes there |
+| *"halo, where am I?"* | Brain emits `session_action: where_am_i` → speaks active session label + cwd |
+| *"halo, Claude, refactor the auth module"* | Vocative dispatch (existing) into the active session's cwd |
+| *"halo, in website, ask Claude to add dark mode"* | One-shot dispatch into the website session without changing active |
+| *"halo, tell all of them to run their tests"* | Fanout — same prompt to every discovered session |
+
+#### How collisions are resolved
+
+Two cwds with the same basename (`D:\client-a\halo` and `D:\client-b\halo`)
+get parent-disambiguated labels: `client-a/halo` and `client-b/halo`.
+Beyond that, pid suffix is appended (`client-a/halo#1234`). You can
+always say *"what sessions do I have"* to hear the current labels.
+
+#### Per-project persistent sessions
+
+When you dispatch to a discovered session, Halo lazily spawns its own
+persistent Claude subprocess in that cwd. This is keyed by
+`(agent_key, cwd)`, so:
+- the same agent can have parallel jobs across N projects
+- each project's `--continue` thread stays alive for the Halo process lifetime
+- `reset_session` accepts an optional cwd to scope the reset
+
+#### Verifying discovery
+
+```powershell
+halo sessions
+```
+
+Read-only one-shot scan. Prints a table of `label / agent / pid / cwd`
+for every running coding-agent CLI. Exit 0 when something is found, 1
+when nothing is. Use this before booting the full voice loop to confirm
+discovery works on your machine.
+
+#### Single-session fallback
+
+When `psutil` isn't installed OR no sessions are discovered, Halo runs
+in v1.1 single-session mode — spawning its own Claude in the launch
+cwd, exactly as before. The brain prompt only carries CURRENT CONTEXT
+when there's something to report, so single-session callers pay zero
+token overhead.
+
+#### Brain-side routing (not regex)
+
+The Stage 2 LLM (qwen2.5:1.5b by default) receives a `CURRENT CONTEXT`
+block prepended to every transcript when sessions are discovered:
+
+```
+# CURRENT CONTEXT (you decide target_session from this)
+active_session: halo
+discovered_sessions:
+  - label: halo       agent: claude_code  cwd: D:/Halo
+  - label: website    agent: claude_code  cwd: D:/website-redesign
+  - label: aip        agent: claude_code  cwd: D:/AIP-Claude
+```
+
+The JSON schema gained two fields the brain populates:
+- `target_session` — label / `"active"` / `"focused"` / `"all"` / `""`
+- `session_action` — `""` / `"switch"` / `"list_sessions"` / `"where_am_i"`
+
+This means new routing patterns (*"work on the third one"*, *"the AI
+thing I was looking at"*, *"the website one with the dark theme"*) are
+all handled by upgrading the prompt — not by adding regex.
 
 ### Follow-up gate
 
@@ -493,6 +586,8 @@ halo/
   turn.py         per-turn orchestration (record/transcribe; routing in __main__)
   tools.py        cross-platform local tools (browser, calc, notepad, ...)
   followup_gate.py 4-rule keyword filter for direct-dialogue mode (v1.1.1)
+  discovery.py    psutil-based scanner — finds running claude/codex (v1.2)
+  registry.py     session registry + spoken-target fuzzy matching (v1.2)
   agents.py       agent registry, dispatch, background jobs, session names
   voice.py        Kokoro TTS + Markdown sanitizer
   bus.py          thread-safe event bus (ring buffer of {kind, ts, ...})

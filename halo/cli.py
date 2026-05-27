@@ -41,8 +41,47 @@ def _build_parser() -> argparse.ArgumentParser:
         "doctor",
         help="Check that Ollama, agents (claude/codex), and Kokoro are wired up.",
     )
+    sub.add_parser(
+        "sessions",
+        help="List running coding-agent sessions discovered on this machine.",
+    )
     sub.add_parser("version", help="Print the installed version and exit.")
     return parser
+
+
+def _print_sessions() -> int:
+    """`halo sessions` — read-only one-shot discovery.
+
+    Useful to verify multi-session discovery works on your machine
+    before booting the full voice loop. Exit 0 if any sessions were
+    found, 1 if none.
+    """
+    from halo.discovery import is_available, scan_once
+
+    if not is_available():
+        print(
+            "psutil is not installed — discovery is disabled.\n"
+            "Install with:  pip install psutil"
+        )
+        return 1
+
+    sessions = scan_once()
+    if not sessions:
+        print(
+            "No running coding-agent sessions detected.\n"
+            "Open a terminal and start `claude` or `codex` somewhere, then re-run."
+        )
+        return 1
+
+    print(f"Discovered {len(sessions)} session{'s' if len(sessions) != 1 else ''}:\n")
+    # Aligned columns: label / agent / pid / cwd
+    label_w = max((len(s.label) for s in sessions), default=10)
+    agent_w = max((len(s.agent_key) for s in sessions), default=10)
+    print(f"  {'LABEL':{label_w}}  {'AGENT':{agent_w}}  {'PID':>6}  CWD")
+    print(f"  {'-' * label_w}  {'-' * agent_w}  {'-' * 6}  ---")
+    for s in sessions:
+        print(f"  {s.label:{label_w}}  {s.agent_key:{agent_w}}  {s.pid:>6}  {s.cwd}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -61,6 +100,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         from halo.doctor import run as run_doctor
         return run_doctor()
+
+    if args.command == "sessions":
+        return _print_sessions()
 
     if args.command == "version":
         print(f"halo-voice {__version__}")

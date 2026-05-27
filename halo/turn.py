@@ -46,7 +46,18 @@ from halo.tools import is_pure_tool
 from halo.wake import get_pre_wake_audio
 
 # --- end-of-turn override phrases ---------------------------------------
-TERMINATORS_RE = re.compile(r"\b(send it|do it|go)\s*[.!?,]*\s*$", re.IGNORECASE)
+# Anchored to end-of-utterance so "send the email" / "go to the gym"
+# don't accidentally fire mid-thought. The user can naturally trail off
+# and let silence commit the turn (mode-adaptive 0.8-4 s), or explicitly
+# punctuate with any of these phrases.
+TERMINATORS_RE = re.compile(
+    r"\b("
+    r"send it|do it|go|"
+    r"start now|please go|let'?s go|let'?s do it|"
+    r"fire it off|ship it|run it|execute"
+    r")\s*[.!?,]*\s*$",
+    re.IGNORECASE,
+)
 HOLD_RE = re.compile(
     r"\b(wait|hold on|hold up|give me (?:a sec|a moment|a minute)|one moment|"
     r"one sec|just a sec|just a moment)\s*[.!?,]*\s*$",

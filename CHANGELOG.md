@@ -10,6 +10,158 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.2.0] — 2026-05-25
+
+The "talk to whichever Claude I want" release. v1.1 bound Halo to one
+Claude in its launch cwd; v1.2 auto-discovers every running coding-agent
+session on the machine and lets the brain route to them by voice.
+
+### Added (multi-session discovery)
+- **`halo/discovery.py`** — psutil-based process scanner. Walks every
+  process every 2 s, classifies coding-agent CLIs by cmdline fingerprint
+  (handles Windows npm-shim case where `claude` is `node.exe
+  ...\\@anthropic-ai\\claude-code\\cli.js`), records `{pid, cwd, label,
+  parent_pid, parent_name}` per session. Excludes Halo's own spawned
+  Claudes (`--input-format stream-json`) and Halo's own Codex
+  (`codex exec`) so the discovery list shows only sessions the user
+  started themselves. Cheap (O(n_processes) per scan, two psutil calls
+  per match). Runs on a `DiscoveryThread` daemon with a fast initial
+  synchronous scan.
+- **`halo/registry.py`** — `SessionRegistry` keyed by label.
+  Collision-resolves two cwds with the same basename via
+  parent-disambiguation (`client-a/halo` vs `client-b/halo`, then
+  pid suffix as last resort). 5-tier fuzzy `resolve()`:
+  pseudo-targets ("all", "focused", "active", "here") → exact label →
+  substring (both directions) → token overlap. Strips filler words
+  ("the", "project", "thing", "one") before matching so *"the website
+  project"* still resolves to `website`. Voice-friendly `speak_list()`
+  and `speak_active()` for spoken summaries.
+
+### Added (brain becomes session-aware)
+- **`SessionContext` + `_format_context_block()`** in `halo/router.py`.
+  Every Stage 2 LLM call now optionally receives a prepended CURRENT
+  CONTEXT block listing `active_session`, `discovered_sessions[]`
+  (label/cwd/agent), and `focused_terminal_session` (reserved for
+  Phase 2 focus binding). Block is **omitted entirely** when the
+  registry is empty — single-session mode pays zero token overhead and
+  behaves byte-identically to v1.1.
+- **Stage 2 schema extended** with two new fields:
+  - `target_session` — label / `"active"` / `"focused"` / `"all"` / `""`
+  - `session_action` — `""` / `"switch"` / `"list_sessions"` / `"where_am_i"`
+  Ollama's structured-output `format` enforces them, so the orchestrator
+  always sees strings, never `KeyError`.
+- **Stage 2 prompt** gained a new SESSION-AWARE ROUTING section + 6
+  worked examples (switch, list, where_am_i, cross-session one-shot,
+  fanout, implicit-active default).
+
+### Added (agents become per-cwd)
+- **`halo/agents.py:session_key(agent_key, cwd)`** — stable composite
+  key (`"claude_code@<abspath>"`). All session state (`_sessions_active`,
+  `_session_names`, `_last_by_session`) is now keyed by this composite.
+  Path is `resolve()`-normalised so `"D:\\Halo"` and `"D:/Halo/."` hash
+  identically.
+- `dispatch(...)`, `start_job(...)`, `session_name(...)`,
+  `reset_session(...)`, `last_result_for(...)` all accept an optional
+  `cwd` parameter (defaults to `DEFAULT_CWD` for back-compat with v1.1
+  single-session callers).
+- `AgentJob` gained a `cwd` field + `session_key` property so the
+  dashboard and registry can distinguish jobs that target the same agent
+  in different projects.
+- `AgentBusy` is now per-(agent, cwd) — two projects can have parallel
+  jobs for the same agent kind.
+- `session_status()` keeps the v1.1 `{agent_key: bool}` shape (aggregated
+  over all cwds for back-compat); new `session_status_detail()` exposes
+  the full composite-keyed map for the orchestrator and dashboard.
+- `halo/sessions.py` (persistent Claude subprocess pool) is now keyed
+  by the composite session_key as well, so each project gets its own
+  long-lived `claude -p --input-format stream-json` process. Log files
+  / popup-console titles are labelled `<agent>-<basename>` so multiple
+  watch windows stay distinguishable.
+
+### Added (orchestrator wiring)
+- **`halo/__main__.py`** spawns the `DiscoveryThread` on startup
+  (silently no-ops when psutil isn't installed). Initial synchronous
+  scan happens before the voice loop opens so the first wake-fire
+  already sees other sessions.
+- Module-level `REGISTRY = SessionRegistry()` singleton, with
+  `_on_discovery_change` callback emitting a `discovery.changed` bus
+  event so the dashboard sees fresh state.
+- `_build_session_context()` snapshots the registry into a
+  `SessionContext` for every Stage 2 call.
+- `_cwd_for_dispatch(target_session)` resolves brain-emitted targets
+  to concrete `Path`s, with fuzzy fallback when the brain emits a
+  slightly-off label.
+- `_handle_session_action()` intercepts `session_action` results
+  (switch / list_sessions / where_am_i) BEFORE the normal dispatch
+  branch, so meta-operations don't dispatch to an agent.
+- `_dispatch_to_all()` fans the same prompt out to every discovered
+  session when `target_session == "all"`.
+- `_start_agent_and_ack` now takes a `cwd` kwarg and threads it
+  through `start_job` so per-project session state is correct.
+- Startup announcement extends to mention discovered count:
+  *"Halo online. Claude is connected. 3 sessions discovered."*
+
+### Added (CLI)
+- **`halo sessions`** — read-only one-shot discovery. Prints
+  `label / agent / pid / cwd` for every running coding-agent CLI.
+  Exit 0 on any sessions found, 1 on none. Use to verify multi-session
+  discovery works on your machine without booting the voice loop.
+
+### Added (turn endpointing tweaks)
+- **`turn.py:TERMINATORS_RE`** gained synonyms the user explicitly
+  asked for: `start now`, `please go`, `let's go`, `let's do it`,
+  `fire it off`, `ship it`, `run it`, `execute`. The default
+  silence-commit (0.8–4 s, mode-adaptive) remains the primary turn-end
+  signal — these are explicit "fire it now" overrides.
+- **`__main__.py:_END_CONVERSATION_RE`** added `stand by` / `standby`
+  as synonyms of `end conversation` — matches what the user asked for
+  ("if I say stand by it will end and go back to wake-listening").
+
+### Tests
+- **`scripts/test_registry.py`** (14 cases) — empty registry, collision
+  disambiguation, exact / case-insensitive / substring / token-overlap
+  / pseudo-target matching, set_active behaviour, speak_list/active.
+- **`scripts/test_discovery.py`** (9 cases) — cmdline classification
+  (npm shims, Halo-spawned exclusion, unrelated processes), label
+  derivation, live `scan_once()` smoke test that doesn't crash on
+  PermissionError.
+- **`scripts/test_agents_multicwd.py`** (7 cases) — session_key
+  normalization, per-cwd naming, aggregated/detail status, reset by
+  all / agent / (agent,cwd), `last_result_for` across cwds.
+- **`scripts/test_brain_routing.py`** — Ollama-dependent integration
+  test for the upgraded Stage 2 brain (switch / list / where_am_i /
+  cross-session / fanout / no-context baseline). Gracefully skips
+  when Ollama is unreachable.
+
+### Dependencies
+- **psutil>=5.9** added to `pyproject.toml` for process discovery.
+  Soft-imported — Halo runs in single-session mode if psutil is absent.
+
+### Migration notes
+- Single-session usage (one `halo` in one project) is byte-identical
+  to v1.1: discovery returns 0 sessions → no CURRENT CONTEXT block →
+  brain emits empty new fields → orchestrator routes to `DEFAULT_CWD`
+  as before.
+- If you want the old behaviour even when other Claudes are running,
+  uninstall psutil (`pip uninstall psutil`). Discovery silently
+  disables; everything else works.
+- The dashboard's `/api/state` shape is unchanged for v1.1 fields;
+  new `discovery.changed` events are additive.
+
+### Known limitations
+- Phase 2 (auto-switch on focused-terminal change) and Phase 3
+  (keystroke injection into terminals Halo didn't spawn) are NOT in
+  this release. Phase 1 — brain-aware routing into Halo-managed
+  per-project sessions — gets you 80% of the multi-session ask without
+  the cross-terminal SendInput hairball. Land Phase 2/3 in v1.3.0
+  after live use confirms the brain-routing model feels right.
+- Discovery cmdline fingerprints are tuned for npm-installed
+  Claude/Codex on Windows + POSIX. If you install Claude from an
+  unusual path, add a fingerprint to `_AGENT_FINGERPRINTS` in
+  `halo/discovery.py`.
+
+---
+
 ## [1.1.1] — 2026-05-25
 
 Single feature, single failure mode killed.

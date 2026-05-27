@@ -32,10 +32,13 @@ import re
 import signal
 import time
 
+from pathlib import Path
+
 from halo import bus
 from halo.agents import (
     AGENTS,
     AgentBusy,
+    DEFAULT_CWD,
     active_jobs,
     available_agents,
     check_availability,
@@ -54,9 +57,11 @@ from halo.config import (
     CONVERSATION_IDLE_SEC,
     FOLLOWUP_GATE_ENABLED,
 )
+from halo.discovery import DiscoveryThread, is_available as discovery_available
 from halo.followup_gate import passes as followup_gate_passes
 from halo.record import preload_models as preload_audio_models
-from halo.router import preload_router, understand_and_route
+from halo.registry import SessionRegistry
+from halo.router import SessionContext, preload_router, understand_and_route
 from halo.tools import execute_system_intent
 from halo.turn import run_turn
 from halo.voice import is_available as voice_available
@@ -66,6 +71,63 @@ from halo.voice import stop as voice_stop
 from halo.voice import wait_until_silent as voice_wait_until_silent
 from halo.wake import WAKE_WORD, _get_model, listen_for_wake
 from halo.web import start_server as start_web_server
+
+# Module-level session registry. Populated by the discovery thread in
+# multi-session mode (v1.2). Stays empty in single-session mode, in which
+# case the orchestrator behaves exactly like v1.1.
+REGISTRY = SessionRegistry()
+_DISCOVERY: DiscoveryThread | None = None
+
+
+def _on_discovery_change(sessions) -> None:
+    """Discovery thread callback — refresh registry + emit bus event so
+    the dashboard sees new/closed sessions promptly."""
+    REGISTRY.update(sessions)
+    bus.emit(
+        "discovery.changed",
+        count=len(sessions),
+        labels=[s.label for s in sessions],
+    )
+
+
+def _build_session_context() -> SessionContext | None:
+    """Snapshot of registry state to inject into the Stage 2 LLM call.
+
+    Returns None when there's nothing meaningful to add (empty registry +
+    no active label) — keeps the prompt cheap in single-session mode.
+    """
+    discovered = []
+    for s in REGISTRY.list():
+        discovered.append({"label": s.label, "cwd": s.cwd, "agent": s.agent_key})
+    active_label = REGISTRY.active_label()
+    if not discovered and active_label is None:
+        return None
+    return SessionContext(active_label=active_label, discovered=discovered)
+
+
+def _cwd_for_dispatch(target_session: str) -> Path:
+    """Resolve target_session (label / 'active' / 'focused' / '' ) into a Path.
+
+    Falls back to DEFAULT_CWD (Halo's launch dir) when no registry match —
+    matches v1.1 single-session behaviour. 'all' is handled separately by
+    the orchestrator (multi-dispatch), not here.
+    """
+    if not target_session or target_session in ("active", "focused"):
+        active = REGISTRY.active()
+        if active is not None:
+            return Path(active.cwd)
+        return DEFAULT_CWD
+    sess = REGISTRY.by_label(target_session)
+    if sess is not None:
+        return Path(sess.cwd)
+    # Fuzzy fallback — brain may have emitted a slightly off label.
+    resolved = REGISTRY.resolve(target_session)
+    if resolved.kind == "session" and resolved.label is not None:
+        sess = REGISTRY.by_label(resolved.label)
+        if sess is not None:
+            return Path(sess.cwd)
+    return DEFAULT_CWD
+
 
 # Phrases that close the conversation and send us back to wake-listening.
 # Matched anywhere in the cleaned transcript (case-insensitive, word boundaries).
@@ -78,6 +140,7 @@ _END_CONVERSATION_RE = re.compile(
     r"good ?bye|bye bye|see you|"
     r"that'?s all|that will be all|i'?m done|done for now|"
     r"thanks that'?s all|"
+    r"stand by|standby|"
     r"shut up|leave me alone"
     r")\b",
     re.IGNORECASE,
@@ -339,12 +402,20 @@ def _drain_completed_jobs() -> None:
     spoken sentence-by-sentence as it generated; we just say a short
     "Mercury is done." cap so the user knows the agent is no longer
     working. For batch agents (Codex), we speak the full summary now.
+
+    v1.2: spoken_name and label are per-(agent, cwd) so the cap
+    correctly says "Mercury in website is done." when relevant.
     """
     for job in completed_unconsumed_jobs():
         cfg = AGENTS[job.agent_key]
-        spoken_name = session_name(cfg.key)
+        spoken_name = session_name(cfg.key, job.cwd)
+        project_tag = Path(job.cwd).name if job.cwd else ""
+        full_label = (
+            f"{cfg.key} / {spoken_name} ({project_tag})" if project_tag
+            else f"{cfg.key} / {spoken_name}"
+        )
         _print_full_result(
-            f"{cfg.key} / {spoken_name}", bool(job.ok), job.result, job.elapsed_sec
+            full_label, bool(job.ok), job.result, job.elapsed_sec
         )
         if job.ok:
             if cfg.streams_text_deltas:
@@ -369,11 +440,20 @@ def _print_decision(decision: dict) -> None:
     print(json.dumps(decision, indent=2))
 
 
-def _start_agent_and_ack(agent_key: str, prompt: str) -> str:
+def _start_agent_and_ack(
+    agent_key: str,
+    prompt: str,
+    *,
+    cwd: Path | None = None,
+) -> str:
     """Spawn a background job, return the voice-ack to speak.
 
     For streaming-capable agents (Claude Code), wire a per-sentence TTS
     callback so Halo narrates the response live while the agent works.
+
+    `cwd` (v1.2) — working directory for the session. Defaults to
+    DEFAULT_CWD. Session state (continuation, name, persistent process)
+    is keyed by (agent, cwd) so multiple projects can run in parallel.
     """
     if not (prompt or "").strip():
         # Belt-and-braces — callers should already guard, but never
@@ -394,14 +474,24 @@ def _start_agent_and_ack(agent_key: str, prompt: str) -> str:
             f"Run halo doctor for setup help."
         )
 
-    spoken = session_name(agent_key)
+    workdir = cwd or DEFAULT_CWD
+    spoken = session_name(agent_key, workdir)
+    # Per-(agent, cwd) "is this a fresh session" check. session_status()
+    # still returns the aggregated agent-level map; we use the detail
+    # variant via the per-cwd session_key import only when we care about
+    # multi-project state, which is here.
+    from halo.agents import session_key as _skey, session_status_detail
+    skey = _skey(agent_key, workdir)
+    is_active = session_status_detail().get(skey, False)
     if config.session_kind == "persistent":
-        active = "continuing" if session_status()[agent_key] else "starting"
+        active = "continuing" if is_active else "starting"
         suffix = f"persistent session, {active}"
     else:
-        active = "continuing" if session_status()[agent_key] else "starting"
+        active = "continuing" if is_active else "starting"
         suffix = f"{active} session"
-    print(f"  dispatching to {spoken} / {config.spoken_name.lower()} "
+    project_tag = Path(workdir).name if workdir != DEFAULT_CWD else ""
+    where = f" in {project_tag}" if project_tag else ""
+    print(f"  dispatching to {spoken}{where} / {config.spoken_name.lower()} "
           f"({suffix}): {prompt!r}")
 
     def _speak_chunk(sentence: str) -> None:
@@ -409,30 +499,100 @@ def _start_agent_and_ack(agent_key: str, prompt: str) -> str:
         # without stalling the agent's stdout reader thread. The
         # sanitizer inside voice.say() strips any markdown the agent
         # leaks despite the voice system prompt.
-        print(f"    [{config.key} -> tts] {sentence!r}")
+        print(f"    [{config.key}{where} -> tts] {sentence!r}")
         say(sentence, blocking=False)
 
     on_chunk = _speak_chunk if config.streams_text_deltas else None
 
     try:
-        job = start_job(agent_key, prompt, on_text_chunk=on_chunk)
+        job = start_job(agent_key, prompt, cwd=workdir, on_text_chunk=on_chunk)
         print(f"  job #{job.job_id} started in background"
               f"{' (streaming)' if config.streams_text_deltas else ''}")
         if active == "starting":
+            if project_tag:
+                return f"On it. {spoken} is starting in {project_tag}."
             return f"On it. I'm calling this session {spoken}."
-        return f"On it. {spoken} is working."
+        return f"On it. {spoken}{where} is working."
     except AgentBusy as exc:
         return str(exc)
 
 
+def _handle_session_action(decision: dict) -> str | None:
+    """v1.2: handle brain-emitted session_action / target_session.
+
+    Returns:
+      str  — a phrase to speak back (action handled here, no agent dispatch)
+      None — the brain did NOT request a session action; caller should
+             continue with the normal dispatch flow.
+    """
+    action = (decision.get("session_action") or "").strip()
+    target = (decision.get("target_session") or "").strip()
+
+    if action == "list_sessions":
+        bus.emit("session.listed")
+        return REGISTRY.speak_list()
+
+    if action == "where_am_i":
+        bus.emit("session.where")
+        return REGISTRY.speak_active()
+
+    if action == "switch":
+        if not target:
+            return "Switch to which session?"
+        resolved = REGISTRY.resolve(target)
+        if resolved.kind == "session" and resolved.label is not None:
+            if REGISTRY.set_active(resolved.label):
+                bus.emit("session.switched", label=resolved.label)
+                return decision.get("confirmation") or f"Switched to {resolved.label}."
+        return f"I don't see a session called {target}."
+
+    return None
+
+
+def _dispatch_to_all(prompt: str, agent_hint: str) -> str:
+    """Fan-out: dispatch the same prompt to every discovered session.
+
+    Used when the brain emits target_session='all'. agent_hint comes
+    from the brain (e.g. 'claude_code') and acts as the default for
+    sessions that match it; sessions of a different agent get their
+    own dispatch via their own agent.
+    """
+    sessions = REGISTRY.list()
+    if not sessions:
+        return "There are no discovered sessions to dispatch to."
+
+    fired = 0
+    for s in sessions:
+        # If the brain picked a specific agent, prefer dispatching only
+        # to sessions of that kind; otherwise dispatch to each session
+        # with its own agent.
+        agent_key = agent_hint if (agent_hint in AGENTS and s.agent_key == agent_hint) else s.agent_key
+        if agent_key not in AGENTS:
+            continue
+        try:
+            _start_agent_and_ack(agent_key, prompt, cwd=Path(s.cwd))
+            fired += 1
+        except Exception as exc:
+            print(f"  fanout error for {s.label}: {exc}")
+    if fired == 0:
+        return "Nothing to dispatch."
+    return f"Sent to {fired} session{'s' if fired != 1 else ''}."
+
+
 def _handle_decision(decision: dict) -> str:
-    """Act on a decision dict. Returns the short phrase to speak back."""
+    """Act on a decision dict. Returns the short phrase to speak back.
+
+    v1.2: respects target_session for per-turn dispatch routing.
+    Session-level actions (switch / list / where_am_i) are handled by
+    `_handle_session_action()` before this is called.
+    """
     status = decision.get("status", "?")
     intent = decision.get("intent", "?")
     agent = decision.get("agent", "none")
     cleaned = decision.get("cleaned_text", "")
     confirmation = decision.get("confirmation", "")
     clarification = decision.get("clarification", "")
+    target_session = (decision.get("target_session") or "").strip()
 
     if status == "chitchat":
         print("  (chitchat — staying silent)")
@@ -465,12 +625,18 @@ def _handle_decision(decision: dict) -> str:
         #      explains it can't help.
         # Falling through to Claude beats a flat "I don't know" refusal.
         print(f"  no tool matched {cleaned!r} -> falling through to claude_code")
-        return _start_agent_and_ack("claude_code", cleaned)
+        cwd = _cwd_for_dispatch(target_session)
+        return _start_agent_and_ack("claude_code", cleaned, cwd=cwd)
+
+    # Multi-session fan-out — brain says target_session='all'.
+    if target_session == "all":
+        return _dispatch_to_all(cleaned, agent_hint=agent if agent in AGENTS else "claude_code")
 
     # Registry-driven dispatch — non-blocking. Job runs in background;
     # _drain_completed_jobs() between turns will speak the result.
     if agent in AGENTS:
-        return _start_agent_and_ack(agent, cleaned)
+        cwd = _cwd_for_dispatch(target_session)
+        return _start_agent_and_ack(agent, cleaned, cwd=cwd)
 
     # question or other agent=none ready intents
     return confirmation or "Okay."
@@ -709,8 +875,24 @@ def run_conversation() -> None:
         print(f"  no local handler matched -> Stage 2 LLM")
         bus.emit("route.matched", handler="stage2_llm")
         t0 = time.monotonic()
-        lm_decision = understand_and_route(cleaned)
+        # v1.2 — inject discovered-sessions context so the brain can
+        # emit target_session / session_action for multi-project
+        # routing. None in single-session mode (empty registry).
+        session_ctx = _build_session_context()
+        lm_decision = understand_and_route(cleaned, context=session_ctx)
         print(f"  stage 2: {(time.monotonic() - t0) * 1000:.0f}ms")
+
+        # 9a. v1.2 — handle session_action BEFORE dispatch interpretation.
+        #     The brain may have decided this turn is a meta-operation
+        #     (switch / list / where_am_i) rather than a command for an
+        #     agent. Speak the result, skip dispatch.
+        if not lm_decision.get("_error"):
+            session_phrase = _handle_session_action(lm_decision)
+            if session_phrase is not None:
+                print(f"  session action -> {lm_decision.get('session_action')!r}")
+                say(session_phrase, blocking=True)
+                last_activity = time.monotonic()
+                continue
 
         # 9b. Fallback: if Stage 2 failed (Ollama down / network error /
         #     model crash) AND the user mentioned an agent name — even
@@ -778,6 +960,25 @@ def main() -> None:
     except Exception as exc:
         print(f"Dashboard failed to start: {exc}")
 
+    # v1.2 multi-session discovery — start the background scanner so
+    # the brain sees other running Claude/Codex sessions on the machine.
+    # Silently skipped when psutil isn't installed (single-session
+    # fallback identical to v1.1).
+    global _DISCOVERY
+    if discovery_available():
+        _DISCOVERY = DiscoveryThread(on_change=_on_discovery_change)
+        _DISCOVERY.start()
+        initial = _DISCOVERY.snapshot()
+        REGISTRY.update(initial)
+        print(
+            f"discovery: found {len(initial)} agent session"
+            f"{'s' if len(initial) != 1 else ''} on this machine"
+        )
+        for s in initial:
+            print(f"  - {s}")
+    else:
+        print("discovery: psutil not installed — running single-session mode")
+
     # Pre-load every heavy thing so the first turn doesn't pay cold-start.
     _get_model()
     preload_audio_models()
@@ -791,19 +992,24 @@ def main() -> None:
     # re-fork `--version` every 750 ms.
     if voice_available():
         avail = available_agents()
+        sess_count = len(REGISTRY.list())
+        sess_tail = (
+            f" {sess_count} session{'s' if sess_count != 1 else ''} discovered."
+            if sess_count else ""
+        )
         if not avail:
             say(
-                "Halo online. No coding agents connected. Run halo doctor.",
+                f"Halo online. No coding agents connected. Run halo doctor.{sess_tail}",
                 blocking=False,
             )
         elif len(avail) == 1:
-            say(f"Halo online. {avail[0]} is connected.", blocking=False)
+            say(f"Halo online. {avail[0]} is connected.{sess_tail}", blocking=False)
         elif len(avail) == 2:
-            say(f"Halo online. {avail[0]} and {avail[1]} are connected.",
+            say(f"Halo online. {avail[0]} and {avail[1]} are connected.{sess_tail}",
                 blocking=False)
         else:
             joined = ", ".join(avail[:-1]) + f", and {avail[-1]}"
-            say(f"Halo online. Connected: {joined}.", blocking=False)
+            say(f"Halo online. Connected: {joined}.{sess_tail}", blocking=False)
     print(f"agents: {', '.join(available_agents()) or '(none connected)'}")
 
     try:
@@ -818,6 +1024,9 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nstopped")
         voice_stop()
+    finally:
+        if _DISCOVERY is not None:
+            _DISCOVERY.stop()
 
 
 if __name__ == "__main__":
