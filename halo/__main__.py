@@ -188,6 +188,17 @@ class _ConversationBrief:
         self.turns.append((role, text, time.monotonic()))
         if len(self.turns) > self.max_turns:
             self.turns = self.turns[-self.max_turns:]
+        # Write through to the durable store (survives restarts) and auto-keep
+        # salient first-person statements as facts.
+        if _MEMORY is not None:
+            try:
+                _MEMORY.record_turn(role, text)
+                if role == "user":
+                    from halo.memory import auto_facts
+                    for fact, cat in auto_facts(text):
+                        _MEMORY.record_fact(fact, cat, weight=2.5)
+            except Exception:
+                pass
 
     def add_user(self, text: str) -> None:
         self._add("user", text)
@@ -242,6 +253,49 @@ class _ConversationBrief:
 # completions (_drain_completed_jobs) can fold the agent's reply into the same
 # rolling memory the brain reads. Set by run_conversation, cleared on exit.
 _active_brief: _ConversationBrief | None = None
+
+# Persistent cross-session memory (halo/memory.py). None when disabled. The
+# brief is the live in-RAM short-term window; this is the durable layer (turns
+# across restarts + importance-weighted facts) injected into the brain.
+_MEMORY = None  # type: ignore[assignment]
+
+
+def _init_memory() -> None:
+    """Create the persistent memory store if [memory] is enabled."""
+    global _MEMORY
+    if not user_cfg.memory.enabled:
+        return
+    try:
+        from pathlib import Path
+
+        from halo.memory import Memory
+        path = (user_cfg.memory.path or "").strip() or str(
+            Path.home() / ".halo" / "halo_memory.db"
+        )
+        _MEMORY = Memory(path, retention_days=user_cfg.memory.retention_days)
+        pruned = _MEMORY.prune()
+        turns, facts = _MEMORY.stats()
+        print(f"memory: {turns} turns, {facts} facts"
+              + (f" (pruned {pruned} old)" if pruned else "") + f" -> {path}")
+    except Exception as exc:
+        print(f"memory: disabled ({exc})")
+        _MEMORY = None
+
+
+def _brain_history(current: str = "") -> str:
+    """The memory block fed to the router + chat brain each turn: persistent
+    memory (facts + recent/relevant turns) when available, else the live brief."""
+    if _MEMORY is not None:
+        try:
+            block = _MEMORY.render_for_brain(
+                current, max_turns=user_cfg.memory.max_turns,
+                max_facts=user_cfg.memory.max_facts,
+            )
+            if block:
+                return block
+        except Exception:
+            pass
+    return _active_brief.render_history() if _active_brief is not None else ""
 
 
 def _on_discovery_change(sessions) -> None:
@@ -624,7 +678,7 @@ def _converse(text: str, brief: "_ConversationBrief | None" = None) -> str:
     text = (text or "").strip()
     if not text:
         return ""
-    history = brief.render_history() if brief is not None else ""
+    history = _brain_history(text)
     spoken = {"full": ""}
 
     def _on_sentence(sentence: str) -> None:
@@ -1881,6 +1935,19 @@ def run_conversation() -> None:
             last_activity = time.monotonic()
             continue
 
+        # "remember that X" -> store a durable fact in persistent memory.
+        if _MEMORY is not None:
+            from halo.memory import extract_fact
+            _fact = extract_fact(cleaned)
+            if _fact is not None:
+                brief.add_user(cleaned)
+                _MEMORY.record_fact(_fact[0], _fact[1], weight=4.0)
+                print(f"  remember -> fact: {_fact[0]!r}")
+                bus.emit("route.matched", handler="remember", text=_fact[0])
+                say("Got it, I'll remember that.", blocking=True)
+                last_activity = time.monotonic()
+                continue
+
         # End-phrase wins next — "go to sleep" / "goodbye" must ALWAYS end the
         # conversation, even with a pending confirmation/clarification open.
         # (Previously a pending clarification swallowed it as a "cancel", so
@@ -2191,7 +2258,7 @@ def run_conversation() -> None:
         # resolve references and stop marking context-dependent fragments
         # "unclear".
         lm_decision = understand_and_route(
-            cleaned, context=session_ctx, history=brief.render_history()
+            cleaned, context=session_ctx, history=_brain_history(cleaned)
         )
         print(f"  stage 2: {(time.monotonic() - t0) * 1000:.0f}ms")
 
@@ -2335,6 +2402,9 @@ def main() -> None:
             diagnose()
     else:
         print("discovery: psutil not installed — running single-session mode")
+
+    # Persistent memory (cross-session). Loads/prunes the SQLite store.
+    _init_memory()
 
     # Pre-load every heavy thing so the first turn doesn't pay cold-start.
     _get_model()

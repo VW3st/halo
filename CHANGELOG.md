@@ -10,6 +10,32 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.4.0] — 2026-06-16
+
+Persistent memory — no more amnesia.
+
+### Added
+- **Persistent memory layer** (`halo/memory.py`) — local SQLite store at
+  `~/.halo/halo_memory.db`, three tiers:
+  - short-term (recent turns, this + last sessions),
+  - long-term (all turns, pruned after `retention_days`),
+  - important facts (durable, never pruned).
+  Every conversation turn + tool action is logged via the conversation brief's
+  write-through; a compact `# MEMORY` block (top facts + recent/relevant turns)
+  is injected into the routing brain and chat model each turn, so Halo answers
+  "what did you open first?" / "what did we talk about" across sleep/wake AND
+  restarts.
+- **"remember that X"** voice command → stores a durable fact. Salient
+  statements ("I'm working on …", "I prefer …", "every day …") are
+  auto-extracted as facts (project / preference / routine).
+- `[memory]` config (`enabled`, `path`, `retention_days`, `max_turns`,
+  `max_facts`) + `HALO_MEMORY_ENABLED`. Local-only; nothing leaves the machine.
+  Interface is backend-agnostic so a vector/graph store (e.g. Mem0) can replace
+  the keyword retrieval later.
+- `scripts/test_memory.py` regression suite (10 checks).
+
+---
+
 ## [1.3.1] — 2026-06-16
 
 ### Fixed

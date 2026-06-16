@@ -340,6 +340,29 @@ setup: `pip install uv`, then set `[mcp] enabled = true` (config) — Halo write
 ⚠️ Powerful: Claude drives your machine by voice with **no approval prompts**.
 Off by default. Restrict with `--exclude-tools` in `~/.halo/mcp.json`.
 
+## Memory
+
+Halo keeps a **persistent, local memory** (`halo/memory.py`, SQLite at
+`~/.halo/halo_memory.db`) so it remembers across sleep/wake **and** restarts —
+no more "what was the last command?" amnesia. Three tiers:
+
+- **Short-term** — recent turns (this + the last few sessions), injected into
+  the brain every turn so *"what did you open first?"* / *"the other one"* resolve.
+- **Long-term** — all turns, kept for `retention_days` (default 30) then pruned.
+- **Important facts** — durable, never pruned. Captured two ways:
+  - **Explicitly:** *"remember that I'm working on the bakery site"* → stored.
+  - **Automatically:** salient statements (*"I'm working on …"*, *"I prefer …"*,
+    *"every day I …"*) are auto-kept as facts (project / preference / routine).
+
+Each turn, a compact `# MEMORY` block (top facts + recent/relevant turns) is fed
+to the routing brain and the chat model — entirely local, nothing leaves the
+machine. Config under `[memory]`: `enabled`, `path`, `retention_days`,
+`max_turns`, `max_facts` (or `HALO_MEMORY_ENABLED=0` to turn off).
+
+> Roadmap: the retrieval is keyword + recency today; the interface is built so a
+> vector/graph backend (e.g. [Mem0](https://github.com/mem0ai/mem0)) can drop in
+> for semantic recall without changing callers.
+
 ## How conversations work
 
 Once a wake word fires, you enter a **conversation** — you don't have

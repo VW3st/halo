@@ -223,6 +223,21 @@ class McpConfig:
 
 
 @dataclass
+class MemoryConfig:
+    # Persistent memory across sleep/wake and restarts (halo/memory.py). Logs
+    # conversation turns + tool actions, keeps importance-weighted facts, and
+    # injects a MEMORY block into the brain each turn. Local SQLite, private.
+    enabled: bool = True
+    # SQLite path. Empty = ~/.halo/halo_memory.db.
+    path: str = ""
+    # Drop conversation TURNS older than this (facts are kept forever).
+    retention_days: int = 30
+    # How many recent turns / top facts to inject into the brain per turn.
+    max_turns: int = 14
+    max_facts: int = 8
+
+
+@dataclass
 class HaloConfig:
     wake: WakeConfig = field(default_factory=WakeConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
@@ -234,6 +249,7 @@ class HaloConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
     dictation: DictationConfig = field(default_factory=DictationConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
 
 # Env-var override map — only the knobs users tweak frequently get a
@@ -272,6 +288,7 @@ _ENV_OVERRIDES: dict[str, tuple[str, str, type]] = {
     "HALO_DICTATION_SMART_STOP":  ("dictation", "smart_stop", bool),
     "HALO_DICTATION_AUTOCORRECT": ("dictation", "autocorrect", bool),
     "HALO_MCP_ENABLED":           ("mcp", "enabled", bool),
+    "HALO_MEMORY_ENABLED":        ("memory", "enabled", bool),
     "HALO_MCP_CONFIG_PATH":       ("mcp", "config_path", str),
 }
 
