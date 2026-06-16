@@ -10,6 +10,52 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.3.0] — 2026-06-16
+
+Conversational, machine-adaptive, dictate-anywhere.
+
+### Added
+- **Real conversation** — chit-chat / casual questions get a streamed spoken
+  reply from the brain (`router.chat_reply_stream`, speaks sentence-by-sentence
+  so the first words land in ~0.4 s). Optional separate, smarter chat model via
+  `HALO_OPENROUTER_CHAT_MODEL` (routing stays on the fast model).
+- **Conversation memory** — a rolling brief (user + Halo + agent turns) persists
+  across sleep/wake and is fed to the router and chat brain, so references
+  ("the other one", "what did we just do") resolve.
+- **Dictate-anywhere (Windows)** — `dictation.py` + `desktop_control.py`: say
+  "dictate", click any field, speak; words typed at the caret via SendInput
+  Unicode injection with accent-aware cleanup. "send it" submits and returns.
+- **`halo calibrate`** (`calibrate.py`) — measures this mic + your voice and
+  writes tuned wake settings to `[profiles.<hostname>]`. Per-machine config
+  overlays (`userconfig._apply_profile`).
+- **STT wake-verification** — a second Whisper pass confirms the wake word after
+  the DNN fires, rejecting false fires the threshold can't (`wake.verify`).
+- **Local "say"** — "say <text>" / "tell the audience <text>" speaks it aloud.
+- **Generic app launcher** — "open <app>" (Paint, Spotify, Word, …) runs locally
+  instead of spawning an agent; politeness wrappers ("can you open … please")
+  tolerated.
+- **Desktop control via MCP** (opt-in) — spawned Claude sessions can drive the
+  desktop (Windows-MCP). `[mcp]` config.
+- **Paid providers** — ElevenLabs TTS + OpenRouter brain behind provider
+  switches (still 100% local by default).
+- **New React/Vite/Tailwind dashboard** (`dashboard/`), mobile-responsive;
+  the backend reuses an open browser tab across restarts instead of spawning
+  new ones.
+
+### Changed / fixed
+- **Confirm before Claude** — Halo no longer silently spawns an agent; an
+  un-named coding task asks first. `intent=system` never auto-dispatches.
+- **Turn-taking** — no longer cuts you off on a trailing "is/are/need/want/to".
+- **"unclear" stays silent** instead of nagging, and no longer merges fragments
+  into a blob.
+- **Session-action hallucination guard** — drops invented switch/list actions
+  the words don't support (`router._validate_session_action`).
+- **STT gain normalization** — boosts quiet mics (e.g. NVIDIA Broadcast ~0.05)
+  before Whisper, fixing garbled transcripts.
+- Wired several dead config literals (idle timers, wake knobs) back to config.
+
+---
+
 ## [1.2.3] — 2026-05-25
 
 UX fix — "hello, can you hear me?" no longer spawns a Claude session.

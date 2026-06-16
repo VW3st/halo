@@ -4,16 +4,26 @@ Voice front-end for agentic coding tools. Say a wake word, talk to
 Claude Code or Codex CLI in plain English, and hear the result back.
 Halo is the audio layer; the agents do the work.
 
-Status: **v1.2.1 — hybrid streaming + one-sentence reply summaries.** Long agent replies no longer monologue at you — Halo speaks the first 2 sentences live so you know the agent is working, then summarizes the rest into one sentence via the local brain. Full text still prints to the terminal. Builds on v1.2 (multi-session mode), v1.1.1 (follow-up gate), v1.1 (custom "halo" wake word, persistent Claude sessions, separate-console live feed, noise-suppression pipeline). Live web dashboard at `http://127.0.0.1:7070`.
+Status: **v1.3 — conversational, machine-adaptive, dictate-anywhere.** Halo now holds real spoken conversations (streaming replies + cross-session memory), does simple things itself instead of always spawning an agent, **dictates into any text field** on Windows, can **calibrate its wake word to your mic** in 30 seconds, and ships a **React dashboard** that's mobile-responsive. Builds on v1.2 (multi-session mode), v1.1.1 (follow-up gate), v1.1 (custom wake word, persistent Claude sessions, live feed, noise suppression). Live web dashboard at `http://127.0.0.1:7070`.
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full history. Licensed MIT
 ([LICENSE](./LICENSE)).
+
+### What's new in v1.3
+
+- **Real conversation, not just dispatch** — chit-chat and casual questions get an actual spoken reply from the brain (streaming, so it starts talking in ~0.4 s), and Halo **remembers the conversation across sleep/wake** so "what did we just do?" works. It does simple things itself (open apps, answer, "say this out loud") and **confirms before ever handing work to Claude** — it won't silently spawn an agent unless you name it.
+- **Dictate-anywhere (Windows)** — say *"dictate"*, click into any text field (browser, editor, terminal), and your speech is typed where the cursor is, with real-time accent-aware cleanup. Say *"send it"* to submit and drop back into conversation. See [Dictation](#dictation).
+- **Per-machine wake calibration** — `halo calibrate` measures your actual mic + voice and writes tuned wake settings into a `[profiles.<hostname>]` block, so the same config adapts to each PC. A second STT pass also **verifies the wake word** to kill false fires. See [Wake word](#custom-wake-word).
+- **Desktop control via MCP (opt-in)** — say *"Claude, take a screenshot and open Notepad"* and the spawned Claude session can drive your desktop (Windows-MCP). See [Desktop control](#desktop-control-mcp).
+- **Paid provider options (opt-in)** — keep it 100% local, or switch TTS to **ElevenLabs** and the brain to **OpenRouter** via env vars. See [Providers](#providers-local-or-cloud).
+- **New dashboard** — a React/Three.js "command mode" UI (source in `dashboard/`), now **mobile-responsive** and it **reuses your open tab** across restarts instead of spawning new ones.
 
 The dashboard shows the entire pipeline live: which stage is firing
 (wake / record / transcribe / route / agent / voice), the most recent
 transcript, every agent session by Roman name with state and elapsed
 time, and a color-coded event log. Auto-launches in your default
-browser when you run Halo (set `HALO_NO_BROWSER=1` to suppress).
+browser the first time you run Halo (set `HALO_NO_BROWSER=1` to
+suppress); on later restarts it reuses the already-open tab.
 
 ```
 HALO •  LOCAL  •  listening                            live  ·  v1.1
@@ -250,10 +260,13 @@ halo                  start the voice loop (default)
 halo run              same as above
 halo download-models  fetch Kokoro TTS model files
 halo doctor           check Ollama, agents (claude/codex), models — read-only
+halo calibrate        tune the wake word to this machine's mic + your voice (v1.3)
 halo sessions         list running coding-agent sessions on this machine (v1.2)
 halo version          print installed version
 halo --help           show help
 ```
+
+(`python -m halo <command>` also works, e.g. `python -m halo calibrate`.)
 
 `halo doctor` is the first thing to run after install. It probes every
 external dependency (Ollama running + routing model pulled, Claude CLI
@@ -275,6 +288,57 @@ python -m halo
 ```
 
 ---
+
+## Providers (local or cloud)
+
+Halo runs **100% local by default** (Ollama brain + faster-whisper STT +
+Kokoro TTS), no API keys. You can opt into paid providers per-component via
+environment variables (a `.env` in the project root is auto-loaded; copy
+`.env.example`). Keys live ONLY in `.env`, which is gitignored:
+
+```bash
+# Cloud TTS (ElevenLabs)
+HALO_VOICE_PROVIDER=elevenlabs
+ELEVENLABS_API_KEY=...                 # your key — never commit
+HALO_ELEVENLABS_VOICE_ID=...
+
+# Cloud brain (OpenRouter) for routing + chat
+HALO_ROUTER_PROVIDER=openrouter
+OPENROUTER_API_KEY=...                  # your key — never commit
+HALO_OPENROUTER_MODEL=ibm-granite/granite-4.1-8b
+# Optional: a SMARTER model for conversation only (routing stays fast/cheap)
+HALO_OPENROUTER_CHAT_MODEL=anthropic/claude-3.5-haiku
+```
+
+Mix and match — e.g. local brain + ElevenLabs voice, or cloud brain + Kokoro.
+
+## Dictation
+
+System-wide dictate-anywhere (Windows). Say **"dictate"**, click into any
+text field (browser, editor, terminal — anywhere the caret blinks), and speak;
+your words are typed at the cursor via `SendInput` Unicode injection, with
+real-time accent-aware cleanup. Controls (spoken):
+
+| Say | Effect |
+|---|---|
+| *"new line"* / *"new paragraph"* | line break(s), keep dictating |
+| *"period"* / *"comma"* / *"question mark"* … | punctuation |
+| *"send it"* / *"send the message"* / *"enter"* | press Enter (submit) **and** return to conversation |
+| *"stop"* / *"smart stop"* | end dictation |
+
+Tunables under `[dictation]` in config: `silence_ms`, `auto_period`,
+`autocorrect`, `start_phrases`, `stop_phrases`.
+
+## Desktop control (MCP)
+
+Opt-in: let the Claude sessions Halo spawns drive your desktop (screenshots,
+clicking, typing, app/window control) via [Windows-MCP](https://github.com/CursorTouch/Windows-MCP).
+Say *"Claude, take a screenshot and open Notepad and type hello"*. One-time
+setup: `pip install uv`, then set `[mcp] enabled = true` (config) — Halo writes
+`~/.halo/mcp.json` and launches the server on first use.
+
+⚠️ Powerful: Claude drives your machine by voice with **no approval prompts**.
+Off by default. Restrict with `--exclude-tools` in `~/.halo/mcp.json`.
 
 ## How conversations work
 
@@ -533,13 +597,36 @@ RTX 3060. Best results: 8 phrase variants × 20+ voices for positives,
 40+ confusables × 5 voices for hard negatives, 50+ common phrases for
 soft negatives.
 
-Tune in `halo/wake.py`:
+### Calibrate to your mic (recommended)
 
-| Constant | Default | What |
+Wake scores vary a lot by microphone, so the best move is to **calibrate**:
+
+```powershell
+halo calibrate     # say the wake word ~5 times; it measures and saves settings
+```
+
+It records your background noise + a few real wake utterances, picks the right
+`threshold` / `min_consecutive`, and writes them to a `[profiles.<hostname>]`
+block in `~/.halo/config.toml` — so the **same config file adapts per machine**
+(a quiet USB mic and a hot headset get opposite settings automatically).
+
+### Switching the wake word
+
+The wake phrase is config-driven — set `[wake] word` (or `HALO_WAKE_WORD`).
+`"hey_jarvis"` (and `alexa`, `hey_mycroft`, `hey_rhasspy`) are built-in,
+heavily-trained, and auto-downloaded — a great choice if the custom `"halo"`
+model is unreliable on your mic. Only the trigger phrase changes; Halo's
+name/voice/persona stay "Halo". STT wake-verification adapts automatically.
+
+### Wake knobs (`[wake]` in config, or `halo/wake.py` / env)
+
+| Key | Default | What |
 |---|---|---|
-| `WAKE_WORD` | `"halo"` | Phrase name. Halo loads `<MODELS_DIR>/<WAKE_WORD>.onnx`. |
-| `THRESHOLD` | `0.75` | Wake DNN activation score (0-1). Raise to filter false fires, lower if real wakes are missed. |
-| `WAKE_VAD_THRESHOLD` | `0.7` | silero-VAD must also score above this. 0.0 disables the gate. |
+| `word` | `"halo"` | Phrase. Loads `<MODELS_DIR>/<word>.onnx`, else a built-in by that name. |
+| `threshold` | `0.4` | Wake DNN score (0-1). Raise to filter false fires, lower if missed. |
+| `min_consecutive` | `1` | Frames ≥ threshold required to fire. Raise on a hot mic that false-fires. |
+| `vad_gate` | `0.5` | silero-VAD must also score above this. 0.0 disables. |
+| `verify` | `true` | Second STT pass confirms the wake word was actually said (kills false fires the threshold can't). |
 
 ---
 
@@ -595,18 +682,24 @@ halo/
   wake.py         openWakeWord listener + pre-wake audio ring buffer
   record.py       silero-vad RecorderState, chime, backchannel tone
   stt.py          faster-whisper BatchTranscriber (CUDA + DLL fixup)
-  router.py       Stage 1 rules + Stage 2 LLM (Ollama qwen2.5 + JSON schema)
+  router.py       Stage 1 rules + Stage 2 LLM (Ollama/OpenRouter + JSON schema) + chat + streaming
   turn.py         per-turn orchestration (record/transcribe; routing in __main__)
-  tools.py        cross-platform local tools (browser, calc, notepad, ...)
+  tools.py        cross-platform local tools (browser, calc, notepad, "say", ...)
+  dictation.py    dictate-anywhere loop: capture -> sanitize -> type at cursor (v1.3)
+  desktop_control.py  Win32 SendInput Unicode injection + focus helpers (v1.3)
+  calibrate.py    `halo calibrate` — per-mic wake tuning -> [profiles.<host>] (v1.3)
   followup_gate.py 4-rule keyword filter for direct-dialogue mode (v1.1.1)
   discovery.py    psutil-based scanner — finds running claude/codex (v1.2)
   registry.py     session registry + spoken-target fuzzy matching (v1.2)
-  agents.py       agent registry, dispatch, background jobs, session names
-  voice.py        Kokoro TTS + Markdown sanitizer
+  agents.py       agent registry, dispatch, background jobs, MCP wiring, session names
+  voice.py        Kokoro / ElevenLabs TTS + Markdown sanitizer
+  userconfig.py   layered config (env > project toml > ~/.halo toml > defaults) + [profiles.<host>]
   bus.py          thread-safe event bus (ring buffer of {kind, ts, ...})
   web.py          Flask server: serves dashboard + /api/events polling
-  web_static/
-    index.html    dashboard (single file, no build step)
+  web_static/     BUILT dashboard (do not edit by hand — see dashboard/ source)
+
+dashboard/        React + Vite + Tailwind source for the dashboard
+                  `npm --prefix dashboard run build` -> emits into halo/web_static/
 
 pyproject.toml    package metadata (hatchling backend, `halo` console script)
 CHANGELOG.md      keep-a-changelog format, per-version history
@@ -651,25 +744,6 @@ Tokens `{PROMPT}` and `{CWD}` get substituted at call time. Then teach
 the Stage 2 router prompt about the new agent if you want voice routing
 ("aider, fix this") or just rely on the vocative dispatch in
 `__main__.py:_vocative_dispatch` (you'll need to extend its regex).
-
----
-
-## Wake word note
-
-openWakeWord ships `alexa`, `hey_jarvis`, `hey_mycroft`, `hey_rhasspy`
-out of the box. There is no built-in `hey_halo`. Step 1 uses
-`hey_jarvis` as a placeholder.
-
-To train a real `hey_halo` model:
-1. Record ~100 samples of yourself saying "Halo" using openWakeWord's
-   [training notebook](https://github.com/dscripka/openWakeWord#training-new-models)
-2. Drop the resulting `.onnx` into your `MODELS_DIR` (defaults to
-   `./models/` in dev, `~/.halo/models/` when pip-installed; override
-   with `HALO_MODELS_DIR`)
-3. Update `halo/wake.py:WAKE_WORD`
-
-Threshold lives in `halo/wake.py:THRESHOLD` (default 0.5). Raise if
-you get false positives, lower if it takes too many tries.
 
 ---
 

@@ -108,6 +108,25 @@ def test_resolve_token_overlap():
     assert_eq(res.label, "AIP-Claude")
 
 
+def test_resolve_compact_spoken_project_name():
+    r = SessionRegistry()
+    r.update([make_session("socialmanager", "D:\\socialmanager")])
+    res = r.resolve("the social manager")
+    assert_eq(res.kind, "session")
+    assert_eq(res.label, "socialmanager")
+
+
+def test_resolve_pid_suffix():
+    r = SessionRegistry()
+    r.update([
+        make_session("Halo/Halo", "D:\\Halo", agent="codex_cli", pid=11788),
+        make_session("Halo/Halo#13488", "D:\\Halo", agent="claude_code", pid=13488),
+    ])
+    res = r.resolve("Halo Halo 13488")
+    assert_eq(res.kind, "session")
+    assert_eq(res.label, "Halo/Halo#13488")
+
+
 def test_resolve_pseudo_targets():
     r = SessionRegistry()
     r.update([make_session("halo", "D:\\Halo")])
@@ -149,8 +168,16 @@ def test_active_disappears_on_update():
     r = SessionRegistry()
     r.update([make_session("halo", "D:\\Halo")])
     r.set_active("halo")
-    r.update([make_session("website", "D:\\web")])
+    r.update([make_session("website", "D:\\web", pid=2000)])
     assert_eq(r.active_label(), None, "active should clear when session vanishes")
+
+
+def test_active_survives_label_change_by_identity():
+    r = SessionRegistry()
+    r.update([make_session("socialmanager", "D:\\socialmanager", pid=31328)])
+    r.set_active("socialmanager")
+    r.update([make_session("work/socialmanager", "D:\\socialmanager", pid=31328)])
+    assert_eq(r.active_label(), "work/socialmanager")
 
 
 def test_speak_list():
@@ -191,10 +218,13 @@ def main() -> int:
         test_resolve_with_filler,
         test_resolve_substring,
         test_resolve_token_overlap,
+        test_resolve_compact_spoken_project_name,
+        test_resolve_pid_suffix,
         test_resolve_pseudo_targets,
         test_resolve_no_match,
         test_set_active,
         test_active_disappears_on_update,
+        test_active_survives_label_change_by_identity,
         test_speak_list,
         test_speak_active,
     ]

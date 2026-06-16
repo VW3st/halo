@@ -55,10 +55,23 @@ desktop.ini
 # index.html is the real landing page now (since v1.1.1) — keep it tracked.
 /halo.html
 /hello.py
+/bakery.html
+/realestate.html
+/landing_pages_high_conversion.md
+/*.html
+!/index.html
 /*.png
 /*.jpg
 /*.jpeg
 /*.gif
+
+# User-specific project config (has personal settings like user_name; the
+# real keys live in .env). Generated per machine — like .env, keep it local.
+/halo-config.toml
+
+# Vite/TS build caches in the dashboard
+dashboard/tsconfig.tsbuildinfo
+dashboard/.vite/
 
 # Environment secrets — never commit
 .env
