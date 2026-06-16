@@ -1225,7 +1225,10 @@ def _chat_base_prompt(history: str = "") -> tuple[str, str]:
     )
     system += _now_context()
     if name:
-        system += f"The user's name is {name}; use it occasionally, only when natural. "
+        system += (
+            f"The user's name is {name} (you know it from their settings — never "
+            "claim they told it to you earlier); use it occasionally, only when natural. "
+        )
     history = (history or "").strip()
     if history:
         system += (

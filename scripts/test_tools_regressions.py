@@ -74,6 +74,21 @@ def main() -> int:
         "exec doesn't answer Brisbane locally",
         execute_system_intent("what is the date and time in Brisbane") == (False, ""),
     )
+    # Multitask: a single command naming 2+ apps must open ALL of them.
+    failed += check(
+        "open A in B opens both (one phrase, two tools)",
+        execute_system_intent("open calculator in the browser")
+        == (True, "Opened calculator.  Opened browser."),
+    )
+    failed += check(
+        "open A and B opens both (bare list item gets the verb)",
+        execute_system_intent("open the calculator and paint")
+        == (True, "Opened calculator.  Opened Paint."),
+    )
+    failed += check(
+        "open A and B and C — all three",
+        is_pure_tool("open chrome and spotify and notepad"),
+    )
     # Politeness-wrapped tool commands must still resolve locally (not fall
     # through to the LLM, which mis-routed "open" to a session switch).
     failed += check(
@@ -92,7 +107,7 @@ def main() -> int:
         "polite non-tool stays non-tool",
         not is_pure_tool("can you tell me a joke"),
     )
-    total = 23
+    total = 26
     print(f"\n{total - failed}/{total} passed")
     return 1 if failed else 0
 

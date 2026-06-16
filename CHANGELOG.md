@@ -10,6 +10,24 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.3.1] — 2026-06-16
+
+### Fixed
+- **Multitask local tools** — "open calculator in the browser" / "open the
+  calculator and paint" / "open chrome and spotify and notepad" now open ALL
+  named apps. The tool loop fired only the first match per phrase, and a bare
+  list item ("…and paint") lost its verb after the conjunction split. Both
+  `is_pure_tool` and `execute_system_intent` propagate the open verb now.
+- **Questions never confirm-dispatch to Claude** — "what app did you open
+  first?" is a memory question, but it contains "open" so it got a
+  "Send to Claude?" prompt. `_needs_confirmation` now returns False for
+  `intent=question`; questions go to the chat brain (with memory). Halo's tool
+  actions are recorded in the conversation brief so it can answer them.
+- Chat no longer claims it was "told" the user's name earlier (it's from
+  settings).
+
+---
+
 ## [1.3.0] — 2026-06-16
 
 Conversational, machine-adaptive, dictate-anywhere.

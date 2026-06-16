@@ -1654,6 +1654,11 @@ def _needs_confirmation(decision: dict) -> bool:
     intent = decision.get("intent", "")
     if intent == "system":
         return False
+    # Questions are ANSWERED (by tools or the chat brain with memory), never
+    # dispatched — even when they contain a verb like "open" ("what app did you
+    # open first?"). Don't pause to confirm sending a question to Claude.
+    if intent == "question":
+        return False
     agent = decision.get("agent", "none")
 
     if agent in AGENTS:
@@ -2119,6 +2124,8 @@ def run_conversation() -> None:
                 print(f"  tool fast-path: {summary}")
                 bus.emit("route.matched", handler="tool", text=summary)
                 say(summary, blocking=True)
+                brief.add_halo(summary)  # remember what was opened ("what did you open first?")
+                last_activity = time.monotonic()
                 continue
 
         # 8. Direct-dialogue mode — pipe to active agent.

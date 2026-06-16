@@ -460,12 +460,18 @@ def is_pure_tool(text: str) -> bool:
         if tool.name == "datetime" and tool.pattern.search(cleaned):
             return not _TZ_QUALIFIER_RE.search(cleaned)
     parts = [p.strip() for p in _SPLIT_RE.split(cleaned) if p and p.strip()] or [cleaned]
+    open_mode = False
     for part in parts:
-        if _OPEN_FILE_RE.search(part):
+        if re.search(_OPEN, part):
+            open_mode = True
+        # A bare list item after an "open ..." command ("...and paint") gets
+        # the verb prepended so it's recognized as "open paint".
+        probe = part if re.search(_OPEN, part) else (f"open {part}" if open_mode else part)
+        if _OPEN_FILE_RE.search(probe):
             continue
-        if _is_open_app_known(part):
+        if _is_open_app_known(probe):
             continue
-        if not any(tool.pattern.search(part) for tool in _TOOLS):
+        if not any(tool.pattern.search(probe) for tool in _TOOLS):
             return False
     return True
 
@@ -503,8 +509,14 @@ def execute_system_intent(cleaned_text: str) -> tuple[bool, str]:
     summaries: list[str] = []
     any_handled = False
     fired: set[str] = set()  # don't double-fire the same tool in one turn
+    # "open A and B" splits to ["open A", "B"]; the bare "B" lost the verb.
+    # Once we've seen an open command, treat a later bare app-name segment as
+    # another thing to open, so "open the calculator and paint" opens BOTH.
+    open_mode = False
 
     for part in parts:
+        if re.search(_OPEN, part):
+            open_mode = True
         # File-open path runs first — "open landing.html" otherwise hits
         # the generic _OPEN regex from the next tool and false-fires.
         fhandled, fsummary = _try_open_file(part)
@@ -533,14 +545,34 @@ def execute_system_intent(cleaned_text: str) -> tuple[bool, str]:
                 any_handled = True
                 fired.add(tool.name)
                 matched = True
-                break
+                # NO break — a single phrase can name MORE THAN ONE tool
+                # ("open calculator and the browser" / "open calculator in the
+                # browser"); fire every matching tool, not just the first.
         if matched:
             continue
 
         # Generic app launcher — runs only when no dedicated tool matched, so
         # "open chrome" still uses the browser handler but "open paint",
         # "open spotify", "open word" launch locally instead of going to Claude.
-        ahandled, asummary = _try_open_app(part)
+        # A bare list item ("...and paint") gets the verb prepended so it's
+        # recognized as "open paint".
+        probe = part if re.search(_OPEN, part) else (f"open {part}" if open_mode else part)
+        # If the bare item names a dedicated tool ("...and the browser"), fire it.
+        if probe is not part:
+            for tool in _TOOLS:
+                if tool.name not in fired and tool.name != "datetime" and tool.pattern.search(probe):
+                    try:
+                        result = tool.handler()
+                        summaries.append(result)
+                        bus.emit("tools.invoke", name=tool.name, text=result)
+                    except Exception as exc:
+                        summaries.append(f"failed to open {tool.name}: {exc}")
+                    any_handled = True
+                    fired.add(tool.name)
+                    matched = True
+            if matched:
+                continue
+        ahandled, asummary = _try_open_app(probe)
         if ahandled:
             summaries.append(asummary)
             any_handled = True
