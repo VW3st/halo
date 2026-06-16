@@ -1,0 +1,75 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: #06080d;
+  color: #e3eaf6;
+  font-family: theme('fontFamily.ui');
+  overflow: hidden;
+  cursor: default;
+}
+
+/* Mobile / narrow viewports: the desktop layout is a fixed multi-column grid
+   that overflows on a phone. Below the lg breakpoint we let the page scroll
+   vertically and give each panel a real min-height so its visualizers render
+   instead of collapsing (panels use flex-1 to fill a desktop grid cell). */
+@media (max-width: 1023px) {
+  html, body, #root { height: auto; min-height: 100%; }
+  body { overflow-y: auto; overflow-x: hidden; }
+  .halo-panel { min-height: 240px; }
+}
+
+/* Ambient nebula glow + hex grid behind the whole UI */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse at 50% 34%, rgba(0, 229, 255, 0.07), transparent 55%),
+    radial-gradient(ellipse at 86% 82%, rgba(183, 148, 244, 0.05), transparent 50%),
+    radial-gradient(ellipse at 14% 82%, rgba(255, 170, 59, 0.04), transparent 50%);
+}
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(0, 229, 255, 0.022) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 229, 255, 0.022) 1px, transparent 1px);
+  background-size: 42px 42px;
+  -webkit-mask-image: radial-gradient(ellipse at center, black 28%, transparent 78%);
+  mask-image: radial-gradient(ellipse at center, black 28%, transparent 78%);
+}
+
+@layer components {
+  .mono { font-family: theme('fontFamily.mono'); }
+  .ptitle {
+    @apply mono uppercase text-cyan;
+    font-size: 10px;
+    letter-spacing: 0.22em;
+  }
+  .psub {
+    @apply mono uppercase text-faint;
+    font-size: 9px;
+    letter-spacing: 0.16em;
+  }
+}
+
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(0, 229, 255, 0.15); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0, 229, 255, 0.3); }

@@ -53,6 +53,12 @@ def index() -> Any:
     return send_from_directory(_STATIC_DIR, "index.html")
 
 
+@app.get("/assets/<path:filename>")
+def assets(filename: str) -> Any:
+    """Serve the Vite-built JS/CSS bundles (dashboard/ -> web_static/assets)."""
+    return send_from_directory(_STATIC_DIR / "assets", filename)
+
+
 @app.get("/api/events")
 def api_events() -> Any:
     since = int(request.args.get("since", 0) or 0)
@@ -129,6 +135,90 @@ def api_open_file() -> Any:
     return jsonify({"ok": True, "opened": target.name})
 
 
+@app.get("/api/system-metrics")
+def api_system_metrics() -> Any:
+    """Live machine metrics — CPU/RAM, GPU if available, conversation
+    timing. Polled by the bottom-left SYSTEM METRICS panel every ~1 s.
+
+    All optional sources degrade gracefully — psutil missing returns
+    zeros for CPU/RAM, NVML missing skips GPU. Never raises."""
+    out: dict = {
+        "cpu_pct": 0.0,
+        "mem_used_gb": 0.0,
+        "mem_total_gb": 0.0,
+        "mem_pct": 0.0,
+        "gpu_pct": 0.0,
+        "gpu_mem_pct": 0.0,
+        "gpu_temp_c": 0.0,
+        "gpu_name": "",
+        "tokens_per_sec": 0.0,
+        "context_tokens": 0,
+        "uptime_sec": time.time() - _SESSION_START_TS,
+        "session_count": 0,
+        "active_jobs": 0,
+    }
+    try:
+        import psutil  # type: ignore
+        # non-blocking CPU sample — psutil's first call returns 0.0, so the
+        # frontend sees real numbers from the second poll onwards.
+        out["cpu_pct"] = float(psutil.cpu_percent(interval=None))
+        vm = psutil.virtual_memory()
+        out["mem_used_gb"] = round((vm.total - vm.available) / 1024**3, 2)
+        out["mem_total_gb"] = round(vm.total / 1024**3, 2)
+        out["mem_pct"] = float(vm.percent)
+    except Exception:
+        pass
+
+    # GPU stats via NVML if available. pynvml ships with torch/cuda
+    # installs and is the only Python binding that's both stdlib-light
+    # AND tells us temp/util in one call.
+    try:
+        import pynvml  # type: ignore
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        util = pynvml.nvmlDeviceGetUtilizationRates(h)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+        out["gpu_pct"] = float(util.gpu)
+        out["gpu_mem_pct"] = round(mem.used / mem.total * 100, 1)
+        out["gpu_temp_c"] = float(
+            pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
+        )
+        out["gpu_name"] = pynvml.nvmlDeviceGetName(h).decode() if isinstance(
+            pynvml.nvmlDeviceGetName(h), bytes
+        ) else str(pynvml.nvmlDeviceGetName(h))
+        pynvml.nvmlShutdown()
+    except Exception:
+        pass
+
+    # Conversation-side metrics.
+    try:
+        from halo.__main__ import REGISTRY
+        out["session_count"] = len(REGISTRY.list())
+    except Exception:
+        pass
+    try:
+        from halo.agents import active_jobs
+        jobs = active_jobs()
+        out["active_jobs"] = len(jobs)
+        # tokens/sec rough estimate from any running job's elapsed +
+        # streaming chars (Claude streams sentences via agent.streaming
+        # events; we use the recent event-bus rate as a proxy).
+        from halo.bus import events_since, current_seq
+        recent = events_since(max(0, current_seq() - 200))
+        stream_evts = [
+            e for e in recent
+            if e["kind"] == "agent.streaming"
+            and e["ts"] > time.time() - 5.0
+        ]
+        if stream_evts:
+            chars = sum(len(e.get("sentence", "")) for e in stream_evts)
+            # Rough char->token ratio (~4 chars/token for English code).
+            out["tokens_per_sec"] = round(chars / 4.0 / 5.0, 1)
+    except Exception:
+        pass
+    return jsonify(out)
+
+
 @app.post("/api/control/reset-sessions")
 def api_reset_sessions() -> Any:
     """Drop agent continuation pointers — next dispatch starts fresh
@@ -193,17 +283,39 @@ def start_server(
     url = f"http://{host}:{port}"
 
     if open_browser and not os.environ.get("HALO_NO_BROWSER"):
-        # Brief delay so Flask's bind completes before the browser hits
-        # the URL — avoids a "can't reach the site" flash on slow boxes.
-        def _open_when_ready() -> None:
-            import time
-            time.sleep(0.4)
-            try:
-                webbrowser.open(url, new=2)
-            except Exception:
-                pass
+        # Don't spawn a NEW tab on every restart — the dashboard's polling UI
+        # auto-reconnects across server restarts, so an already-open tab just
+        # resumes. We open at most once per rolling 6h window (tracked by a
+        # marker file), so rapid start/stop cycles don't pile up tabs.
+        from pathlib import Path
+        import time as _t
 
-        threading.Thread(target=_open_when_ready, daemon=True,
-                         name="halo-web-open").start()
+        marker = Path.home() / ".halo" / ".dashboard-opened"
+        fresh = False
+        try:
+            fresh = marker.is_file() and (_t.time() - marker.stat().st_mtime) < 6 * 3600
+        except Exception:
+            fresh = False
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(str(int(_t.time())))  # roll the window forward
+        except Exception:
+            pass
+
+        if fresh:
+            print("  dashboard: reusing the already-open tab (it auto-reconnects)")
+        else:
+            # Brief delay so Flask's bind completes before the browser hits the
+            # URL — avoids a "can't reach the site" flash on slow boxes.
+            def _open_when_ready() -> None:
+                import time
+                time.sleep(0.4)
+                try:
+                    webbrowser.open(url, new=2)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_open_when_ready, daemon=True,
+                             name="halo-web-open").start()
 
     return url
