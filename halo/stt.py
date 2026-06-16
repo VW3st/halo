@@ -22,6 +22,7 @@ from typing import Optional
 
 import numpy as np
 
+from halo import bus
 from halo.config import SAMPLE_RATE
 
 
@@ -57,9 +58,29 @@ from faster_whisper import WhisperModel  # noqa: E402
 # similar WER on clean speech. int8_float16 on RTX 3060 uses ~800 MB
 # VRAM (fits alongside Ollama 1.5b + Windows).
 _MODEL_NAME = "distil-large-v3"
+
+# Vocabulary bias for command turns (accent accommodation). Nouns only —
+# deliberately NO verbs like "dictate"/"stop" so we don't nudge Whisper into
+# false dictation triggers/stops on near-silent turns.
+_BIAS_PROMPT = (
+    "Halo, Claude, Codex. Chrome, calculator, Paint, Notepad, Spotify, Word, "
+    "Excel, Explorer, settings, terminal. GitHub, TypeScript, JavaScript, "
+    "Python, React, Next.js."
+)
 _CUDA_COMPUTE = "int8_float16"
 _CPU_COMPUTE = "int8"
 _MIN_AUDIO_SEC = 0.2  # any shorter and Whisper will hallucinate
+
+# Confidence gate. faster-whisper exposes per-segment acoustic stats; we
+# use them to drop turns that are really mic noise / background TV / a cough
+# that the model hallucinated words from (e.g. "no, what do you mean, it
+# feels good" out of room tone, which then got dispatched as a task).
+# Tuned conservatively — require BOTH a low word-confidence AND a high
+# non-speech probability — so genuine quiet speech isn't dropped. Either
+# signal alone has too many false positives. The dispatch-side task guard
+# is the second line of defence for confidently-mis-transcribed noise.
+_MIN_AVG_LOGPROB = -1.0      # below this, the model is unsure of the words
+_MAX_NO_SPEECH_PROB = 0.6    # above this, the model thinks it's non-speech
 
 # distil-large-v3 (like the full distil-whisper family) was fine-tuned
 # on millions of YouTube auto-captions. Its highest-probability output
@@ -93,6 +114,36 @@ def _is_hallucination(text: str) -> bool:
     """True if `text` is one of distil-whisper's known silence-mode artifacts."""
     cleaned = text.strip().rstrip(".!?,").lower().strip()
     return cleaned in _HALLUCINATION_PHRASES
+
+
+def _passes_confidence(segments: list, text: str) -> bool:
+    """False when the model's own acoustic stats say this was probably
+    non-speech. Duration-weighted so one short noisy segment can't swing
+    the verdict. Returns True when there's no usable timing info (don't
+    second-guess the model without evidence)."""
+    total = sum(max(0.0, s.end - s.start) for s in segments)
+    if total > 0.0:
+        logprob = sum(
+            getattr(s, "avg_logprob", 0.0) * max(0.0, s.end - s.start) for s in segments
+        ) / total
+        nospeech = sum(
+            getattr(s, "no_speech_prob", 0.0) * max(0.0, s.end - s.start) for s in segments
+        ) / total
+    else:
+        # No usable per-segment timing (some decode configs zero start/end).
+        # Fall back to a plain mean so the gate still works.
+        n = len(segments)
+        logprob = sum(getattr(s, "avg_logprob", 0.0) for s in segments) / n
+        nospeech = sum(getattr(s, "no_speech_prob", 0.0) for s in segments) / n
+    if logprob < _MIN_AVG_LOGPROB and nospeech > _MAX_NO_SPEECH_PROB:
+        print(f"  [stt] rejected low-confidence (logprob {logprob:.2f}, "
+              f"no_speech {nospeech:.2f}): {text!r}")
+        bus.emit(
+            "stt.rejected", reason="low_confidence", text=text,
+            logprob=round(logprob, 2), no_speech=round(nospeech, 2),
+        )
+        return False
+    return True
 
 _model: Optional[WhisperModel] = None
 _load_lock = threading.Lock()
@@ -164,17 +215,41 @@ class BatchTranscriber:
                 return np.zeros(0, dtype=np.int16)
             return np.concatenate(self._chunks)
 
-    def transcribe(self) -> str:
-        """Run Whisper on everything buffered so far. Returns "" if too short."""
+    def transcribe(self, *, raw: bool = False) -> str:
+        """Run Whisper on everything buffered so far. Returns "" if too short.
+
+        `raw=True` (dictation mode) skips the hallucination-phrase blocklist
+        and the acoustic-confidence gate. Those gates exist to stop a
+        command turn from dispatching mic noise / a bare "hello" as a task —
+        but in dictation the user is deliberately speaking words to be typed
+        verbatim, so dropping ordinary words like "no" / "okay" / "hello" /
+        "thanks" would silently swallow legitimate input. The Whisper VAD
+        filter still runs (it only strips genuine non-speech segments).
+        """
         audio_i16 = self._snapshot()
         if audio_i16.size < int(SAMPLE_RATE * _MIN_AUDIO_SEC):
             return ""
         audio_f32 = audio_i16.astype(np.float32) / 32768.0
+        # Gain-normalize quiet mics before Whisper. Devices like NVIDIA
+        # Broadcast output a low level (~0.05 peak), which starves the decoder
+        # and produces garbled transcripts ("stop"->"top", "sleep"->"slip").
+        # Scale up so the peak sits near a level Whisper transcribes reliably;
+        # capped at 12x and only for genuinely-quiet-but-present speech so
+        # near-silence isn't blown up into hallucinated words.
+        peak = float(np.max(np.abs(audio_f32))) if audio_f32.size else 0.0
+        if 0.004 < peak < 0.32:
+            audio_f32 = np.clip(audio_f32 * min(0.38 / peak, 12.0), -1.0, 1.0)
         assert _model is not None
         segments, _info = _model.transcribe(
             audio_f32,
             language="en",
             beam_size=5,
+            # Accent help: prime the decoder with the domain vocabulary so an
+            # accented "open Chrome / Claude / calculator" latches onto the
+            # intended word instead of a phonetic neighbour. Only for command
+            # turns — dictation (raw=True) stays neutral so arbitrary free
+            # speech isn't skewed toward these terms.
+            initial_prompt=None if raw else _BIAS_PROMPT,
             # Whisper's built-in silero VAD pass strips non-speech segments
             # BEFORE transcription. Massive reduction in "Thank you" /
             # "Thanks for watching" hallucinations on quiet or noisy
@@ -185,7 +260,19 @@ class BatchTranscriber:
             without_timestamps=True,
             condition_on_previous_text=False,  # avoid hallucinated continuations
         )
-        text = " ".join(seg.text.strip() for seg in segments).strip()
+        seg_list = list(segments)
+        text = " ".join(seg.text.strip() for seg in seg_list).strip()
+        if not text:
+            return ""
+        if raw:
+            # Dictation: type exactly what was said, gates bypassed.
+            return text
+        # Acoustic-confidence gate — drop turns the model itself flags as
+        # probably-non-speech (mic noise / background audio it hallucinated
+        # words from). This is what let "no, what do you mean, it feels
+        # good" reach the router and spawn a phantom session.
+        if seg_list and not _passes_confidence(seg_list, text):
+            return ""
         # Filter known distil-whisper silence-mode artifacts ("Thank you.",
         # "Thanks for watching.", etc) so the orchestrator doesn't dispatch
         # them as real commands. SILENT discard — logging each drop spammed
@@ -195,6 +282,27 @@ class BatchTranscriber:
         if _is_hallucination(text):
             return ""
         return text
+
+    def peak_rms(self) -> float:
+        """Loudest 100 ms window in the buffered audio (RMS, 0..1).
+
+        Used to reject the no-VAD fallback path: if even the loudest window
+        is near silence, the mic only captured room tone and any text
+        Whisper produced is a hallucination — don't commit it as a turn.
+        Windowed (not whole-buffer) so a short real word still scores high
+        while steady background hiss averages out low.
+        """
+        audio_i16 = self._snapshot()
+        if audio_i16.size == 0:
+            return 0.0
+        f = audio_i16.astype(np.float32) / 32768.0
+        win = int(SAMPLE_RATE * 0.1) or 1
+        peak = 0.0
+        for i in range(0, f.size, win):
+            seg = f[i : i + win]
+            if seg.size:
+                peak = max(peak, float(np.sqrt(np.mean(seg ** 2))))
+        return peak
 
     def stop(self) -> str:
         """Symmetric API with the old streaming transcriber. Returns final text."""

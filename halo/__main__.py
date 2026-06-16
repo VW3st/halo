@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import re
 import signal
+import threading
 import time
 
 from pathlib import Path
@@ -59,13 +60,22 @@ from halo.config import (
     LIVE_STREAM_MAX_SENTENCES,
     REPLY_SUMMARIZE_THRESHOLD_CHARS,
 )
+from halo.desktop_control import foreground_pid, send_to_session as send_to_desktop_session
 from halo.discovery import DiscoveryThread, is_available as discovery_available
 from halo.followup_gate import passes as followup_gate_passes
 from halo.record import preload_models as preload_audio_models
 from halo.registry import SessionRegistry
-from halo.router import SessionContext, preload_router, summarize_reply, understand_and_route
-from halo.tools import execute_system_intent
-from halo.turn import run_turn
+from halo.router import (
+    SessionContext,
+    chat_reply,
+    chat_reply_stream,
+    preload_router,
+    summarize_reply,
+    understand_and_route,
+)
+from halo.tools import _try_say, execute_system_intent
+from halo.turn import listen_for_barge_in, run_turn
+from halo.userconfig import cfg as user_cfg
 from halo.voice import is_available as voice_available
 from halo.voice import is_speaking as voice_is_speaking
 from halo.voice import preload_voice, say
@@ -79,6 +89,28 @@ from halo.web import start_server as start_web_server
 # case the orchestrator behaves exactly like v1.1.
 REGISTRY = SessionRegistry()
 _DISCOVERY: DiscoveryThread | None = None
+_desktop_last_sent: dict[str, str] = {}
+_desktop_last_error: str = ""
+
+
+def _user_name() -> str:
+    return (user_cfg.persona.user_name or "").strip()
+
+
+def _address_user(prefix: str = "") -> str:
+    name = _user_name()
+    if not name:
+        return prefix
+    return f"{prefix}, {name}" if prefix else name
+
+
+def _personalize_reply(reply: str) -> str:
+    name = _user_name()
+    if not name or not reply:
+        return reply
+    if reply.lower().startswith(("good", "all good", "hi", "hey")):
+        return reply.rstrip(".") + f", {name}."
+    return reply
 
 
 class _StreamState:
@@ -118,6 +150,100 @@ class _StreamState:
 _stream_states: dict[int, _StreamState] = {}
 
 
+class _ConversationBrief:
+    """Rolling short-term memory of one awakened conversation.
+
+    Records BOTH sides — what the user said and what Halo said/did — with a
+    timestamp per turn, windowed by count and age (~last dozen turns / 15 min).
+    Two consumers:
+
+      * `render_history()` — a compact "You:/Halo:" transcript fed into the
+        Stage 2 router AND the chat brain every turn, so context-dependent
+        fragments ("do it again", "the other one") resolve instead of coming
+        back "unclear". This is the fix for "it doesn't capture the context".
+      * `render_for_agent()` — prior USER task turns only, used to brief a
+        coding agent at dispatch (unchanged behaviour).
+
+    Still local and short-lived — not a database, not cross-session memory.
+    """
+
+    __slots__ = ("turns", "max_turns", "max_age_sec")
+
+    def __init__(self, max_turns: int = 30, max_age_sec: float = 3600.0) -> None:
+        # each turn: (role, text, monotonic_ts); role in {"user", "halo"}
+        # Wider window than before (30 turns / 60 min) and PERSISTED across
+        # sleep/wake (see run_conversation), so Halo can answer "what did we
+        # talk about" / "what was the first message" instead of only knowing
+        # the current burst.
+        self.turns: list[tuple[str, str, float]] = []
+        self.max_turns = max_turns
+        self.max_age_sec = max_age_sec
+
+    def _add(self, role: str, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        if len(text) > 400:
+            text = text[:400].rstrip() + "…"
+        self.turns.append((role, text, time.monotonic()))
+        if len(self.turns) > self.max_turns:
+            self.turns = self.turns[-self.max_turns:]
+
+    def add_user(self, text: str) -> None:
+        self._add("user", text)
+
+    def add_halo(self, text: str) -> None:
+        self._add("halo", text)
+
+    def clear(self) -> None:
+        self.turns.clear()
+
+    def _recent(self) -> list[tuple[str, str]]:
+        now = time.monotonic()
+        return [(r, t) for (r, t, ts) in self.turns if now - ts <= self.max_age_sec]
+
+    def render_history(self) -> str:
+        """Compact recent transcript for the router / chat brain. "" if empty."""
+        recent = self._recent()
+        if not recent:
+            return ""
+        lines = ["# RECENT CONVERSATION"]
+        for role, text in recent:
+            lines.append(f"{'You' if role == 'user' else 'Halo'}: {text}")
+        return "\n".join(lines)
+
+    def render_for_agent(self, current_prompt: str) -> str:
+        current = (current_prompt or "").strip()
+        # Prior USER task turns only — skip Halo's replies, chit-chat, and
+        # control phrases so the agent gets a clean task brief.
+        prior: list[str] = []
+        for role, text, _ts in self.turns:
+            if role != "user" or not text or text == current:
+                continue
+            if _is_end_phrase(text) or _is_new_session_phrase(text):
+                continue
+            if _is_bare_go(text) or _chitchat_reply(text) is not None:
+                continue
+            prior.append(text)
+        if not prior:
+            return current
+        lines = ["Context from the voice conversation before this handoff:"]
+        for i, turn in enumerate(prior, 1):
+            lines.append(f"{i}. User said: {turn}")
+        lines.extend([
+            "",
+            "Use that context to preserve constraints and decisions, but follow this current request:",
+            current,
+        ])
+        return "\n".join(lines)
+
+
+# Module-level pointer to the active conversation's brief, so background-job
+# completions (_drain_completed_jobs) can fold the agent's reply into the same
+# rolling memory the brain reads. Set by run_conversation, cleared on exit.
+_active_brief: _ConversationBrief | None = None
+
+
 def _on_discovery_change(sessions) -> None:
     """Discovery thread callback — refresh registry + emit bus event so
     the dashboard sees new/closed sessions promptly."""
@@ -144,6 +270,247 @@ def _build_session_context() -> SessionContext | None:
     return SessionContext(active_label=active_label, discovered=discovered)
 
 
+_SESSION_LIST_QUERY_RE = re.compile(
+    r"\b("
+    r"(?:what|which|show|list|tell me).{0,45}(?:sessions?|session names?|"
+    r"cli|agents?|terminals?)|"
+    r"what.{0,25}(?:clis?|lies).{0,25}(?:open|running|available)|"
+    r"what session are you|"
+    r"(?:what|tell me).{0,35}(?:last task|last thing you did)|"
+    r"(?:sessions?|agents?|cli).{0,35}(?:online|running|open|active|available|"
+    r"connected)|"
+    r"do we have.{0,35}(?:sessions?|agents?|cli)|"
+    r"who(?:'s| is) active|"
+    r"where am i|what project am i on"
+    r")\b",
+    re.IGNORECASE,
+)
+_SESSION_SWITCH_RE = re.compile(
+    r"\b(?:let me talk to|talk to|speak to|need to speak to|"
+    r"i need to speak to|switch to|switch over to|connect me to|"
+    r"put me on|transfer me to|go to|go on|go under)\s+(?:the\s+)?(.+?)"
+    r"(?:\s+(?:session|project|cli|agent))?\s*[.!?,]*$",
+    re.IGNORECASE,
+)
+_TYPE_LEAD_IN = (
+    r"(?:hey\s+|hi\s+|halo\s+|okay\s+|ok\s+|look\s+|"
+    r"i\s+want\s+you\s+to\s+|i\s+need\s+you\s+to\s+|"
+    r"can\s+you\s+|could\s+you\s+|would\s+you\s+|please\s+)*"
+)
+_TYPE_VERB = r"(?:type|send|write|paste|(?:i(?:'| a)?m\s+)?typing)"
+_TYPE_TARGET = (
+    r"active\s+session|selected\s+session|focused\s+session|current\s+session|"
+    r"active|selected|focused|current|open|"
+    r"social\s+manager|manager|[\w\s/\\#.-]+?"
+)
+_TYPE_REQUEST_TARGET = (
+    r"active\s+session|selected\s+session|focused\s+session|current\s+session|"
+    r"active|selected|focused|current|open|"
+    r"social\s+manager|manager|"
+    r"[\w/\\#-]+(?:\s+[\w/\\#-]+){0,2}"
+)
+_TYPE_IN_SESSION_RE = re.compile(
+    r"^\s*" + _TYPE_LEAD_IN + _TYPE_VERB + r"\s+"
+    r"(?:this\s+)?(?:in|into|to|on)\s+"
+    r"(?:the\s+)?(?P<target>" + _TYPE_TARGET + r")"
+    r"(?:\s+(?:session|project|cli|agent))?"
+    r"(?:\s*[:.,-]\s*|\s+)(?P<text>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_TYPE_IN_SESSION_REQUEST_RE = re.compile(
+    r"^\s*" + _TYPE_LEAD_IN + _TYPE_VERB + r"\s+"
+    r"(?:in|into|to|on)\s+"
+    r"(?:the\s+)?(?P<target>" + _TYPE_REQUEST_TARGET + r")"
+    r"(?:\s+(?:session|project|cli|agent))?\s*[.!?]*$",
+    re.IGNORECASE,
+)
+
+# System-wide dictation trigger -> type my speech into whatever field has
+# focus. Start phrases are user-configurable ([dictation].start_phrases,
+# default "dictate"). Matching is accent-robust / fuzzy (see
+# dictation.matches_start) so a mis-transcribed "dictate" ("dictade",
+# "dictat") still enters dictation instead of falling through to the LLM.
+def _wants_dictation(text: str) -> bool:
+    from halo.dictation import matches_start
+    return matches_start(text)
+
+
+def _agent_spoken(agent_key: str) -> str:
+    cfg = AGENTS.get(agent_key)
+    return cfg.spoken_name if cfg else agent_key
+
+
+def _session_spoken(session) -> str:
+    return f"{_agent_spoken(session.agent_key)} in {session.label}"
+
+
+def _is_session_query(text: str) -> bool:
+    return bool(_SESSION_LIST_QUERY_RE.search(text or ""))
+
+
+def _session_summary() -> str:
+    sessions = REGISTRY.list()
+    connected = available_agents()
+    parts: list[str] = []
+    if connected:
+        parts.append(f"Connected CLIs: {_join_names(connected)}.")
+    else:
+        parts.append("No connected CLIs passed their health check.")
+    if not sessions:
+        parts.append("I don't see any discovered agent sessions running.")
+        return " ".join(parts)
+    names = [_session_spoken(s) for s in sessions]
+    if len(names) == 1:
+        parts.append(f"One discovered session: {names[0]}.")
+    else:
+        parts.append(f"{len(names)} discovered sessions: {_join_names(names)}.")
+    active = REGISTRY.active()
+    if active is not None:
+        parts.append(f"You're on {_session_spoken(active)}.")
+        last = _desktop_last_sent.get(active.label)
+        if last:
+            parts.append(f"Last thing I sent there: {last}.")
+    else:
+        parts.append("No session is selected yet.")
+    return " ".join(parts)
+
+
+def _local_session_switch(text: str) -> tuple[str | None, str]:
+    m = _SESSION_SWITCH_RE.search(text or "")
+    if not m:
+        return None, ""
+    target = _clean_session_target(m.group(1))
+    if not target:
+        return None, ""
+    if target in {"active", "selected", "active selected", "selected active"}:
+        active = REGISTRY.active()
+        if active is None:
+            return None, "No session is selected yet. Say the session name, like social manager."
+        return active.agent_key, f"You're talking to {_session_spoken(active)}."
+    # Agent-only switches are handled by _agent_switch_target; this path
+    # is for discovered sessions/projects like "social manager".
+    if _resolve_agent_word(target) is not None:
+        return None, ""
+    resolved = REGISTRY.resolve(target)
+    if resolved.kind != "session" or resolved.label is None:
+        return None, f"I don't see a session called {target}."
+    session = REGISTRY.by_label(resolved.label)
+    if session is None or not REGISTRY.set_active(resolved.label):
+        return None, f"I don't see a session called {target}."
+    bus.emit("session.switched", label=resolved.label)
+    return session.agent_key, f"You're talking to {_session_spoken(session)}."
+
+
+def _clean_session_target(target: str) -> str:
+    target = (target or "").strip()
+    target = re.sub(r"[,.!?]+", " ", target)
+    target = re.sub(r"\s+", " ", target).strip()
+    target = re.sub(
+        r"^(?:selected\s+)?(?:session|project|cli|agent)\s+(?:on|in|for)\s+",
+        "",
+        target,
+        flags=re.IGNORECASE,
+    )
+    target = re.sub(r"^(?:selected|open|active)\s+", "", target, flags=re.IGNORECASE)
+    target = re.sub(
+        r"\b(?:cli|agent|session|project|please|thanks|thank you)\b",
+        "",
+        target,
+        flags=re.IGNORECASE,
+    )
+    target = re.sub(r"\s+", " ", target).strip()
+    if target in {"", "selected", "active", "active selected", "selected active"}:
+        return "active"
+    # In this project "the manager" is how the user naturally refers to the
+    # socialmanager session. Prefer an actual manager-labelled session.
+    if re.fullmatch(r"(?:social\s+)?manager", target, flags=re.IGNORECASE):
+        for session in REGISTRY.list():
+            if "manager" in session.label.lower():
+                return session.label
+    return target
+
+
+def _direct_desktop_session(agent_key: str, session_label: str | None):
+    if session_label:
+        session = REGISTRY.by_label(session_label)
+        if session is not None and session.agent_key == agent_key:
+            return session
+    active = REGISTRY.active()
+    if active is not None and active.agent_key == agent_key:
+        return active
+    return None
+
+
+def _focused_desktop_session():
+    pid = foreground_pid()
+    if pid is None:
+        return None
+    for session in REGISTRY.list():
+        if session.pid == pid or session.parent_pid == pid:
+            return session
+    return None
+
+
+def _session_for_control_target(target: str | None):
+    cleaned = _clean_session_target(target or "active")
+    if cleaned in {"active", "selected", "current"}:
+        return REGISTRY.active() or _focused_desktop_session()
+    if cleaned in {"focused", "open"}:
+        return _focused_desktop_session() or REGISTRY.active()
+    resolved = REGISTRY.resolve(cleaned)
+    if resolved.kind == "session" and resolved.label is not None:
+        session = REGISTRY.by_label(resolved.label)
+        if session is not None:
+            REGISTRY.set_active(resolved.label)
+            return session
+    return None
+
+
+def _send_to_direct_desktop_session(agent_key: str, text: str, session_label: str | None) -> str | None:
+    global _desktop_last_error
+    session = _direct_desktop_session(agent_key, session_label)
+    if session is None:
+        return None
+    result = send_to_desktop_session(session, text)
+    if result.ok:
+        _desktop_last_sent[session.label] = text
+        _desktop_last_error = ""
+        return f"Sent to {_session_spoken(session)}."
+    _desktop_last_error = result.message
+    return result.message
+
+
+def _local_type_into_session(text: str) -> str | None:
+    global _desktop_last_error
+    # Check the no-payload form first. Otherwise "type in the active
+    # session" can be misread as target="active", payload="session".
+    m = _TYPE_IN_SESSION_REQUEST_RE.match(text or "")
+    request_only = m is not None
+    if not m:
+        m = _TYPE_IN_SESSION_RE.match(text or "")
+    if not m:
+        return None
+    target = m.group("target") or "active"
+    payload = "" if request_only else (m.group("text") or "").strip()
+    session = _session_for_control_target(target)
+    if session is None:
+        return "No desktop session is selected or focused. Say the session name, like social manager."
+    if not payload:
+        REGISTRY.set_active(session.label)
+        return f"What should I type into {_session_spoken(session)}?"
+    result = send_to_desktop_session(session, payload)
+    if result.ok:
+        REGISTRY.set_active(session.label)
+        _desktop_last_sent[session.label] = payload
+        return f"Sent to {_session_spoken(session)}."
+    _desktop_last_error = result.message
+    return result.message
+
+
+def _is_desktop_error_query(text: str) -> bool:
+    return bool(re.search(r"\b(why is that|why did (?:that|it) fail|what happened|why)\b", text or "", re.I))
+
+
 def _cwd_for_dispatch(target_session: str) -> Path:
     """Resolve target_session (label / 'active' / 'focused' / '' ) into a Path.
 
@@ -151,20 +518,32 @@ def _cwd_for_dispatch(target_session: str) -> Path:
     matches v1.1 single-session behaviour. 'all' is handled separately by
     the orchestrator (multi-dispatch), not here.
     """
+    def _valid(cwd: str | None) -> Path | None:
+        # A discovered session whose cwd() was AccessDenied gets cwd="" (or a
+        # dead path). Don't dispatch there — it resolves to Halo's own dir and
+        # silently runs in the wrong place. Fall back to DEFAULT_CWD instead.
+        if not cwd:
+            return None
+        try:
+            p = Path(cwd)
+            return p if p.is_dir() else None
+        except Exception:
+            return None
+
     if not target_session or target_session in ("active", "focused"):
         active = REGISTRY.active()
         if active is not None:
-            return Path(active.cwd)
+            return _valid(active.cwd) or DEFAULT_CWD
         return DEFAULT_CWD
     sess = REGISTRY.by_label(target_session)
     if sess is not None:
-        return Path(sess.cwd)
+        return _valid(sess.cwd) or DEFAULT_CWD
     # Fuzzy fallback — brain may have emitted a slightly off label.
     resolved = REGISTRY.resolve(target_session)
     if resolved.kind == "session" and resolved.label is not None:
         sess = REGISTRY.by_label(resolved.label)
         if sess is not None:
-            return Path(sess.cwd)
+            return _valid(sess.cwd) or DEFAULT_CWD
     return DEFAULT_CWD
 
 
@@ -177,6 +556,8 @@ def _cwd_for_dispatch(target_session: str) -> Path:
 # (pattern, [reply variants...]). A random pick keeps it from sounding
 # robotic when you hammer Halo with test utterances.
 _CHITCHAT_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
+    (re.compile(r"\b(what(?:'s| is) your name|who are you|what should i call you)\b", re.I),
+     ("I'm Halo.", "My name is Halo.")),
     # Existence / presence check
     (re.compile(r"\b(are you (there|here|on|alive|listening|hearing me|with me|awake|around))\b", re.I),
      ("Yes, I'm here.", "Still here.", "Right here.")),
@@ -184,6 +565,8 @@ _CHITCHAT_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
      ("Loud and clear.", "I hear you.", "Yes, clearly.")),
     # Wake-only greetings (no follow-up content)
     (re.compile(r"^\s*(hi|hey|hello|yo|sup|howdy)\s*(halo|there|you)?[.,!?\s]*$", re.I),
+     ("Hi. What can I do for you?", "Hey. Ready when you are.", "Hi there.")),
+    (re.compile(r"\b(?:just\s+)?(?:wanted|want)\s+to\s+say\s+hi\b", re.I),
      ("Hi. What can I do for you?", "Hey. Ready when you are.", "Hi there.")),
     # Test pings — bare "test" / "testing" / repeated / mic check
     (re.compile(r"^[\s.,!?]*(test|testing|mic check|audio check)"
@@ -206,7 +589,7 @@ _CHITCHAT_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
     (re.compile(r"^\s*(what'?s (up|happening|going on|new|the deal))[.,!?\s]*$", re.I),
      ("All good. Ready when you are.", "Just here. What's the task?")),
     # "How are you" style
-    (re.compile(r"^\s*(how are you|how'?s it going|how are things)[.,!?\s]*$", re.I),
+    (re.compile(r"\b(how are you(?: today)?|how'?s it going|how are things|are you good|you good)\b", re.I),
      ("Good. What's up?", "All good. What do you need?")),
     # Compliments / thanks (no follow-up action)
     (re.compile(r"^\s*(thanks|thank you|nice|cool|good job|well done|awesome)[.,!?\s]*$", re.I),
@@ -230,6 +613,166 @@ def _chitchat_reply(text: str) -> str | None:
         if pattern.search(text):
             return random.choice(replies)
     return None
+
+
+def _converse(text: str, brief: "_ConversationBrief | None" = None) -> str:
+    """Stream a conversational reply and SPEAK it sentence-by-sentence as it
+    generates, so the first words come out ~0.4 s in instead of waiting ~1.3 s
+    for the whole reply. Adds the reply to memory and returns "" because it has
+    ALREADY been spoken (the caller must not re-speak it). Fails open to a
+    short canned line so the user always hears something."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    history = brief.render_history() if brief is not None else ""
+    spoken = {"full": ""}
+
+    def _on_sentence(sentence: str) -> None:
+        sentence = (sentence or "").strip()
+        if not sentence:
+            return
+        if not spoken["full"]:
+            print(f"  chat (streaming) -> {sentence!r}")
+        say(sentence, blocking=False)  # queued; first sentence starts at once
+        spoken["full"] = (spoken["full"] + " " + sentence).strip()
+
+    try:
+        full = (chat_reply_stream(text, history=history, on_sentence=_on_sentence) or "").strip()
+    except Exception:
+        full = ""
+    full = full or spoken["full"]
+    if not full:
+        # Brain unreachable and nothing streamed — speak a canned line.
+        full = _personalize_reply("I'm here. What's on your mind?")
+        say(full, blocking=False)
+    if brief is not None:
+        brief.add_halo(full)
+    return ""  # already spoken via _on_sentence
+
+
+# Did the user actually NAME a coding agent? Drives the "Confirm before
+# Claude" policy — an un-named coding task pauses for a yes/no rather than
+# silently spawning a session. Includes common accent/STT mishearings of
+# "Claude" ("cloud", "clord", "clawed") so naming it out loud still counts.
+_AGENT_NAME_RE = re.compile(
+    r"\b(claude(?:\s*code)?|cloud\s*code|clawed|clord|anthropic|"
+    r"codex|open\s*ai)\b",
+    re.IGNORECASE,
+)
+
+
+def _user_named_agent(text: str) -> bool:
+    return bool(_AGENT_NAME_RE.search(text or ""))
+
+
+# Wake-word confirmation vocabulary — halo-like tokens, including the accent /
+# STT variants the model produces ("hello", "hallo", "hey low", "aloha").
+_WAKE_CONFIRM_RE = re.compile(
+    r"\b(?:h[ae]l+o+w?|hel+o+|hal+o+w?|hull?o|hallow|hey\s*l[oa]w?|hi\s*low|aloha?)\b",
+    re.IGNORECASE,
+)
+
+
+def _lev(a: str, b: str) -> int:
+    """Levenshtein distance (small inputs — wake-token fuzzy match)."""
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if not la:
+        return lb
+    if not lb:
+        return la
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[lb]
+
+
+def _text_has_wake_word(text: str) -> bool:
+    """True if a transcript plausibly contains the configured wake word.
+
+    Word-agnostic: keys off the configured `[wake] word` so switching to a
+    different/more-distinct wake word (e.g. "hey_jarvis", "hey halo") keeps
+    verification working. Matches the DISTINCTIVE token fuzzily ("jarvis" for
+    "hey jarvis", "halo" for "halo"). The halo-family regex is a bonus."""
+    t = (text or "").lower()
+    if not t.strip():
+        return False
+    target = (WAKE_WORD or "halo").lower().replace("_", " ").replace("-", " ")
+    if "halo" in target and _WAKE_CONFIRM_RE.search(t):
+        return True  # halo-family variants only when the word IS halo
+    tokens = [w for w in target.split() if w]
+    distinctive = tokens[-1] if tokens else "halo"  # skip the "hey" prefix
+    for tok in re.findall(r"[a-z']+", t):
+        if abs(len(tok) - len(distinctive)) <= 2 and _lev(tok, distinctive) <= 2:
+            return True
+    return False
+
+
+# A wake fire at or above this score is trusted even when STT can't cleanly
+# read back the wake word, PROVIDED the audio is short (a mis-transcribed
+# "halo", not a sentence of other speech). Reduces false REJECTIONS of real
+# wakes the recognizer garbled (e.g. "halo" -> "Hey!").
+_WAKE_STRONG_ACCEPT = 0.60
+
+
+def _wake_confirmed_by_stt(score: float = 0.0) -> bool:
+    """Second-stage wake gate (issue #1): after the DNN fires, transcribe the
+    ~1 s of audio captured before the fire and confirm the wake word was
+    actually spoken. `score` is the DNN fire confidence, used as a prior.
+
+    Conservative — biased toward NOT dropping real wakes:
+      * verify disabled / no audio / STT error -> accept.
+      * STT read back the wake word             -> accept.
+      * STT heard nothing but real speech energy-> accept (quiet real "halo").
+      * STT heard nothing and near-silence      -> reject (noise spike).
+      * STT heard NON-wake text:
+          - strong + short fire (mis-heard "halo") -> accept.
+          - otherwise (a sentence of other speech) -> REJECT (false-fire win).
+    """
+    if not user_cfg.wake.verify:
+        return True
+    try:
+        from halo.config import SAMPLE_RATE
+        from halo.record import SPEECH_RMS_FLOOR
+        from halo.stt import BatchTranscriber
+        from halo.wake import get_pre_wake_audio
+
+        audio = get_pre_wake_audio()
+        if audio is None or audio.size < int(SAMPLE_RATE * 0.3):
+            return True  # nothing to verify -> don't block
+        tb = BatchTranscriber()
+        tb.seed(audio)
+        text = (tb.transcribe(raw=True) or "").strip()
+        peak = tb.peak_rms()
+        # No tb.stop() — BatchTranscriber holds no stream/thread, and stop()
+        # would re-run transcription (wasted ~200 ms on every wake).
+    except Exception as exc:
+        print(f"  [wake verify] error ({exc}) — accepting")
+        return True
+
+    if not text:
+        if peak < SPEECH_RMS_FLOOR:
+            print(f"  [wake verify] rejected — silent fire (peak {peak:.3f})")
+            bus.emit("wake.rejected", reason="silent")
+            return False
+        return True  # real speech energy, recognizer just fumbled it
+    if _text_has_wake_word(text):
+        print(f"  [wake verify] confirmed: {text!r}")
+        return True
+    # Non-wake transcript. Trust a strong, SHORT fire (a garbled "halo"); reject
+    # a clear run of other speech.
+    word_count = len(re.findall(r"[a-z']+", text.lower()))
+    if score >= _WAKE_STRONG_ACCEPT and word_count <= 2:
+        print(f"  [wake verify] accepted on strong score {score:.2f} "
+              f"(garbled wake heard as {text!r})")
+        return True
+    print(f"  [wake verify] rejected false fire — heard {text!r} (no wake word)")
+    bus.emit("wake.rejected", text=text, score=score)
+    return False
 
 
 # Real-task signal — used by the `intent=system` fall-through to decide
@@ -273,20 +816,64 @@ def _looks_like_real_task(text: str) -> bool:
     return bool(_TASK_VERB_RE.search(text) or _TASK_NOUN_RE.search(text))
 
 
+# Whisper frequently prepends a phantom "Hello?" / "Hey" to a captured
+# utterance (it mishears the tail of the wake word). That junk prefix makes
+# the router mark real commands as chitchat/unclear. Strip leading greeting
+# tokens — but keep the last one if nothing substantive follows, so a genuine
+# bare "hey" still reaches the chitchat layer.
+_LEADING_GREETING_RE = re.compile(
+    # ONLY wake-word mishearings — not discourse words. "so/now/okay/oh" are
+    # turn-shape signals downstream filters use; stripping them eroded
+    # detection (audit finding).
+    r"^\s*(?:hello|hallo|hullo|hey|aye|hi|yo|halo)[\s,.!?]+",
+    re.IGNORECASE,
+)
+_LEADING_WAKE_JUNK_RE = re.compile(
+    r"^\s*(?:waika|waker|wake up|heyka|hika|ika)[\s,.!?]+",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_greeting(text: str) -> str:
+    t = (text or "").strip()
+    for _ in range(3):
+        m = _LEADING_GREETING_RE.match(t) or _LEADING_WAKE_JUNK_RE.match(t)
+        if not m:
+            break
+        rest = t[m.end():].strip()
+        if len(rest) < 2:
+            return t  # only a greeting remains — keep it for the chitchat layer
+        t = rest
+    return t
+
+
 # Phrases that close the conversation and send us back to wake-listening.
 # Matched anywhere in the cleaned transcript (case-insensitive, word boundaries).
 _END_CONVERSATION_RE = re.compile(
     r"\b("
     r"over and out|over n out|"
-    r"go to sleep|go back to sleep|"
+    r"go to sleep|go back to sleep|back to sleep|sleep now|"
+    r"you can sleep|i want you to sleep|go to bed|halo sleep|"
     r"stop listening|stop conversation|end conversation|end session|"
-    r"end of session|session end|that'?s enough|that'?s it|enough|"
-    r"good ?bye|bye bye|see you|"
+    r"end of session|session end|that'?s enough|that'?s it|"
+    r"good ?bye|bye bye|bye|see you|"
     r"that'?s all|that will be all|i'?m done|done for now|"
     r"thanks that'?s all|"
     r"stand by|standby|"
     r"shut up|leave me alone"
     r")\b",
+    re.IGNORECASE,
+)
+
+# Bare control words that mean "never mind, carry on" when nothing is pending.
+# Acknowledged locally so a lone "stop"/"cancel" never reaches Stage 2 (where
+# the small router occasionally invents a session switch). NOT an end phrase —
+# "go to sleep" / "goodbye" still exit.
+_BARE_STOP_RE = re.compile(
+    r"^\s*(?:stop|stop it|stop that|stop talking|stop please|please stop|"
+    r"cancel|never ?mind|forget it|nothing|no thanks?|"
+    r"shut up|be quiet|quiet|hush|enough|that'?s enough|"
+    r"that'?s ok(?:ay)?|it'?s ok(?:ay)?)\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
 
@@ -492,6 +1079,37 @@ def _is_new_session_phrase(text: str) -> bool:
     return bool(_NEW_SESSION_RE.search(text or ""))
 
 
+# Connective words that glue a new-session phrase to its trailing command
+# ("new session, AND THEN ask Claude to..."). Stripped along with the phrase
+# so the remaining command routes cleanly.
+_NEW_SESSION_GLUE_RE = re.compile(
+    r"^\s*(?:[,.;:]+\s*)?(?:and\s+then|and|then|now|so|ok(?:ay)?|please|"
+    r"can you|could you|would you|will you|i\s+want\s+to|let'?s)\b[\s,]*",
+    re.IGNORECASE,
+)
+
+
+def _strip_new_session_phrase(text: str) -> str:
+    """Remove the new-session phrase (and any leading glue) and return the
+    trailing command, e.g. 'new session, ask Claude to build X' -> 'ask Claude
+    to build X'. Returns '' when nothing substantive follows the phrase."""
+    t = (text or "").strip()
+    m = _NEW_SESSION_RE.search(t)
+    if not m:
+        return t
+    left = t[: m.start()]
+    # Drop a bare article that was attached to the phrase ("a new session").
+    left = re.sub(r"(?:^|\s)(?:a|an|the)\s*$", " ", left, flags=re.IGNORECASE)
+    remainder = re.sub(r"\s{2,}", " ", (left + " " + t[m.end():])).strip(" ,.;:!?")
+    # Peel leading connective filler so the command starts clean.
+    for _ in range(3):
+        stripped = _NEW_SESSION_GLUE_RE.sub("", remainder).strip(" ,.;:!?")
+        if stripped == remainder:
+            break
+        remainder = stripped
+    return remainder if len(remainder) >= 2 else ""
+
+
 def _is_status_query(text: str) -> bool:
     """Status query only intercepts when there's actually something to
     report. 'What's happening?' with no jobs running/completed is just
@@ -539,6 +1157,41 @@ def _print_full_result(job_label: str, ok: bool, text: str, elapsed: float) -> N
     print()
 
 
+def _join_names(names: list[str]) -> str:
+    """Spoken list join: ['A'] -> 'A', ['A','B'] -> 'A and B',
+    ['A','B','C'] -> 'A, B and C'."""
+    names = [n for n in names if n]
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def _summarize_with_timeout(reply_text: str, prompt: str, timeout: float = 6.0) -> str:
+    """`summarize_reply` with a hard wall-clock cap.
+
+    summarize_reply makes a blocking Ollama call. Run inside the
+    conversation loop, a slow or hung model would freeze talk→listen.
+    Run it on a daemon thread; if it overruns, fall back to the local
+    head-trim summarizer (no network) so the loop always moves on.
+    """
+    box: dict[str, str | None] = {"text": None}
+
+    def _work() -> None:
+        try:
+            box["text"] = summarize_reply(reply_text, prompt)
+        except Exception:
+            box["text"] = None
+
+    t = threading.Thread(target=_work, daemon=True, name="summarize")
+    t.start()
+    t.join(timeout)
+    if t.is_alive() or not box["text"]:
+        return summarize_for_speech(reply_text) or ""
+    return box["text"] or ""
+
+
 def _drain_completed_jobs() -> None:
     """Print finished agent jobs to stdout, and speak a "done" cap.
 
@@ -547,10 +1200,22 @@ def _drain_completed_jobs() -> None:
     "Mercury is done." cap so the user knows the agent is no longer
     working. For batch agents (Codex), we speak the full summary now.
 
+    When several jobs finished since the last turn (e.g. a fan-out),
+    we COALESCE: print every result but speak a single combined cap
+    ("Mercury and Mars are done.") instead of running an LLM summary +
+    TTS serially for each — that pile-up blocked the loop for seconds.
+    The detailed per-job summary is reserved for the common single
+    completion. The user can always replay a specific session's output.
+
     v1.2: spoken_name and label are per-(agent, cwd) so the cap
     correctly says "Mercury in website is done." when relevant.
     """
-    for job in completed_unconsumed_jobs():
+    jobs = list(completed_unconsumed_jobs())
+    if not jobs:
+        return
+
+    drained = []  # (spoken_name, job, stream_state, cfg)
+    for job in jobs:
         cfg = AGENTS[job.agent_key]
         spoken_name = session_name(cfg.key, job.cwd)
         project_tag = Path(job.cwd).name if job.cwd else ""
@@ -561,50 +1226,74 @@ def _drain_completed_jobs() -> None:
         _print_full_result(
             full_label, bool(job.ok), job.result, job.elapsed_sec
         )
+        # Fold the agent's outcome into the conversation memory so the brain
+        # knows what was just built ("open the page you made", "what did it do").
+        if _active_brief is not None and job.result:
+            _active_brief.add_halo(f"{spoken_name}: {job.result}")
         # Pop and consume the per-job stream state (v1.2.1 hybrid mode).
         stream_state = _stream_states.pop(job.job_id, None)
-        if job.ok:
-            if cfg.streams_text_deltas:
-                # Streaming agent: spoke first N sentences live. If the
-                # reply ran past the live budget, summarize the
-                # remainder into one cap sentence so the user gets the
-                # rest of the story without sitting through a monologue.
-                full_reply = (job.result or "").strip()
-                if stream_state is not None and stream_state.was_truncated:
-                    spoken_already = stream_state.spoken_text.strip()
-                    remainder = full_reply
-                    if spoken_already and full_reply.startswith(spoken_already):
-                        remainder = full_reply[len(spoken_already):].strip()
-                    if remainder and len(remainder) >= 60:
-                        # Only summarize if there's meaningful content
-                        # left — a stray trailing word doesn't warrant
-                        # an extra TTS round-trip.
-                        summary = summarize_reply(remainder, job.prompt)
-                        if summary:
-                            say(f"And, {summary}", blocking=True)
-                # If was_truncated=False the user already heard the
-                # whole reply via the live stream. Skip the cap.
-            else:
-                # Batch agent (Codex): no live streaming. If short,
-                # speak the cleaned head; if long, brain-summarize.
-                full_reply = (job.result or "").strip()
-                if len(full_reply) > REPLY_SUMMARIZE_THRESHOLD_CHARS:
-                    summary = summarize_reply(full_reply, job.prompt)
+        drained.append((spoken_name, job, stream_state, cfg))
+
+    # Coalesced path — multiple jobs landed together. One short cap, no
+    # serial LLM summaries.
+    if len(drained) > 1:
+        oks = [n for (n, j, _s, _c) in drained if j.ok]
+        errs = [n for (n, j, _s, _c) in drained if not j.ok]
+        parts = []
+        if oks:
+            verb = "are" if len(oks) > 1 else "is"
+            parts.append(f"{_join_names(oks)} {verb} done.")
+        if errs:
+            parts.append(f"{_join_names(errs)} had a problem.")
+        say(" ".join(parts), blocking=True)
+        for (_n, job, _s, _c) in drained:
+            mark_consumed(job)
+        return
+
+    # Single completion — full detailed cap.
+    spoken_name, job, stream_state, cfg = drained[0]
+    if job.ok:
+        if cfg.streams_text_deltas:
+            # Streaming agent: spoke first N sentences live. If the
+            # reply ran past the live budget, summarize the
+            # remainder into one cap sentence so the user gets the
+            # rest of the story without sitting through a monologue.
+            full_reply = (job.result or "").strip()
+            if stream_state is not None and stream_state.was_truncated:
+                spoken_already = stream_state.spoken_text.strip()
+                remainder = full_reply
+                if spoken_already and full_reply.startswith(spoken_already):
+                    remainder = full_reply[len(spoken_already):].strip()
+                if remainder and len(remainder) >= 60:
+                    # Only summarize if there's meaningful content
+                    # left — a stray trailing word doesn't warrant
+                    # an extra TTS round-trip.
+                    summary = _summarize_with_timeout(remainder, job.prompt)
                     if summary:
-                        say(f"{spoken_name} says, {summary}", blocking=True)
-                    else:
-                        say(f"{spoken_name} is done.", blocking=True)
-                else:
-                    short = summarize_for_speech(full_reply) or f"{spoken_name} is done."
-                    say(f"{spoken_name} says, {short}", blocking=True)
+                        say(f"And, {summary}", blocking=True)
+            # If was_truncated=False the user already heard the
+            # whole reply via the live stream. Skip the cap.
         else:
-            # Error path: short caps still use the legacy head-trim
-            # (errors are usually short stderr tails, not paragraphs).
-            say(
-                f"{spoken_name} had a problem. {summarize_for_speech(job.result, 120)}",
-                blocking=True,
-            )
-        mark_consumed(job)
+            # Batch agent (Codex): no live streaming. If short,
+            # speak the cleaned head; if long, brain-summarize.
+            full_reply = (job.result or "").strip()
+            if len(full_reply) > REPLY_SUMMARIZE_THRESHOLD_CHARS:
+                summary = _summarize_with_timeout(full_reply, job.prompt)
+                if summary:
+                    say(f"{spoken_name} says, {summary}", blocking=True)
+                else:
+                    say(f"{spoken_name} is done.", blocking=True)
+            else:
+                short = summarize_for_speech(full_reply) or f"{spoken_name} is done."
+                say(f"{spoken_name} says, {short}", blocking=True)
+    else:
+        # Error path: short caps still use the legacy head-trim
+        # (errors are usually short stderr tails, not paragraphs).
+        say(
+            f"{spoken_name} had a problem. {summarize_for_speech(job.result, 120)}",
+            blocking=True,
+        )
+    mark_consumed(job)
 
 
 def _print_decision(decision: dict) -> None:
@@ -617,6 +1306,7 @@ def _start_agent_and_ack(
     prompt: str,
     *,
     cwd: Path | None = None,
+    brief: _ConversationBrief | None = None,
 ) -> str:
     """Spawn a background job, return the voice-ack to speak.
 
@@ -632,6 +1322,8 @@ def _start_agent_and_ack(
         # dispatch a blank prompt to an agent. Claude / Codex both
         # error on empty input.
         return ""
+    if brief is not None:
+        prompt = brief.render_for_agent(prompt)
 
     # Pre-flight: refuse to dispatch to an agent whose binary isn't on
     # PATH or didn't respond to its check_call. Otherwise the subprocess
@@ -700,20 +1392,19 @@ def _start_agent_and_ack(
 
     try:
         job = start_job(agent_key, prompt, cwd=workdir, on_text_chunk=on_chunk)
+        # (start_job claims the voice floor for this job before its runner
+        # thread starts, so the latest dispatch is the sole live speaker.)
         # Register the stream state for _drain to consume on completion.
         # We register even when streams_text_deltas=False so batch agents
         # (Codex) also get the summarize-when-long behaviour — their
         # state will just have was_truncated=False and we'll branch on
         # full-text length instead.
         _stream_states[job.job_id] = stream_state
-        # Stash the original prompt for the summarizer to use as context.
-        job.prompt  # already on the job
+        # (the original prompt is already stored on the job for the summarizer)
         print(f"  job #{job.job_id} started in background"
               f"{' (streaming)' if config.streams_text_deltas else ''}")
         if active == "starting":
-            if project_tag:
-                return f"On it. {spoken} is starting in {project_tag}."
-            return f"On it. I'm calling this session {spoken}."
+            return f"On it. Starting {spoken}."
         return f"On it. {spoken}{where} is working."
     except AgentBusy as exc:
         return str(exc)
@@ -750,13 +1441,21 @@ def _handle_session_action(decision: dict) -> str | None:
         if resolved.kind == "session" and resolved.label is not None:
             if REGISTRY.set_active(resolved.label):
                 bus.emit("session.switched", label=resolved.label)
+                session = REGISTRY.by_label(resolved.label)
+                if session is not None:
+                    return f"You're talking to {_session_spoken(session)}."
                 return decision.get("confirmation") or f"Switched to {resolved.label}."
         return f"I don't see a session called {target}."
 
     return None
 
 
-def _dispatch_to_all(prompt: str, agent_hint: str) -> str:
+def _dispatch_to_all(
+    prompt: str,
+    agent_hint: str,
+    *,
+    brief: _ConversationBrief | None = None,
+) -> str:
     """Fan-out: dispatch the same prompt to every discovered session.
 
     Used when the brain emits target_session='all'. agent_hint comes
@@ -777,7 +1476,7 @@ def _dispatch_to_all(prompt: str, agent_hint: str) -> str:
         if agent_key not in AGENTS:
             continue
         try:
-            _start_agent_and_ack(agent_key, prompt, cwd=Path(s.cwd))
+            _start_agent_and_ack(agent_key, prompt, cwd=Path(s.cwd), brief=brief)
             fired += 1
         except Exception as exc:
             print(f"  fanout error for {s.label}: {exc}")
@@ -786,7 +1485,11 @@ def _dispatch_to_all(prompt: str, agent_hint: str) -> str:
     return f"Sent to {fired} session{'s' if fired != 1 else ''}."
 
 
-def _handle_decision(decision: dict) -> str:
+def _handle_decision(
+    decision: dict,
+    *,
+    brief: _ConversationBrief | None = None,
+) -> str:
     """Act on a decision dict. Returns the short phrase to speak back.
 
     v1.2: respects target_session for per-turn dispatch routing.
@@ -802,8 +1505,12 @@ def _handle_decision(decision: dict) -> str:
     target_session = (decision.get("target_session") or "").strip()
 
     if status == "chitchat":
-        print("  (chitchat — staying silent)")
-        return ""
+        # Empty cleaned_text means the router heard only noise/laughter —
+        # nothing to converse about, stay silent. Otherwise actually chat back.
+        if not (cleaned or "").strip():
+            print("  (chitchat — nothing to say)")
+            return ""
+        return _converse(cleaned, brief)  # streams + speaks internally
 
     if status == "cancel":
         return confirmation or "Cancelled."
@@ -815,37 +1522,185 @@ def _handle_decision(decision: dict) -> str:
         return ""
 
     # status == "ready"
-    if intent == "system":
+    # Local tools (date/time, open chrome, calculator, ...) can satisfy a
+    # ready turn regardless of how the small router labelled the intent.
+    # The 1.5B model frequently tags "what's the date / time" as
+    # intent=question (or system) inconsistently, then the question branch
+    # just speaks a useless "Okay." Try the local tools FIRST for non-code
+    # intents so these always resolve locally and instantly.
+    if intent != "code":
         handled, summary = execute_system_intent(cleaned)
         if handled:
-            print(f"  executed: {summary}")
+            print(f"  executed (local tool): {summary}")
             return summary
-        # No local tool matched. v1.2.0 used to blanket-dispatch to
-        # Claude here, which surprised users who said "hello can you
-        # hear me?" and got a 12-second Claude session spun up to
-        # answer. v1.2.3 only falls through if the cleaned text looks
-        # like a real task — an imperative coding verb or a technical
-        # noun. Chitchat-shape utterances get a polite refusal so the
-        # user knows they were heard but nothing fired.
-        if _looks_like_real_task(cleaned):
-            print(f"  no tool matched {cleaned!r} -> falling through to claude_code")
-            cwd = _cwd_for_dispatch(target_session)
-            return _start_agent_and_ack("claude_code", cleaned, cwd=cwd)
-        print(f"  no tool, looks like chitchat -> refusing: {cleaned!r}")
-        return "I'm not sure what you'd like me to do."
+
+    if intent == "question" and agent == "none":
+        # Tools didn't answer it — have a real conversation instead of the
+        # old robotic "I can help with Halo or your coding agents" line.
+        return _converse(cleaned, brief)  # streams + speaks internally
+
+    if intent == "system":
+        # Local tools + the generic app launcher already ran above and matched
+        # nothing. Per the "Confirm before Claude" policy, NEVER silently spawn
+        # an agent here — that's exactly the "open paint went to Claude" leak.
+        # Tell the user; they can say "Claude ..." to hand it over explicitly.
+        print(f"  system intent, no local match -> not dispatching: {cleaned!r}")
+        return (
+            "I couldn't do that one myself. Say Claude if you want me to hand "
+            "it over."
+        )
 
     # Multi-session fan-out — brain says target_session='all'.
     if target_session == "all":
-        return _dispatch_to_all(cleaned, agent_hint=agent if agent in AGENTS else "claude_code")
+        return _dispatch_to_all(
+            cleaned,
+            agent_hint=agent if agent in AGENTS else "claude_code",
+            brief=brief,
+        )
 
     # Registry-driven dispatch — non-blocking. Job runs in background;
     # _drain_completed_jobs() between turns will speak the result.
     if agent in AGENTS:
         cwd = _cwd_for_dispatch(target_session)
-        return _start_agent_and_ack(agent, cleaned, cwd=cwd)
+        return _start_agent_and_ack(agent, cleaned, cwd=cwd, brief=brief)
 
-    # question or other agent=none ready intents
-    return confirmation or "Okay."
+    # question / other ready intents with no agent. The brain chose
+    # agent=none, so this is the ambiguous "is this even for Claude?" case.
+    # Only spawn a session when it actually looks like a task — otherwise
+    # it's conversational noise / a casual remark that slipped the chitchat
+    # filter (e.g. a mis-transcribed "what do you mean, it feels good"),
+    # and spawning a fresh Claude session for it is exactly the phantom-
+    # session bug the user hit. Speak the brain's confirmation instead.
+    # We only reach here for agent=none either (a) after the user confirmed a
+    # dispatch ("Send X to Claude?" -> yes), or (b) when it isn't a task. In
+    # case (a) the condition below holds and we dispatch; in case (b) we just
+    # chat back instead of leaving dead air. The normal (un-confirmed) flow
+    # never silently dispatches because _needs_confirmation intercepts first.
+    if cleaned and len(cleaned.split()) >= 2 and _looks_like_real_task(cleaned):
+        print(f"  ready {intent!r}, no agent -> dispatching to claude_code: {cleaned!r}")
+        cwd = _cwd_for_dispatch(target_session)
+        return _start_agent_and_ack("claude_code", cleaned, cwd=cwd, brief=brief)
+    if cleaned:
+        print(f"  ready {intent!r}, no agent, not a task -> conversing")
+        return _converse(cleaned, brief)  # streams + speaks internally
+    return confirmation or ""
+
+
+_YES_RE = re.compile(
+    r"^\s*(?:yes|yeah|yep|correct|right|affirmative|go ahead|do it|"
+    r"send it|start|start it|please do|that'?s right)\s*[.!?,]*\s*$",
+    re.IGNORECASE,
+)
+_NO_RE = re.compile(
+    r"^\s*(?:no|nope|cancel|don'?t|do not|stop|never mind|nevermind|"
+    r"not now|leave it)\s*[.!?,]*\s*$",
+    re.IGNORECASE,
+)
+_CHANGE_PREFIX_RE = re.compile(
+    r"^\s*(?:actually|wait|no actually|change that to|make it|instead|"
+    r"rather|use|with)\b",
+    re.IGNORECASE,
+)
+_BARE_GO_RE = re.compile(
+    r"^\s*(?:go|let'?s go|let'?s do it|do it|send it|start|start now|"
+    r"please go|execute)\s*[.!?,]*\s*$",
+    re.IGNORECASE,
+)
+_RISKY_AGENT_RE = re.compile(
+    r"\b("
+    r"delete|remove|wipe|erase|drop|truncate|destroy|overwrite|replace all|"
+    r"revert|rollback|reset|clean|prune|"
+    r"commit|push|pull|merge|rebase|checkout|stash|"
+    r"install|uninstall|upgrade|downgrade|deploy|release|publish|ship|"
+    r"run|execute|shell|powershell|terminal|cmd|bash|"
+    r"token|secret|password|credential|env|environment"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_yes(text: str) -> bool:
+    return bool(_YES_RE.match(text or ""))
+
+
+def _is_no(text: str) -> bool:
+    return bool(_NO_RE.match(text or ""))
+
+
+def _is_change_answer(text: str) -> bool:
+    return bool(_CHANGE_PREFIX_RE.match(text or ""))
+
+
+def _is_bare_go(text: str) -> bool:
+    return bool(_BARE_GO_RE.match(text or ""))
+
+
+def _needs_confirmation(decision: dict) -> bool:
+    """True when a ready decision should pause for a spoken yes/no before
+    Halo hands the work to a coding agent.
+
+    "Confirm before Claude" policy: the user asked NOT to be auto-routed to
+    Claude unless they say so. Explicit "Claude, ..." / "ask Codex to ..."
+    already bypass Stage 2 via vocative/verbal dispatch, so by the time a
+    decision reaches here the user did NOT name the agent out loud — we
+    confirm first. System/question intents are handled locally (tools/chat),
+    never a dispatch, so they never need confirmation.
+    """
+    if decision.get("status") != "ready":
+        return False
+    cleaned = (decision.get("cleaned_text") or "").strip()
+    if not cleaned:
+        return False
+    intent = decision.get("intent", "")
+    if intent == "system":
+        return False
+    agent = decision.get("agent", "none")
+
+    if agent in AGENTS:
+        # The router auto-picked an agent. Confirm unless the user actually
+        # named one in the command (rare here — vocative/verbal caught most).
+        if not _user_named_agent(cleaned):
+            return True
+        # Named agent but risky/vague — keep the original guards.
+        if _RISKY_AGENT_RE.search(cleaned):
+            return True
+        if len(cleaned.split()) <= 4 and re.search(
+            r"\b(fix|change|update|remove|delete|run|deploy)\b", cleaned, re.I
+        ):
+            return True
+        return False
+
+    # agent == none: would only fall through to a Claude dispatch if it looks
+    # like a real task (see _handle_decision's tail). Confirm that too.
+    if len(cleaned.split()) >= 2 and _looks_like_real_task(cleaned):
+        return True
+    return False
+
+
+def _confirmation_question(decision: dict) -> str:
+    agent = decision.get("agent", "none")
+    if agent in AGENTS:
+        spoken = AGENTS[agent].spoken_name
+    else:
+        # agent=none real-task confirmations default to Claude (the fall-through
+        # target in _handle_decision).
+        spoken = AGENTS["claude_code"].spoken_name if "claude_code" in AGENTS else "Claude"
+    cleaned = (decision.get("cleaned_text") or "that").strip().rstrip(".")
+    if len(cleaned) > 90:
+        cleaned = cleaned[:87].rstrip() + "..."
+    return f"Send '{cleaned}' to {spoken}?"
+
+
+def _merge_pending_text(original: str, answer: str) -> str:
+    original = (original or "").strip().rstrip(".")
+    answer = (answer or "").strip()
+    if not original:
+        return answer
+    if not answer:
+        return original
+    if _is_change_answer(answer):
+        return f"{original}, but {answer}"
+    return f"{original}. {answer}"
 
 
 def _set_direct(direct_agent: str | None) -> str | None:
@@ -877,12 +1732,24 @@ def run_conversation() -> None:
     """
     last_activity = time.monotonic()
     direct_agent: str | None = None
+    direct_session_label: str | None = None
     # Toggled True the first time the user actually says something we
     # process (any non-None decision). The idle budget jumps from 5s
     # to CONVERSATION_IDLE_ENGAGED_SEC (90s) once engaged, so a single
     # spoken command no longer cuts the conversation short the moment
     # Halo finishes its reply.
     engaged = False
+    pending_action: dict | None = None
+    pending_clarification: str | None = None
+    # Persist conversation memory ACROSS sleep/wake within one Halo run, so
+    # Halo remembers earlier turns instead of forgetting every time it sleeps.
+    # Reset only on an explicit "new session". Also exposed module-level so
+    # background-job completions can fold the agent's reply into it.
+    global _active_brief
+    if _active_brief is None:
+        _active_brief = _ConversationBrief()
+    brief = _active_brief
+    first_turn_after_wake = True
 
     while True:
         # Speak any background-job results that landed since last turn.
@@ -894,8 +1761,15 @@ def run_conversation() -> None:
         # Reset last_activity once Halo goes silent so the idle clock
         # starts from "user could begin talking now", not from when the
         # user last spoke (which may have been before a 10s agent reply).
+        barge_in_text: str | None = None
         if voice_is_speaking():
-            voice_wait_until_silent(timeout=20.0)
+            barge_in_text = listen_for_barge_in(timeout=20.0)
+            if barge_in_text:
+                print(f"  barge-in accepted -> {barge_in_text!r}")
+                bus.emit("barge_in.accepted", text=barge_in_text)
+                voice_stop()
+            else:
+                voice_wait_until_silent(timeout=20.0)
             last_activity = time.monotonic()
 
         # Idle timeout — extend whenever a job is in flight, Halo is
@@ -910,9 +1784,15 @@ def run_conversation() -> None:
             CONVERSATION_IDLE_ENGAGED_SEC if engaged else CONVERSATION_IDLE_SEC
         )
         if idle > idle_limit:
-            if active_jobs() or voice_is_speaking() or direct_agent is not None:
+            # Keep alive while a job runs or Halo is speaking. Direct mode no
+            # longer pins the mic open FOREVER — it honors the engaged (90s)
+            # budget so a stray/auto-entered direct mode can't trap the user.
+            if active_jobs() or voice_is_speaking():
                 last_activity = time.monotonic()
             else:
+                if direct_agent is not None:
+                    print("  direct mode idle -> exiting direct mode")
+                    direct_agent = _set_direct(None)
                 print(f"\nconversation idle for {idle_limit:.0f}s -> sleeping")
                 say("Going back to sleep.", blocking=True)
                 return
@@ -924,31 +1804,171 @@ def run_conversation() -> None:
         # Always skip Stage 2 inside run_turn — every routing decision
         # is made HERE, in priority order, so we only spend the LLM
         # roundtrip on utterances that genuinely need it.
-        decision = run_turn(skip_routing=True, max_wait_first_speech_sec=first_wait)
+        if barge_in_text:
+            decision = {
+                "status": "raw",
+                "cleaned_text": barge_in_text,
+                "transcript": barge_in_text,
+                "intent": "raw",
+                "agent": "none",
+                "confirmation": "",
+                "clarification": "",
+            }
+        else:
+            decision = run_turn(
+                skip_routing=True,
+                max_wait_first_speech_sec=first_wait,
+                seed_pre_wake=first_turn_after_wake,
+            )
+            first_turn_after_wake = False
         if decision is None:
             continue
 
-        last_activity = time.monotonic()
-        engaged = True
         cleaned = (decision.get("cleaned_text") or "").strip()
+        cleaned = _strip_leading_greeting(cleaned)
         print(f"  heard: {cleaned!r}")
 
-        # 1. End phrase
+        # Empty after wake/greeting strip = Whisper transcribed silence,
+        # room noise, or a phantom wake. Do NOT flip `engaged` (that pins
+        # the mic open for the 90s engaged budget) and do NOT reset the
+        # idle timer — otherwise repeating noise keeps the conversation
+        # alive forever. Just loop back to listening.
+        if not cleaned:
+            continue
+
+        # A genuine, non-empty utterance: we're in an active conversation
+        # now, so extend the idle budget to the engaged window.
+        last_activity = time.monotonic()
+        engaged = True
+        brief.add_user(cleaned)
+
+        # Dictation trigger wins over EVERYTHING — including a pending
+        # confirmation/clarification — so a mis-heard "dictate" can never
+        # spiral into the LLM (it would otherwise get merged into the
+        # pending clarification and routed). Clears pending state, then
+        # hands the mic to the verbatim dictation loop.
+        if _wants_dictation(cleaned):
+            print("  dictation trigger -> entering dictation mode")
+            bus.emit("route.matched", handler="dictation")
+            pending_action = None
+            pending_clarification = None
+            from halo.dictation import run_dictation
+            say(
+                "Dictation on. Click where you want the words and start "
+                "talking. Say stop when you're done.",
+                blocking=True,
+            )
+            summary = run_dictation()
+            if summary:
+                say(summary, blocking=True)
+            last_activity = time.monotonic()
+            continue
+
+        # "Say <text>" — Halo speaks it verbatim. Checked BEFORE the end-phrase
+        # guard so quoting an end phrase ("say thanks, see you next time") reads
+        # it aloud instead of triggering sleep. A demo/recording puppet aid.
+        say_matched, say_text = _try_say(cleaned)
+        if say_matched:
+            print(f"  say -> {say_text!r}")
+            bus.emit("route.matched", handler="say", text=say_text)
+            say(say_text, blocking=True)
+            brief.add_halo(say_text)
+            last_activity = time.monotonic()
+            continue
+
+        # End-phrase wins next — "go to sleep" / "goodbye" must ALWAYS end the
+        # conversation, even with a pending confirmation/clarification open.
+        # (Previously a pending clarification swallowed it as a "cancel", so
+        # the conversation refused to sleep.)
         if _is_end_phrase(cleaned):
             print("  end-phrase -> closing conversation")
             bus.emit("route.matched", handler="end_phrase")
             say("Goodbye.", blocking=True)
             return
 
+        # Pending yes/no confirmation. This is what makes a spoken
+        # "ready to start?" a real dialogue turn instead of dispatching
+        # immediately on a small-router guess.
+        if pending_action is not None:
+            if _is_yes(cleaned):
+                lm_decision = pending_action
+                pending_action = None
+                print("  pending action confirmed")
+                bus.emit("route.matched", handler="confirmed_action")
+                phrase = _handle_decision(lm_decision, brief=brief)
+                if phrase:
+                    say(phrase, blocking=True)
+                if lm_decision.get("status") == "ready":
+                    agent_dispatched = lm_decision.get("agent")
+                    if agent_dispatched in AGENTS:
+                        direct_agent = _set_direct(agent_dispatched)
+                        direct_session_label = None
+                        print(f"  entering direct-dialogue mode with {direct_agent}")
+                last_activity = time.monotonic()
+                continue
+            if _is_no(cleaned) or _is_end_phrase(cleaned):
+                pending_action = None
+                bus.emit("route.matched", handler="cancel_pending_action")
+                say("Cancelled.", blocking=True)
+                last_activity = time.monotonic()
+                continue
+            original = pending_action.get("cleaned_text", "")
+            cleaned = _merge_pending_text(original, cleaned)
+            pending_action = None
+            print(f"  pending action revised -> {cleaned!r}")
+
+        # Pending clarification. The user's short answer is not a fresh
+        # command; attach it to the original unclear request and let the
+        # normal routing stack interpret the completed instruction.
+        if pending_clarification is not None:
+            if _is_no(cleaned) or _is_end_phrase(cleaned):
+                pending_clarification = None
+                bus.emit("route.matched", handler="cancel_pending_clarification")
+                say("Cancelled.", blocking=True)
+                last_activity = time.monotonic()
+                continue
+            cleaned = _merge_pending_text(pending_clarification, cleaned)
+            pending_clarification = None
+            print(f"  clarification merged -> {cleaned!r}")
+
+        # 1b. Bare control word with nothing pending — acknowledge locally
+        #     instead of burning a Stage 2 round-trip. A lone "stop" used to
+        #     reach the LLM and get mis-routed to a session switch; now it just
+        #     gets a quick "Okay" and we keep listening ("go to sleep" exits).
+        if _BARE_STOP_RE.match(cleaned):
+            print(f"  bare control word -> acknowledging: {cleaned!r}")
+            bus.emit("route.matched", handler="bare_control")
+            say("Okay.", blocking=True)
+            last_activity = time.monotonic()
+            continue
+
         # 2. New-session phrase
         if _is_new_session_phrase(cleaned):
-            print("  reset-session phrase -> dropping agent continuation")
+            remainder = _strip_new_session_phrase(cleaned)
+            print(f"  reset-session phrase -> fresh session"
+                  + (f"; carrying command {remainder!r}" if remainder else ""))
             bus.emit("route.matched", handler="new_session")
             reset_session()
             direct_agent = _set_direct(None)
+            direct_session_label = None
+            pending_action = None
+            pending_clarification = None
+            brief.clear()
+            try:
+                REGISTRY.set_active(None)  # else next dispatch reuses old cwd
+            except Exception:
+                pass
             bus.emit("session.reset")
-            say("Fresh session.", blocking=True)
-            continue
+            # If the user said the reset AND a command in one breath ("new
+            # session, ask Claude to build X"), don't drop the command — keep
+            # routing it on a clean slate. Otherwise just acknowledge.
+            if remainder:
+                cleaned = remainder
+                brief.add_user(cleaned)
+                # fall through to vocative / verbal / Stage 2 routing below
+            else:
+                say("Fresh session.", blocking=True)
+                continue
 
         # 3. Vocative dispatch — "Claude, X" / "Codex, X". Goes straight
         #    to the named agent. Saves the 3-5 s Stage 2 LLM round-trip.
@@ -957,7 +1977,8 @@ def run_conversation() -> None:
             print(f"  vocative dispatch -> {voc_agent}: {voc_text!r}")
             bus.emit("route.matched", handler="vocative", target=voc_agent)
             direct_agent = _set_direct(voc_agent)
-            phrase = _start_agent_and_ack(voc_agent, voc_text)
+            direct_session_label = None
+            phrase = _start_agent_and_ack(voc_agent, voc_text, cwd=_cwd_for_dispatch(""), brief=brief)
             if phrase:
                 say(phrase, blocking=True)
             last_activity = time.monotonic()
@@ -973,7 +1994,8 @@ def run_conversation() -> None:
             print(f"  verbal dispatch -> {verb_agent}: {verb_text!r}")
             bus.emit("route.matched", handler="verbal", target=verb_agent)
             direct_agent = _set_direct(verb_agent)
-            phrase = _start_agent_and_ack(verb_agent, verb_text)
+            direct_session_label = None
+            phrase = _start_agent_and_ack(verb_agent, verb_text, cwd=_cwd_for_dispatch(""), brief=brief)
             if phrase:
                 say(phrase, blocking=True)
             last_activity = time.monotonic()
@@ -983,6 +2005,7 @@ def run_conversation() -> None:
         switch_target = _agent_switch_target(cleaned)
         if switch_target is not None:
             direct_agent = _set_direct(switch_target)
+            direct_session_label = None
             spoken = session_name(switch_target)
             print(f"  pure switch -> {switch_target} ({spoken})")
             bus.emit("route.matched", handler="mode_switch", target=switch_target)
@@ -994,6 +2017,7 @@ def run_conversation() -> None:
             if direct_agent:
                 print(f"  leaving direct dialogue with {direct_agent}")
             direct_agent = _set_direct(None)
+            direct_session_label = None
             bus.emit("route.matched", handler="back_to_halo")
             say("Halo here.", blocking=True)
             continue
@@ -1031,15 +2055,63 @@ def run_conversation() -> None:
         #     to a fresh Claude session.
         chitchat = _chitchat_reply(cleaned)
         if chitchat is not None:
+            chitchat = _personalize_reply(chitchat)
             print(f"  chitchat-to-halo -> {chitchat!r}")
             bus.emit("route.matched", handler="chitchat_halo", text=chitchat)
             say(chitchat, blocking=True)
+            brief.add_halo(chitchat)
+            last_activity = time.monotonic()
+            continue
+
+        type_phrase = _local_type_into_session(cleaned)
+        if type_phrase is not None:
+            print(f"  local desktop type -> {type_phrase!r}")
+            bus.emit("route.matched", handler="desktop_type")
+            say(type_phrase, blocking=True)
+            active_session = REGISTRY.active()
+            if active_session is not None:
+                direct_agent = _set_direct(active_session.agent_key)
+                direct_session_label = REGISTRY.active_label()
+            last_activity = time.monotonic()
+            continue
+
+        switch_agent, switch_phrase = _local_session_switch(cleaned)
+        if switch_phrase:
+            print(f"  local session switch -> {switch_phrase!r}")
+            bus.emit("route.matched", handler="session_switch")
+            say(switch_phrase, blocking=True)
+            if switch_agent:
+                direct_agent = _set_direct(switch_agent)
+                direct_session_label = REGISTRY.active_label()
+                print(f"  entering direct-dialogue mode with {direct_agent}")
+            last_activity = time.monotonic()
+            continue
+
+        if _is_session_query(cleaned):
+            summary = _session_summary()
+            print(f"  local session query -> {summary}")
+            bus.emit("route.matched", handler="session_query")
+            say(summary, blocking=True)
+            last_activity = time.monotonic()
+            continue
+
+        if _desktop_last_error and _is_desktop_error_query(cleaned):
+            print(f"  desktop error query -> {_desktop_last_error}")
+            bus.emit("route.matched", handler="desktop_error_query")
+            say(_desktop_last_error, blocking=True)
             last_activity = time.monotonic()
             continue
 
         # 7. Tool fast-path — always wins for "open chrome" style commands,
         #    even in direct-dialogue mode. Lets the user fire quick local
         #    actions without breaking the agent thread.
+        if _is_bare_go(cleaned):
+            print("  bare go phrase with no pending action -> asking for task")
+            bus.emit("route.matched", handler="bare_go_no_action")
+            say("What should I start?", blocking=True)
+            last_activity = time.monotonic()
+            continue
+
         from halo.tools import is_pure_tool
         if cleaned and is_pure_tool(cleaned):
             handled, summary = execute_system_intent(cleaned)
@@ -1081,7 +2153,15 @@ def run_conversation() -> None:
 
             print(f"  direct-dialogue -> {direct_agent}")
             bus.emit("route.matched", handler="direct", target=direct_agent)
-            phrase = _start_agent_and_ack(direct_agent, cleaned)
+            desktop_phrase = _send_to_direct_desktop_session(
+                direct_agent, cleaned, direct_session_label
+            )
+            if desktop_phrase is not None:
+                print(f"  desktop-session send -> {desktop_phrase!r}")
+                say(desktop_phrase, blocking=True)
+                last_activity = time.monotonic()
+                continue
+            phrase = _start_agent_and_ack(direct_agent, cleaned, cwd=_cwd_for_dispatch(""), brief=brief)
             if phrase:
                 say(phrase, blocking=True)
             last_activity = time.monotonic()
@@ -1100,7 +2180,12 @@ def run_conversation() -> None:
         # emit target_session / session_action for multi-project
         # routing. None in single-session mode (empty registry).
         session_ctx = _build_session_context()
-        lm_decision = understand_and_route(cleaned, context=session_ctx)
+        # v1.3 — also inject the rolling conversation history so the brain can
+        # resolve references and stop marking context-dependent fragments
+        # "unclear".
+        lm_decision = understand_and_route(
+            cleaned, context=session_ctx, history=brief.render_history()
+        )
         print(f"  stage 2: {(time.monotonic() - t0) * 1000:.0f}ms")
 
         # 9a. v1.2 — handle session_action BEFORE dispatch interpretation.
@@ -1112,6 +2197,15 @@ def run_conversation() -> None:
             if session_phrase is not None:
                 print(f"  session action -> {lm_decision.get('session_action')!r}")
                 say(session_phrase, blocking=True)
+                if lm_decision.get("session_action") == "switch":
+                    active_session = REGISTRY.active()
+                    if active_session is not None:
+                        direct_agent = _set_direct(active_session.agent_key)
+                        direct_session_label = REGISTRY.active_label()
+                        print(
+                            "  entering direct desktop session "
+                            f"{direct_session_label} with {direct_agent}"
+                        )
                 last_activity = time.monotonic()
                 continue
 
@@ -1135,7 +2229,7 @@ def run_conversation() -> None:
                         target=fallback_agent,
                     )
                     direct_agent = _set_direct(fallback_agent)
-                    phrase = _start_agent_and_ack(fallback_agent, cleaned)
+                    phrase = _start_agent_and_ack(fallback_agent, cleaned, brief=brief)
                     if phrase:
                         say(phrase, blocking=True)
                     last_activity = time.monotonic()
@@ -1147,21 +2241,51 @@ def run_conversation() -> None:
         _print_decision(lm_decision)
 
         if lm_decision.get("status") == "cancel":
-            phrase = _handle_decision(lm_decision)
+            pending_action = None
+            pending_clarification = None
+            phrase = _handle_decision(lm_decision, brief=brief)
             if phrase:
                 say(phrase, blocking=True)
             return
 
-        phrase = _handle_decision(lm_decision)
+        if lm_decision.get("status") == "unclear":
+            # If the brain can't make sense of it, it almost certainly wasn't a
+            # real command — STAY SILENT and keep listening instead of nagging
+            # with a verbose "I didn't understand" AND merging the fragment into
+            # the next turn (the blob that misrouted "open Spotify"). The user
+            # just restates the whole thing. Only nudge for a clear-but-vague
+            # TASK (coding verb), with one short canned line.
+            pending_action = None
+            pending_clarification = None  # never merge fragments into a blob
+            if _looks_like_real_task(cleaned) and len(cleaned.split()) >= 3:
+                say("What would you like me to do?", blocking=True)
+            else:
+                print(f"  unclear / not a command -> ignoring: {cleaned!r}")
+            last_activity = time.monotonic()
+            continue
+
+        if _needs_confirmation(lm_decision):
+            pending_action = lm_decision
+            pending_clarification = None
+            question = _confirmation_question(lm_decision)
+            print(f"  confirmation required -> {question!r}")
+            bus.emit("route.matched", handler="confirm_action")
+            say(question, blocking=True)
+            last_activity = time.monotonic()
+            continue
+
+        phrase = _handle_decision(lm_decision, brief=brief)
         if phrase:
             print(f"  speaking: {phrase!r}")
             say(phrase, blocking=True)
+            brief.add_halo(phrase)
 
         # Auto-enter direct-dialogue with whichever agent Stage 2 picked.
         if lm_decision.get("status") == "ready":
             agent_dispatched = lm_decision.get("agent")
             if agent_dispatched in AGENTS:
                 direct_agent = _set_direct(agent_dispatched)
+                direct_session_label = None
                 print(f"  entering direct-dialogue mode with {direct_agent}")
 
         last_activity = time.monotonic()
@@ -1197,6 +2321,11 @@ def main() -> None:
         )
         for s in initial:
             print(f"  - {s}")
+        if not initial:
+            # Auto-diagnose so the user can see WHY nothing was found without
+            # needing to set HALO_DISCOVERY_DEBUG.
+            from halo.discovery import diagnose
+            diagnose()
     else:
         print("discovery: psutil not installed — running single-session mode")
 
@@ -1235,7 +2364,14 @@ def main() -> None:
 
     try:
         while True:
-            listen_for_wake()
+            wake_score = listen_for_wake()
+            # Second-stage gate: confirm the wake word with STT before opening
+            # a conversation, so a DNN false-fire on ordinary speech doesn't
+            # wake Halo (issue #1). The fire score is a prior — a strong fire is
+            # trusted even if STT garbles it. Rejected -> back to listening.
+            if not _wake_confirmed_by_stt(wake_score):
+                print("  (false wake rejected -- back to listening)\n")
+                continue
             print("\nwake word detected -- entering conversation\n")
             bus.emit("convo.entered")
             say("I'm here.", blocking=True)
@@ -1251,4 +2387,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # `python -m halo` -> voice loop (unchanged). `python -m halo <cmd>` ->
+    # route through the CLI so subcommands (calibrate, doctor, ...) work the
+    # same as the installed `halo` console script.
+    import sys as _sys
+    if len(_sys.argv) > 1:
+        from halo.cli import main as _cli_main
+        _sys.exit(_cli_main(_sys.argv[1:]))
     main()

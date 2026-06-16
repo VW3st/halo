@@ -42,6 +42,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Check that Ollama, agents (claude/codex), and Kokoro are wired up.",
     )
     sub.add_parser(
+        "calibrate",
+        help="Measure the wake word on this mic and save per-machine settings.",
+    )
+    sub.add_parser(
         "sessions",
         help="List running coding-agent sessions discovered on this machine.",
     )
@@ -100,6 +104,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         from halo.doctor import run as run_doctor
         return run_doctor()
+
+    if args.command == "calibrate":
+        from halo.calibrate import run as run_calibrate
+        return run_calibrate()
 
     if args.command == "sessions":
         return _print_sessions()

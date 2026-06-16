@@ -6,6 +6,7 @@ Higher-level turn orchestration lives in halo/turn.py.
 from __future__ import annotations
 
 import os
+import queue
 import tempfile
 import threading
 import time
@@ -31,12 +32,19 @@ from halo.config import (
 
 # silero-vad v5 requires exactly 512 samples per chunk at 16 kHz (~32 ms).
 VAD_CHUNK = 512
-# Back to silero's default. 0.3 was too sensitive — room noise on the
-# Blue Snowball kept VAD "started" indefinitely, ballooning the audio
-# buffer. Streaming STT means the cost of a slightly-too-strict VAD is
-# only a re-prompt, not a 30-second batch transcribe.
-VAD_THRESHOLD = 0.5
+# 0.35: silero often under-scores a raw, AGC-less USB mic (Blue Snowball)
+# so 0.5 missed real speech entirely ("no speech detected"). Run-ons that
+# 0.3 used to cause are now bounded by TURN_MAX_SEC, so the looser value is
+# safe — and the RMS-energy fallback below catches speech silero misses.
+VAD_THRESHOLD = 0.35
 SPEECH_PAD_MS = 200
+
+# RMS-energy fallback so a quiet mic that under-scores on silero still
+# registers speech. If `ENERGY_ONSET_CHUNKS` consecutive chunks clear
+# SPEECH_RMS_FLOOR we treat it as a speech onset; after speech, that many
+# sub-gate chunks marks the end. ~32 ms per chunk.
+SPEECH_RMS_FLOOR = 0.018
+ENERGY_ONSET_CHUNKS = 6   # ~200 ms of sustained energy = onset
 
 # Tell the user "your mic is picking up audio" when RMS rises above this.
 # Rate-limited print, purely diagnostic. Bumped from 0.01 to 0.05 so we
@@ -89,6 +97,7 @@ class RecorderState:
         self,
         min_silence_ms: int,
         on_audio: Optional[Callable[[np.ndarray], None]] = None,
+        suppress_tts_echo: bool = True,
     ) -> None:
         self.vad = VADIterator(
             _get_vad_model(),
@@ -98,68 +107,117 @@ class RecorderState:
             speech_pad_ms=SPEECH_PAD_MS,
         )
         self._on_audio = on_audio
+        self._suppress_tts_echo = suppress_tts_echo
         self._chunks: list[np.ndarray] = []
         self._lock = threading.Lock()
         self._speech_event = threading.Event()
         self._silence_event = threading.Event()
         self.had_speech = False
         self._last_rms_print = 0.0
+        # Realtime audio path: the PortAudio callback ONLY enqueues raw
+        # chunks; all inference (silero VAD) runs on a consumer thread.
+        # Doing torch work inside the callback overran the 32 ms block
+        # budget on a raw USB mic -> "input overflow" -> dropped speech.
+        self._q: queue.Queue = queue.Queue(maxsize=512)
+        self._stop = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+        self._energy_run = 0   # consecutive energetic chunks (onset fallback)
+        self._silence_run = 0  # consecutive quiet chunks after speech (end fallback)
+        self._min_silence_chunks = max(1, int(min_silence_ms / 32))
 
     def _callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
+        # Keep this as cheap as possible — it runs on the realtime audio
+        # thread. Any heavy work here causes PortAudio input overflow.
         if status:
             global _last_audio_status_print
             now = time.monotonic()
             if now - _last_audio_status_print > _AUDIO_STATUS_THROTTLE_SEC:
                 _last_audio_status_print = now
                 print(f"audio status: {status}")
+        try:
+            self._q.put_nowait(indata[:, 0].copy())
+        except queue.Full:
+            pass  # consumer fell behind; drop a frame rather than block audio
 
-        # Halo's TTS plays through the same physical speakers the user's
-        # mic is listening to. If we feed those chunks to the STT pipeline,
-        # Whisper transcribes Halo's own voice and the orchestrator
-        # dispatches it back to Claude — Halo ends up arguing with itself.
-        # Drop chunks while voice.is_speaking(); a real interrupt would
-        # need barge-in, which is a separate (deferred) feature.
+    def _consume(self) -> None:
+        """Drain the raw-audio queue and run gate + VAD off the realtime thread."""
         from halo.voice import is_speaking as _voice_is_speaking
-        if _voice_is_speaking():
-            return
-
-        chunk = indata[:, 0].copy()
-        with self._lock:
-            self._chunks.append(chunk)
-
-        # Forward to the streaming transcriber (Moonshine) if attached.
-        if self._on_audio is not None:
+        while not self._stop.is_set():
             try:
-                self._on_audio(chunk)
-            except Exception as exc:
-                print(f"  on_audio error: {exc}")
+                chunk = self._q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                break
+            # Don't transcribe / VAD Halo's own TTS bleeding into the mic,
+            # except in explicit barge-in mode where we are listening only
+            # for a tiny interrupt vocabulary while TTS is active.
+            if self._suppress_tts_echo and _voice_is_speaking():
+                continue
 
-        chunk_float = chunk.astype(np.float32) / 32768.0
+            with self._lock:
+                self._chunks.append(chunk)
+            if self._on_audio is not None:
+                try:
+                    self._on_audio(chunk)
+                except Exception as exc:
+                    print(f"  on_audio error: {exc}")
 
-        # Mic-activity diagnostic: prove audio is flowing even when VAD
-        # doesn't fire. Rate-limited so it doesn't flood the terminal.
-        rms = float(np.sqrt(np.mean(chunk_float ** 2)))
-        now = time.monotonic()
-        if rms > MIC_RMS_FLOOR and now - self._last_rms_print > MIC_RMS_PRINT_INTERVAL_SEC:
-            self._last_rms_print = now
-            print(f"  mic level: {rms:.3f}")
+            chunk_float = chunk.astype(np.float32) / 32768.0
+            rms = float(np.sqrt(np.mean(chunk_float ** 2)))
+            now = time.monotonic()
+            if rms > MIC_RMS_FLOOR and now - self._last_rms_print > MIC_RMS_PRINT_INTERVAL_SEC:
+                self._last_rms_print = now
+                print(f"  mic level: {rms:.3f}")
 
-        # Noise gate: chunks below the floor are treated as silence and
-        # NOT fed to VAD. Keeps silero from triggering on room noise,
-        # fan hum, breath, etc. Tunable via config.MIC_NOISE_GATE_RMS.
-        if rms < MIC_NOISE_GATE_RMS:
-            return
+            # Noise gate: below the floor = silence. Also drives the
+            # RMS-energy END fallback once speech has started.
+            if rms < MIC_NOISE_GATE_RMS:
+                self._energy_run = 0
+                if self.had_speech:
+                    self._silence_run += 1
+                    if self._silence_run >= self._min_silence_chunks:
+                        self._speech_event.clear()
+                        self._silence_event.set()
+                continue
 
-        result = self.vad(torch.from_numpy(chunk_float), return_seconds=False)
-        if result is None:
-            return
-        if "start" in result:
-            self.had_speech = True
-            self._silence_event.clear()
-            self._speech_event.set()
-        if "end" in result:
-            self._speech_event.clear()
-            self._silence_event.set()
+            # RMS-energy ONSET fallback for quiet mics silero under-scores.
+            if rms >= SPEECH_RMS_FLOOR:
+                self._energy_run += 1
+                self._silence_run = 0
+                if self._energy_run >= ENERGY_ONSET_CHUNKS and not self.had_speech:
+                    self.had_speech = True
+                    self._silence_event.clear()
+                    self._speech_event.set()
+            else:
+                self._energy_run = 0
+
+            result = self.vad(torch.from_numpy(chunk_float), return_seconds=False)
+            if result is None:
+                continue
+            if "start" in result:
+                self.had_speech = True
+                self._silence_run = 0
+                self._silence_event.clear()
+                self._speech_event.set()
+            if "end" in result:
+                self._speech_event.clear()
+                self._silence_event.set()
+
+    def start_worker(self) -> None:
+        self._stop.clear()
+        self._worker = threading.Thread(target=self._consume, daemon=True, name="halo-rec-consume")
+        self._worker.start()
+
+    def stop_worker(self) -> None:
+        self._stop.set()
+        try:
+            self._q.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._worker is not None:
+            self._worker.join(timeout=1.5)
+            self._worker = None
 
     def snapshot(self) -> np.ndarray:
         with self._lock:
@@ -182,14 +240,22 @@ class RecorderState:
 
 @contextmanager
 def open_stream(state: RecorderState) -> Iterator[RecorderState]:
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="int16",
-        blocksize=VAD_CHUNK,
-        callback=state._callback,
-    ):
-        yield state
+    # latency="high" gives PortAudio a larger host buffer so a raw USB mic
+    # has slack and doesn't overflow. The callback is now trivial (enqueue
+    # only); the consumer thread does the VAD work.
+    state.start_worker()
+    try:
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="int16",
+            blocksize=VAD_CHUNK,
+            latency="high",
+            callback=state._callback,
+        ):
+            yield state
+    finally:
+        state.stop_worker()
 
 
 def save_wav(audio: np.ndarray) -> Path:

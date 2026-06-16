@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from halo.userconfig import cfg
+
 # Flip to False once we're past the build-and-debug phase.
 DEBUG = True
 
@@ -57,14 +59,22 @@ SAMPLE_RATE = 16_000
 # Router backend for command interpretation. Stage 2 of the routing brain.
 # - "ollama": local, free, default. Requires `ollama pull qwen2.5:1.5b-instruct` once.
 # - "claude": Anthropic API. Requires ANTHROPIC_API_KEY env var. (Not wired.)
-ROUTER_BACKEND = "ollama"
+ROUTER_BACKEND = cfg.router.provider
 
-OLLAMA_HOST = "http://localhost:11434"
+OLLAMA_HOST = cfg.router.ollama_host
 # qwen2.5:1.5b-instruct is the latency-tier default — non-reasoning,
 # small enough to clear the <200ms stage-1 / <500ms stage-2 budget on
 # modest GPUs. qwen2.5:3b-instruct is more accurate but ~3x slower on
 # the same hardware; qwen3:4b emits chain-of-thought (unusable for voice).
-OLLAMA_MODEL = "qwen2.5:1.5b-instruct"
+OLLAMA_MODEL = cfg.router.ollama_model
+OPENROUTER_BASE_URL = cfg.router.openrouter_base_url
+OPENROUTER_MODEL = cfg.router.openrouter_model
+# Optional separate model for chat; falls back to the routing model when blank.
+OPENROUTER_CHAT_MODEL = cfg.router.openrouter_chat_model or cfg.router.openrouter_model
+OPENROUTER_API_KEY_ENV = cfg.router.openrouter_api_key_env
+OPENROUTER_SITE_URL = cfg.router.openrouter_site_url
+OPENROUTER_APP_NAME = cfg.router.openrouter_app_name
+OPENROUTER_TIMEOUT_SEC = cfg.router.openrouter_timeout_sec
 
 CLAUDE_MODEL = "claude-haiku-4-5"
 
@@ -73,7 +83,7 @@ CLAUDE_MODEL = "claude-haiku-4-5"
 # adds mode-dependent extra wait on top (see halo/turn.py:detect_mode).
 TURN_END_SILENCE_MS = 600
 TURN_EXTENSION_SEC = 2.0
-TURN_MAX_SEC = 30.0
+TURN_MAX_SEC = 14.0  # was 30 — cap run-on capture; 30s let rambling pile up
 TURN_MAX_WAIT_FOR_FIRST_SPEECH_SEC = 5.0
 TURN_MAX_INCOMPLETE_EXTENSIONS = 3
 CHIME_FREQ_HZ = 800
@@ -102,8 +112,11 @@ MIC_NOISE_GATE_RMS = 0.005
 #
 # Direct-dialogue mode never auto-sleeps regardless of these (see
 # run_conversation in __main__).
-CONVERSATION_IDLE_SEC = 5.0
-CONVERSATION_IDLE_ENGAGED_SEC = 90.0
+# Wired to [conversation] config (was a hardcoded literal). The pre-engagement
+# window can be generous now that STT wake-verification rejects phantom wakes
+# before a conversation even opens — a real wake gets a calm beat to start.
+CONVERSATION_IDLE_SEC = cfg.conversation.idle_sec
+CONVERSATION_IDLE_ENGAGED_SEC = cfg.conversation.idle_engaged_sec
 
 # Persistent CLI session visibility. When True, Halo echoes each event
 # from the agent's stdout to its own terminal — you watch Claude write
@@ -146,12 +159,25 @@ FOLLOWUP_GATE_ENABLED = True
 LIVE_STREAM_MAX_SENTENCES = 2
 REPLY_SUMMARIZE_THRESHOLD_CHARS = 400
 
+# --- dictation mode knobs ---------------------------------------------
+# System-wide dictation ("take dictation" -> type my speech into the
+# focused field). DICTATION_IDLE_SEC: how long to wait for the next
+# utterance before auto-ending dictation. Generous so the user can think
+# between sentences. DICTATION_MAX_UTTERANCE_SEC: hard cap on a single
+# captured chunk before it commits and gets typed.
+DICTATION_IDLE_SEC = 30.0
+DICTATION_MAX_UTTERANCE_SEC = 20.0
+# Wall-clock budget for the optional per-chunk LLM autocorrect pass. If the
+# router model doesn't answer in time, dictation types the locally-cleaned
+# text instead so typing never stalls on a slow/offline model.
+DICTATION_CORRECT_TIMEOUT_SEC = 6.0
+
 # Step 3.5 adaptive constants. Total silence-to-commit per mode
 # (silero base + orchestrator extra). See detect_mode() in halo/turn.py.
 MODE_SILENCE_SEC = {
-    "snappy": 0.8,
-    "thinking": 2.5,
-    "composing": 4.0,
+    "snappy": 0.9,
+    "thinking": 3.2,   # was 2.5 — gave thinkers too little room, cut them mid-sentence
+    "composing": 4.5,  # was 4.0
 }
 HOLD_SUPPRESS_SEC = 10.0
 BACKCHANNEL_AFTER_SEC = 3.0

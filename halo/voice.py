@@ -18,9 +18,14 @@ asterisks, backticks, and em-dashes turn into garbage audio.
 
 from __future__ import annotations
 
+import json
+import os
 import random
 import re
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -29,6 +34,7 @@ import sounddevice as sd
 
 from halo import bus
 from halo.config import MODELS_DIR
+from halo.userconfig import cfg as user_cfg
 
 # af_heart is the only A/A graded voice in the Kokoro lineup
 # (per hexgrad/Kokoro-82M/VOICES.md). Natural-sounding, conversational,
@@ -42,6 +48,7 @@ _MODEL_PATH = MODELS_DIR / "kokoro-v1.0.fp16.onnx"
 _VOICES_PATH = MODELS_DIR / "voices-v1.0.bin"
 
 _kokoro = None
+_cloud_voice_ready = False
 _load_lock = threading.Lock()
 _playback_lock = threading.Lock()
 
@@ -51,6 +58,11 @@ _playback_lock = threading.Lock()
 # for replying to a question).
 _active_say_count = 0
 _active_count_lock = threading.Lock()
+# After playback ends there's still an acoustic tail in the room + mic/OS
+# buffering. Keep is_speaking() True for a short grace window so the recorder
+# doesn't transcribe the tail of Halo's own voice (self-dispatch loop).
+_SPEAKING_TAIL_SEC = 0.35
+_speaking_until = 0.0
 
 
 def _begin_speaking() -> None:
@@ -60,15 +72,19 @@ def _begin_speaking() -> None:
 
 
 def _end_speaking() -> None:
-    global _active_say_count
+    global _active_say_count, _speaking_until
+    import time as _time
     with _active_count_lock:
         _active_say_count = max(0, _active_say_count - 1)
+        if _active_say_count == 0:
+            _speaking_until = _time.monotonic() + _SPEAKING_TAIL_SEC
 
 
 def is_speaking() -> bool:
-    """True while at least one say() call is mid-synthesis or playback."""
+    """True while a say() is mid-flight OR within the post-playback tail."""
+    import time as _time
     with _active_count_lock:
-        return _active_say_count > 0
+        return _active_say_count > 0 or _time.monotonic() < _speaking_until
 
 
 def wait_until_silent(timeout: float = 15.0, poll_interval: float = 0.05) -> bool:
@@ -100,9 +116,35 @@ WORKING_PHRASES = (
 
 
 def preload_voice() -> None:
-    """Load Kokoro ONNX once. Cheap to call from startup."""
-    global _kokoro
+    """Prepare the selected TTS provider once. Cheap to call from startup."""
+    global _cloud_voice_ready, _kokoro
     with _load_lock:
+        provider = (user_cfg.voice.provider or "kokoro").strip().lower()
+        if provider == "elevenlabs":
+            key = os.environ.get(user_cfg.voice.elevenlabs_api_key_env, "").strip()
+            voice_id = (user_cfg.voice.elevenlabs_voice_id or "").strip()
+            if not key:
+                print(
+                    "  ElevenLabs API key missing -- voice disabled "
+                    f"({user_cfg.voice.elevenlabs_api_key_env})."
+                )
+                _cloud_voice_ready = False
+                return
+            if not voice_id:
+                print("  ElevenLabs voice id missing -- voice disabled.")
+                _cloud_voice_ready = False
+                return
+            _cloud_voice_ready = True
+            print(
+                "loading ElevenLabs TTS "
+                f"({user_cfg.voice.elevenlabs_model_id}, "
+                f"{user_cfg.voice.elevenlabs_output_format})..."
+            )
+            print("  ElevenLabs configured.")
+            return
+        if provider != "kokoro":
+            print(f"  unknown voice provider {provider!r} -- voice disabled.")
+            return
         if _kokoro is not None:
             return
         if not _MODEL_PATH.exists() or not _VOICES_PATH.exists():
@@ -121,6 +163,9 @@ def preload_voice() -> None:
 
 
 def is_available() -> bool:
+    provider = (user_cfg.voice.provider or "kokoro").strip().lower()
+    if provider == "elevenlabs":
+        return _cloud_voice_ready
     return _kokoro is not None
 
 
@@ -187,12 +232,29 @@ def say(
     thread so the wake-listen loop can resume immediately. Pass
     blocking=True if the caller needs to wait (e.g. shutdown).
     """
-    if _kokoro is None:
-        return  # voice disabled
+    provider = (user_cfg.voice.provider or "kokoro").strip().lower()
+    if provider == "kokoro" and _kokoro is None:
+        return
+    if provider == "elevenlabs" and not _cloud_voice_ready:
+        return
+    if provider not in {"kokoro", "elevenlabs"}:
+        return
     spoken = _clean_for_speech(text)
     if not spoken:
         return
     bus.emit("tts.spoke", text=spoken, who="Halo")
+    # Speaking.start drives the Output spectrogram + the central
+    # "Speaking" ring on the dashboard. Duration is estimated from
+    # word count (~3 wps for natural prosody); the worker thread emits
+    # speaking.end when playback actually finishes.
+    word_count = max(1, len(spoken.split()))
+    bus.emit(
+        "speaking.start",
+        text=spoken,
+        who="Halo",
+        words=word_count,
+        est_ms=int(word_count * 350),
+    )
 
     # Mark "speaking" synchronously (before the worker thread starts)
     # so is_speaking() is reliable for callers that check immediately
@@ -200,10 +262,15 @@ def say(
     _begin_speaking()
 
     def _do_synth_and_play() -> None:
+        import time as _time
+        t0 = _time.monotonic()
         try:
-            samples, sample_rate = _kokoro.create(
-                spoken, voice=voice, speed=speed, lang="en-us"
-            )
+            if provider == "elevenlabs":
+                samples, sample_rate = _synth_elevenlabs(spoken)
+            else:
+                samples, sample_rate = _kokoro.create(
+                    spoken, voice=voice, speed=speed, lang="en-us"
+                )
             if samples.dtype != np.float32:
                 samples = samples.astype(np.float32)
             with _playback_lock:
@@ -213,11 +280,68 @@ def say(
             print(f"  voice synth/playback error: {exc}")
         finally:
             _end_speaking()
+            bus.emit(
+                "speaking.end",
+                who="Halo",
+                ms=int((_time.monotonic() - t0) * 1000),
+            )
 
     if blocking:
         _do_synth_and_play()
     else:
         threading.Thread(target=_do_synth_and_play, daemon=True).start()
+
+
+def _synth_elevenlabs(text: str) -> tuple[np.ndarray, int]:
+    output_format = (user_cfg.voice.elevenlabs_output_format or "pcm_24000").strip()
+    sample_rate = _sample_rate_from_output_format(output_format)
+    if not output_format.startswith("pcm_"):
+        raise RuntimeError(
+            "ElevenLabs output_format must be PCM for direct playback "
+            f"(got {output_format!r})."
+        )
+    api_key = os.environ.get(user_cfg.voice.elevenlabs_api_key_env, "").strip()
+    voice_id = (user_cfg.voice.elevenlabs_voice_id or "").strip()
+    if not api_key or not voice_id:
+        raise RuntimeError("ElevenLabs API key or voice id missing")
+
+    query = urllib.parse.urlencode({"output_format": output_format})
+    url = (
+        "https://api.elevenlabs.io/v1/text-to-speech/"
+        f"{urllib.parse.quote(voice_id)}/stream?{query}"
+    )
+    body = {
+        "text": text,
+        "model_id": user_cfg.voice.elevenlabs_model_id,
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "xi-api-key": api_key,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            req, timeout=float(user_cfg.voice.elevenlabs_timeout_sec)
+        ) as response:
+            audio = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:200]
+        raise RuntimeError(f"ElevenLabs HTTP {exc.code}: {detail}") from exc
+    if not audio:
+        raise RuntimeError("ElevenLabs returned empty audio")
+    pcm = np.frombuffer(audio, dtype="<i2")
+    return (pcm.astype(np.float32) / 32768.0), sample_rate
+
+
+def _sample_rate_from_output_format(output_format: str) -> int:
+    match = re.search(r"_(\d{4,5})(?:_|$)", output_format or "")
+    if not match:
+        return 24_000
+    return int(match.group(1))
 
 
 def say_one_of(phrases: tuple[str, ...], **kwargs) -> str:

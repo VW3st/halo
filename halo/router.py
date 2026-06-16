@@ -21,13 +21,29 @@ without us having to write more orchestrator regex.
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import ollama
 
-from halo.config import OLLAMA_HOST, OLLAMA_MODEL
+from halo import bus
+from halo.config import (
+    OLLAMA_HOST,
+    OLLAMA_MODEL,
+    OPENROUTER_API_KEY_ENV,
+    OPENROUTER_APP_NAME,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_CHAT_MODEL,
+    OPENROUTER_MODEL,
+    OPENROUTER_SITE_URL,
+    OPENROUTER_TIMEOUT_SEC,
+    ROUTER_BACKEND,
+)
 
 # Keep the model resident in VRAM as long as the process is alive —
 # 30 min wasn't enough; we saw 11s cold reloads mid-session. 24h
@@ -40,9 +56,19 @@ _KEEP_ALIVE = "24h"
 # decide here the snappier the loop feels.
 
 _TRAILING_INCOMPLETE_RE = re.compile(
-    r"\b(and|but|or|so|because|with|to|for|in|on|at|of|the|a|my|some|"
-    r"um|uh|er|ah|like|well|hmm|actually|okay|right|alright|now)"
-    r"[\s.,!?]*$",
+    r"\b("
+    # conjunctions / prepositions / determiners / fillers — always a fragment
+    r"and|but|or|so|because|with|to|for|in|on|at|of|the|a|an|my|your|this|that|"
+    r"these|those|some|any|um|uh|er|ah|like|well|hmm|actually|okay|right|"
+    r"alright|now|"
+    # "thinking out loud" tails — a person mid-sentence ("what I need to do
+    # is", "I'm going to", "I want to"). These almost never end a finished
+    # command, so extending the turn (one ~2s window) lets the user finish
+    # instead of being cut off and cascading into 'unclear'. Deliberately
+    # excludes imperatives (build/run/do) that DO end real commands.
+    r"is|are|was|were|am|be|need|needs|want|wants|going|gonna|wanna|trying|"
+    r"exactly|really|just|literally|about|regarding|called|named"
+    r")[\s.,!?]*$",
     re.IGNORECASE,
 )
 
@@ -87,7 +113,7 @@ Reply with one word: COMPLETE or INCOMPLETE.
 # Stage 2 — understanding + routing
 # ---------------------------------------------------------------------------
 
-STAGE2_PROMPT = """\
+_STAGE2_PROMPT_OLD = """\
 # IDENTITY
 You are Halo, a voice control orchestrator for AI coding agents. You receive raw transcribed voice commands from a developer and convert them into structured instructions for downstream agents (Claude Code, Codex CLI).
 
@@ -485,6 +511,55 @@ Output:
 }
 """
 
+# Lean Stage-2 prompt. The old ~400-line prompt (kept above as
+# _STAGE2_PROMPT_OLD for reference) was re-prefilled UNCACHED on every call,
+# which on a 1.5B was the dominant cause of the 5-9s latency. This trimmed
+# version + a 4-field schema cuts prefill and constrained-decode dramatically.
+# The session-routing block is appended ONLY when sessions are discovered.
+STAGE2_PROMPT = """You are Halo, a voice router for AI coding agents (Claude Code, Codex CLI). Turn ONE transcribed voice command into a small JSON object. Output JSON only, no prose.
+
+Fix speech-to-text errors: claud/clod/clawed->Claude, codecs->Codex, get hub->GitHub, type script->TypeScript, java script->JavaScript, next js->Next.js, super base->Supabase, post grass->Postgres, o llama->Ollama. Drop filler (um, uh, like, you know). If the transcript OPENS with a stray greeting (hello, hey, hi, okay) from a misheard wake word, IGNORE it and route the real command after it.
+
+Put the lightly-cleaned command in cleaned_text. Do NOT rephrase, expand, summarize, or invent details (files, frameworks, libraries, databases) the user did not say — copy their words.
+
+status: ready (clear, complete, actionable) | unclear (truly ambiguous or missing essential info) | chitchat (greeting / accidental wake / not a command) | cancel (abort)
+intent: code (write/edit/build/debug/run/deploy) | question (ask something) | system (control Halo, or "open <app>", or date/time) | cancel
+agent: claude_code (default for coding) | codex_cli (ONLY if the user names Codex or OpenAI) | none (questions, system, chitchat). NEVER swap the named agent.
+
+Rules: "open <app>" / "launch <x>" / "what time/date is it" => ready, intent=system or question, agent=none (real commands, not chitchat). A normal imperative is "ready", not "unclear". Only use "unclear" when you genuinely can't tell what's wanted.
+
+Examples:
+"um build me a login page" -> {"status":"ready","cleaned_text":"Build me a login page","intent":"code","agent":"claude_code"}
+"ask codex to refactor the auth module" -> {"status":"ready","cleaned_text":"Refactor the auth module","intent":"code","agent":"codex_cli"}
+"hello, open chrome" -> {"status":"ready","cleaned_text":"Open Chrome","intent":"system","agent":"none"}
+"what's the date and time" -> {"status":"ready","cleaned_text":"What's the date and time","intent":"question","agent":"none"}
+"fix the bug" -> {"status":"unclear","cleaned_text":"Fix the bug","intent":"code","agent":"claude_code"}
+"hey how are you" -> {"status":"chitchat","cleaned_text":"How are you","intent":"question","agent":"none"}
+"what is happening my friend" -> {"status":"chitchat","cleaned_text":"What is happening my friend","intent":"question","agent":"none"}
+"i'm working on something amazing" -> {"status":"chitchat","cleaned_text":"I'm working on something amazing","intent":"question","agent":"none"}
+"what do you think about that" -> {"status":"chitchat","cleaned_text":"What do you think about that","intent":"question","agent":"none"}
+"stop" -> {"status":"cancel","cleaned_text":"Stop","intent":"cancel","agent":"none"}
+
+A casual remark, opinion, feeling, or open-ended question that is NOT a tool command and NOT a coding task is "chitchat" — never "unclear". Only use "unclear" for a real command missing essential detail.
+
+If a "# RECENT CONVERSATION" block is present, use it to resolve references ("it", "the other one", "do that again") and fill in obvious context, then route ONLY the USER TRANSCRIPT line. A short fragment that the recent conversation makes clear is "ready", not "unclear".
+"""
+
+# Appended to STAGE2_PROMPT only when discovered sessions exist. Adds the
+# two extra fields target_session + session_action.
+STAGE2_SESSION_BLOCK = """
+# MULTI-SESSION
+Other Claude/Codex sessions are running (listed in the CURRENT CONTEXT block).
+Also set:
+- target_session: a discovered label to dispatch there | "active" (default) | "all" (fan out) | "" (default routing). Resolve noisy labels to the closest discovered label ("the website one" -> "website").
+- session_action: "switch" (change active session; put label in target_session) | "list_sessions" (user asked what's running) | "where_am_i" (user asked which is active) | "" (normal dispatch).
+"in <label>, do X" / "ask the <label> one to Y" -> target_session=<label>, session_action="".
+Examples:
+"switch to website" -> {"status":"ready","cleaned_text":"Switch to website","intent":"system","agent":"none","target_session":"website","session_action":"switch"}
+"what sessions do I have" -> {"status":"ready","cleaned_text":"What sessions do I have","intent":"question","agent":"none","target_session":"","session_action":"list_sessions"}
+"in website add dark mode" -> {"status":"ready","cleaned_text":"Add dark mode","intent":"code","agent":"claude_code","target_session":"website","session_action":""}
+"""
+
 # JSON schema passed to Ollama's `format` parameter so the model is
 # decode-time constrained to valid output — no JSON parsing errors,
 # no missing fields.
@@ -519,6 +594,21 @@ ROUTE_SCHEMA: dict[str, Any] = {
         "confirmation", "clarification",
         "target_session", "session_action",
     ],
+}
+
+# Lean schema for the common single-session case: only the four fields the
+# orchestrator actually needs from the model. Fewer constrained output
+# tokens = markedly faster decode. confirmation/clarification are synthesized
+# locally; session fields default to "".
+ROUTE_SCHEMA_LEAN: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["ready", "unclear", "chitchat", "cancel"]},
+        "cleaned_text": {"type": "string"},
+        "intent": {"type": "string", "enum": ["code", "question", "system", "cancel"]},
+        "agent": {"type": "string", "enum": ["claude_code", "codex_cli", "none"]},
+    },
+    "required": ["status", "cleaned_text", "intent", "agent"],
 }
 
 _FALLBACK_DECISION = {
@@ -590,6 +680,88 @@ def _get_client() -> ollama.Client:
     return _client
 
 
+def _chat_json(
+    *,
+    messages: list[dict[str, str]],
+    schema: dict[str, Any],
+    max_tokens: int,
+    temperature: float = 0.2,
+) -> dict[str, Any]:
+    provider = (ROUTER_BACKEND or "ollama").strip().lower()
+    if provider == "openrouter":
+        return _chat_json_openrouter(
+            messages=messages,
+            schema=schema,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+    if provider != "ollama":
+        raise RuntimeError(f"unknown router provider {provider!r}")
+    response = _get_client().chat(
+        model=OLLAMA_MODEL,
+        messages=messages,
+        format=schema,
+        options={"temperature": temperature, "num_predict": max_tokens},
+        keep_alive=_KEEP_ALIVE,
+    )
+    return json.loads(response["message"]["content"])
+
+
+def _chat_json_openrouter(
+    *,
+    messages: list[dict[str, str]],
+    schema: dict[str, Any],
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
+    api_key = os.environ.get(OPENROUTER_API_KEY_ENV, "").strip()
+    if not api_key:
+        raise RuntimeError(f"OpenRouter API key missing ({OPENROUTER_API_KEY_ENV})")
+    model = (OPENROUTER_MODEL or "").strip()
+    if not model:
+        raise RuntimeError("OpenRouter model missing (HALO_OPENROUTER_MODEL)")
+    base_url = (OPENROUTER_BASE_URL or "https://openrouter.ai/api/v1").rstrip("/")
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "reasoning": {"enabled": False, "exclude": True},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "halo_response",
+                "strict": True,
+                "schema": schema,
+            },
+        },
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if OPENROUTER_SITE_URL:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+    if OPENROUTER_APP_NAME:
+        headers["X-OpenRouter-Title"] = OPENROUTER_APP_NAME
+    req = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=float(OPENROUTER_TIMEOUT_SEC)) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:300]
+        raise RuntimeError(f"OpenRouter HTTP {exc.code}: {detail}") from exc
+    content = payload["choices"][0]["message"]["content"]
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    return json.loads(content)
+
+
 def check_turn_complete(partial_transcript: str) -> bool:
     """Stage 1: pure-rules turn-completion classifier (no LLM).
 
@@ -649,8 +821,12 @@ _WHERE_PATTERN = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+# NOTE: deliberately NO "open" here — "open a browser/calculator/app" is a
+# LOCAL tool action, not a session switch. Including it made "open a browser"
+# (when it reached Stage 2) get mis-synthesized into a switch to a running
+# session instead of opening the app.
 _SWITCH_VERB_PATTERN = re.compile(
-    r"\b(switch|jump|move|go|work on|use|activate|open)\b",
+    r"\b(switch|jump|move|go|work on|use|activate)\b",
     re.IGNORECASE,
 )
 _CODING_VERB_PATTERN = re.compile(
@@ -704,9 +880,38 @@ def _apply_session_action_fallback(decision: dict, has_context: bool) -> None:
             decision["agent"] = "none"
 
 
+def _validate_session_action(decision: dict) -> None:
+    """Clear a session_action the words don't actually support. The small
+    multi-session brain hallucinates switch/list_sessions/where_am_i for
+    ordinary chatter; only honor one when the transcript really asks for it."""
+    action = (decision.get("session_action") or "").strip()
+    if not action:
+        return
+    cleaned = (decision.get("cleaned_text") or "").lower()
+    if action == "list_sessions" and not _LIST_PATTERN.search(cleaned):
+        decision["session_action"] = ""
+        return
+    if action == "where_am_i" and not _WHERE_PATTERN.search(cleaned):
+        decision["session_action"] = ""
+        return
+    if action == "switch":
+        target = (decision.get("target_session") or "").lower().strip()
+        has_verb = _SWITCH_VERB_PATTERN.search(cleaned) is not None
+        named = (
+            target not in ("", "active", "focused", "all")
+            and re.search(rf"\b{re.escape(target)}\b", cleaned) is not None
+        )
+        # A real switch says a switch verb AND names a session (or at least
+        # names the target). "close" / "no why did you do that" do neither.
+        if not (has_verb and (named or re.search(r"\bsession\b", cleaned))):
+            decision["session_action"] = ""
+            decision["target_session"] = ""
+
+
 def understand_and_route(
     full_transcript: str,
     context: Optional[SessionContext] = None,
+    history: str = "",
 ) -> dict:
     """Stage 2: clean + route the full transcript. Returns the schema dict.
 
@@ -716,29 +921,56 @@ def understand_and_route(
     and `session_action`. When None or empty, behaves exactly as v1.1
     (single-session mode).
 
+    `history` (v1.3) — a compact "# RECENT CONVERSATION" block of the last
+    few user/Halo turns. Prepended so the brain can resolve references
+    ("the other one", "do it again") and stop marking context-dependent
+    fragments as unclear. Empty = no history (behaves as before).
+
     On any error, returns a safe `unclear` fallback so callers can keep
     going without exception handling. The fallback also contains the new
     v1.2 fields as empty strings so callers can read them unconditionally.
     """
-    user_payload = full_transcript
+    history = (history or "").strip()
     ctx_block = _format_context_block(context)
+    blocks: list[str] = []
+    if history:
+        blocks.append(history)
     if ctx_block:
-        user_payload = ctx_block + "\n# USER TRANSCRIPT\n" + full_transcript
+        blocks.append(ctx_block)
+    if blocks:
+        blocks.append(
+            "# USER TRANSCRIPT (route THIS line; everything above is context)\n"
+            + full_transcript
+        )
+        user_payload = "\n".join(blocks)
+    else:
+        user_payload = full_transcript
+    if ctx_block:
+        system_prompt = STAGE2_PROMPT + "\n" + STAGE2_SESSION_BLOCK
+        schema = ROUTE_SCHEMA
+    else:
+        # Single-session: lean prompt + 4-field schema = much faster.
+        system_prompt = STAGE2_PROMPT
+        schema = ROUTE_SCHEMA_LEAN
 
+    t0 = time.monotonic()
+    bus.emit("thinking.start", stage="route", text=full_transcript)
     try:
-        response = _get_client().chat(
-            model=OLLAMA_MODEL,
+        decision = _chat_json(
             messages=[
-                {"role": "system", "content": STAGE2_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_payload},
             ],
-            format=ROUTE_SCHEMA,
-            options={"temperature": 0.2},
-            keep_alive=_KEEP_ALIVE,
+            schema=schema,
+            # Full 8-field schema (multi-session) needs more headroom or the
+            # JSON truncates -> parse failure -> dropped turn. Constrained
+            # decode means a higher cap is free when output is short.
+            max_tokens=96 if schema is ROUTE_SCHEMA_LEAN else 220,
+            temperature=0.2,
         )
-        decision = json.loads(response["message"]["content"])
-        # Defensive: older models or rare schema misses might omit the
-        # new fields. Make sure callers always see them as strings.
+        # Lean schema omits these — default them so callers read uniformly.
+        decision.setdefault("confirmation", "")
+        decision.setdefault("clarification", "")
         decision.setdefault("target_session", "")
         decision.setdefault("session_action", "")
         # Post-process: 1.5B brain frequently emits target_session but
@@ -747,8 +979,27 @@ def understand_and_route(
         _apply_session_action_fallback(
             decision, has_context=ctx_block != "",
         )
+        # Anti-hallucination: with several sessions discovered, the small brain
+        # invents session_action=switch/list for things that aren't session
+        # commands ("close" -> switch, "no I told you that" -> list_sessions).
+        # Drop any session_action the actual words don't support.
+        _validate_session_action(decision)
+        bus.emit(
+            "thinking.end",
+            stage="route",
+            ms=int((time.monotonic() - t0) * 1000),
+            status=decision.get("status", "?"),
+            intent=decision.get("intent", "?"),
+            agent=decision.get("agent", "none"),
+        )
         return decision
     except Exception as exc:
+        bus.emit(
+            "thinking.end",
+            stage="route",
+            ms=int((time.monotonic() - t0) * 1000),
+            error=str(exc),
+        )
         return {**_FALLBACK_DECISION, "cleaned_text": full_transcript, "_error": str(exc)}
 
 
@@ -843,16 +1094,22 @@ def summarize_reply(
         REPLY=reply_text[:4000],  # cap input length to bound latency
     )
 
+    t0 = time.monotonic()
+    bus.emit("thinking.start", stage="summarize", chars=len(reply_text))
     try:
-        response = _get_client().chat(
-            model=OLLAMA_MODEL,
+        data = _chat_json(
             messages=[{"role": "user", "content": prompt}],
-            format=_SUMMARIZE_SCHEMA,
-            options={"temperature": 0.2},
-            keep_alive=_KEEP_ALIVE,
+            schema=_SUMMARIZE_SCHEMA,
+            max_tokens=96,
+            temperature=0.2,
         )
-        data = json.loads(response["message"]["content"])
         sentence = (data.get("one_sentence") or "").strip()
+        bus.emit(
+            "thinking.end",
+            stage="summarize",
+            ms=int((time.monotonic() - t0) * 1000),
+            chars_out=len(sentence),
+        )
         if not sentence:
             return _head_truncate(reply_text, max_chars)
         # Cap output length even if brain ignored the word limit.
@@ -862,6 +1119,12 @@ def summarize_reply(
     except Exception as exc:
         # Brain unreachable / errored — head-truncate so the user still
         # hears something instead of dead silence.
+        bus.emit(
+            "thinking.end",
+            stage="summarize",
+            ms=int((time.monotonic() - t0) * 1000),
+            error=str(exc),
+        )
         print(f"  [summarize] brain unreachable ({exc}) — head-truncating")
         return _head_truncate(reply_text, max_chars)
 
@@ -878,3 +1141,327 @@ def _head_truncate(text: str, max_chars: int) -> str:
         if idx > max_chars * 0.4:
             return head[: idx + 1].strip()
     return head.rstrip() + "..."
+
+
+_CORRECT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"corrected": {"type": "string"}},
+    "required": ["corrected"],
+}
+
+_CORRECT_PROMPT = (
+    "You clean up dictation captured by speech-to-text from a speaker with a "
+    "strong non-native accent, so it often contains misspellings and wrong "
+    "words. Fix spelling, obvious transcription errors, capitalization, and "
+    "punctuation. Do NOT translate, rephrase, summarize, answer, explain, or "
+    "add or remove meaning — return the SAME sentence, only corrected. "
+    'Reply as JSON: {"corrected": "<the corrected text>"}.\n\nText: '
+)
+
+
+_CHAT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"reply": {"type": "string"}},
+    "required": ["reply"],
+}
+
+
+def _chat_persona() -> tuple[str, str]:
+    """(user_name, halo_character) from the live config, best-effort."""
+    try:
+        from halo.userconfig import cfg as _ucfg
+
+        return (
+            (_ucfg.persona.user_name or "").strip(),
+            (_ucfg.persona.halo_character or "").strip(),
+        )
+    except Exception:
+        return "", ""
+
+
+def _now_context() -> str:
+    """Current local time, fed to the chat brain so it can answer time/date
+    questions (including 'what time is it in Brisbane' — it converts from
+    this) instead of guessing."""
+    import datetime
+
+    try:
+        now = datetime.datetime.now().astimezone()
+        tzname = now.tzname() or "local time"
+        return (
+            "(Reference only — do NOT mention the date, time, or timezone "
+            "unless the user explicitly asks for it.) Current local time: "
+            f"{now.strftime('%A, %B %d, %Y, %I:%M %p')} {tzname}. "
+            "Convert from this for other timezones only if asked. "
+        )
+    except Exception:
+        return ""
+
+
+def _chat_base_prompt(history: str = "") -> tuple[str, str]:
+    """Shared chat system prompt (persona + current time + recent history),
+    WITHOUT any output-format instruction. Returns (system_prompt, user_name)."""
+    name, character = _chat_persona()
+    persona = character or "a friendly, quick-witted voice assistant"
+    system = (
+        f"You are Halo, {persona}, having a casual SPOKEN conversation. Reply "
+        "with ONE short, natural sentence (8 to 16 words) — like a quick-witted "
+        "friend would say it out loud.\n\n"
+        "CRITICAL: Respond directly. NEVER restate, echo, paraphrase, or "
+        "analyze what the user said. Banned openings: \"you're asking...\", "
+        "\"you're confirming...\", \"you want to know...\", \"it seems you...\", "
+        "\"that's a...\". Just answer or react, the way a person would.\n\n"
+        "If it's small talk, banter back. If it's a real question, answer it. "
+        "If you truly can't tell what they mean, say so in a few words and ask "
+        "what they need. Do not offer to write code unless asked; if they want "
+        'a coding task, say they can ask "Claude". If asked about earlier '
+        "conversation not shown below, say you don't recall exactly — never "
+        "invent it. No markdown, lists, emojis, or code.\n\n"
+        "Examples (style only):\n"
+        "User: what's happening today -> Not much, just keeping things humming — what's on your plate?\n"
+        "User: is that a question or a statement -> Ha, you tell me! What's on your mind?\n"
+        "User: yep -> Cool. What's next?\n"
+        "User: what are they doing -> Not sure who you mean — which one are you asking about?\n"
+    )
+    system += _now_context()
+    if name:
+        system += f"The user's name is {name}; use it occasionally, only when natural. "
+    history = (history or "").strip()
+    if history:
+        system += (
+            "\n\n# RECENT CONVERSATION (context only — reply to the latest user line)\n"
+            + history
+            + "\n"
+        )
+    return system, name
+
+
+def chat_reply(text: str, history: str = "") -> str:
+    """Hold an actual conversation — the spoken reply for chit-chat and
+    casual questions that aren't a tool command or a coding task.
+
+    Non-streaming variant (returns the whole reply). See `chat_reply_stream`
+    for the low-latency sentence-by-sentence path used by the voice loop.
+
+    FAIL-OPEN: returns "" on any model error so the caller can fall back
+    to a short canned line — a dead turn is worse than a generic reply.
+    """
+    msg = (text or "").strip()
+    if not msg:
+        return ""
+    system, _name = _chat_base_prompt(history)
+    system += '\nReply as JSON: {"reply": "<your spoken reply>"}.'
+
+    t0 = time.monotonic()
+    bus.emit("thinking.start", stage="chat", chars=len(msg))
+    try:
+        data = _chat_json(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": msg},
+            ],
+            schema=_CHAT_SCHEMA,
+            max_tokens=60,
+            temperature=0.6,
+        )
+        reply = (data.get("reply") or "").strip()
+        bus.emit(
+            "thinking.end",
+            stage="chat",
+            ms=int((time.monotonic() - t0) * 1000),
+            chars_out=len(reply),
+        )
+        return reply
+    except Exception as exc:
+        bus.emit(
+            "thinking.end",
+            stage="chat",
+            ms=int((time.monotonic() - t0) * 1000),
+            error=str(exc),
+        )
+        print(f"  [chat] brain unreachable ({exc}) — using canned reply")
+        return ""
+
+
+# Streaming sentence splitter. A terminator preceded by an abbreviation
+# ("E." in "E. Australia", "Mr.", "e.g.") is NOT a real sentence end — emitting
+# there spoke fragments like "...here in E." Skip those and wait for the next
+# real boundary.
+_TERMINATOR_RE = re.compile(r"[.!?…]+(?=\s|$)")
+_ABBREV_BEFORE_RE = re.compile(
+    r"(?:\b[A-Za-z]|\b(?:mr|mrs|ms|dr|st|vs|etc|e\.g|i\.e|a\.m|p\.m|no|fig))$",
+    re.IGNORECASE,
+)
+
+
+def _flush_sentences(buffer: str, on_sentence) -> str:
+    """Emit complete sentences from `buffer` via on_sentence; return the
+    remainder (an incomplete trailing sentence still being generated)."""
+    if on_sentence is None:
+        return buffer
+    emitted_to = 0
+    for m in _TERMINATOR_RE.finditer(buffer):
+        before = buffer[:m.start()]
+        if _ABBREV_BEFORE_RE.search(before):
+            continue  # abbreviation (E., Mr., e.g.) — not a sentence end
+        sentence = buffer[emitted_to:m.end()].strip()
+        if sentence:
+            on_sentence(sentence)
+        emitted_to = m.end()
+    return buffer[emitted_to:]
+
+
+def chat_reply_stream(text: str, history: str = "", on_sentence=None) -> str:
+    """Streaming chat reply: the model streams tokens and `on_sentence` is
+    called with each complete sentence as it finishes — so the voice loop can
+    start SPEAKING the first sentence ~0.4 s in instead of waiting ~1.3 s for
+    the whole reply. Returns the full reply text.
+
+    FAIL-OPEN: on any streaming error, falls back to the non-streaming
+    `chat_reply` and emits the whole thing through on_sentence once.
+    """
+    msg = (text or "").strip()
+    if not msg:
+        return ""
+    system, _name = _chat_base_prompt(history)
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": msg},
+    ]
+    provider = (ROUTER_BACKEND or "ollama").strip().lower()
+    t0 = time.monotonic()
+    bus.emit("thinking.start", stage="chat", chars=len(msg))
+    try:
+        if provider == "openrouter":
+            full = _chat_stream_openrouter(messages, on_sentence)
+        else:
+            full = _chat_stream_ollama(messages, on_sentence)
+        bus.emit(
+            "thinking.end",
+            stage="chat",
+            ms=int((time.monotonic() - t0) * 1000),
+            chars_out=len(full),
+        )
+        return full
+    except Exception as exc:
+        bus.emit(
+            "thinking.end", stage="chat",
+            ms=int((time.monotonic() - t0) * 1000), error=str(exc),
+        )
+        print(f"  [chat stream] failed ({exc}) — falling back to non-streaming")
+        full = chat_reply(text, history=history)
+        if full and on_sentence:
+            on_sentence(full)
+        return full
+
+
+def _chat_stream_ollama(messages: list[dict[str, str]], on_sentence) -> str:
+    parts: list[str] = []
+    buf = ""
+    stream = _get_client().chat(
+        model=OLLAMA_MODEL,
+        messages=messages,
+        options={"temperature": 0.6, "num_predict": 60},
+        keep_alive=_KEEP_ALIVE,
+        stream=True,
+    )
+    for chunk in stream:
+        delta = (chunk.get("message") or {}).get("content") or ""
+        if not delta:
+            continue
+        parts.append(delta)
+        buf += delta
+        buf = _flush_sentences(buf, on_sentence)
+    tail = buf.strip()
+    if tail and on_sentence:
+        on_sentence(tail)
+    return "".join(parts).strip()
+
+
+def _chat_stream_openrouter(messages: list[dict[str, str]], on_sentence) -> str:
+    api_key = os.environ.get(OPENROUTER_API_KEY_ENV, "").strip()
+    if not api_key:
+        raise RuntimeError(f"OpenRouter API key missing ({OPENROUTER_API_KEY_ENV})")
+    # Use the dedicated chat model when configured (smarter conversation),
+    # falling back to the routing model.
+    model = (OPENROUTER_CHAT_MODEL or OPENROUTER_MODEL or "").strip()
+    if not model:
+        raise RuntimeError("OpenRouter model missing (HALO_OPENROUTER_MODEL)")
+    base_url = (OPENROUTER_BASE_URL or "https://openrouter.ai/api/v1").rstrip("/")
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.6,
+        "max_tokens": 60,
+        "stream": True,
+        "reasoning": {"enabled": False, "exclude": True},
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+    if OPENROUTER_SITE_URL:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+    if OPENROUTER_APP_NAME:
+        headers["X-OpenRouter-Title"] = OPENROUTER_APP_NAME
+    req = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    parts: list[str] = []
+    buf = ""
+    with urllib.request.urlopen(req, timeout=float(OPENROUTER_TIMEOUT_SEC)) as r:
+        for raw in r:
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if not line or not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                obj = json.loads(payload)
+                delta = obj["choices"][0].get("delta", {}).get("content") or ""
+            except (ValueError, KeyError, IndexError):
+                continue
+            if not delta:
+                continue
+            parts.append(delta)
+            buf += delta
+            buf = _flush_sentences(buf, on_sentence)
+    tail = buf.strip()
+    if tail and on_sentence:
+        on_sentence(tail)
+    return "".join(parts).strip()
+
+
+def correct_text(text: str) -> str:
+    """Fix STT spelling/transcription slips in a dictated chunk.
+
+    Best-effort and FAIL-OPEN: returns the input unchanged on any model
+    error, an empty result, or an implausibly different output (a guard
+    against the model rewriting instead of correcting). The caller is
+    responsible for any wall-clock timeout — keep dictation responsive.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return text
+    try:
+        data = _chat_json(
+            messages=[{"role": "user", "content": _CORRECT_PROMPT + raw}],
+            schema=_CORRECT_SCHEMA,
+            max_tokens=max(48, min(400, len(raw))),
+            temperature=0.0,
+        )
+        out = (data.get("corrected") or "").strip()
+    except Exception as exc:
+        print(f"  [dictation correct] model unreachable ({exc}) — using raw")
+        return raw
+    if not out:
+        return raw
+    # Reject editorializing: a correction shouldn't balloon the length.
+    if len(out) > max(40, int(len(raw) * 2.5)):
+        return raw
+    return out

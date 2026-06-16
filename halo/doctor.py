@@ -15,10 +15,12 @@ import shutil
 import sys
 import urllib.error
 import urllib.request
+import os
 from typing import Callable
 
 from halo.agents import AGENTS, check_availability
 from halo.config import MODELS_DIR, OLLAMA_HOST, OLLAMA_MODEL
+from halo.userconfig import cfg
 
 OK = "[ok]   "
 WARN = "[warn] "
@@ -88,6 +90,24 @@ def _check_kokoro() -> tuple[bool, str, str]:
     )
 
 
+def _check_openrouter() -> tuple[bool, str, str]:
+    key_env = cfg.router.openrouter_api_key_env
+    if not os.environ.get(key_env):
+        return False, FAIL, f"OpenRouter key missing. Set {key_env} in .env."
+    if not cfg.router.openrouter_model:
+        return False, FAIL, "OpenRouter model missing. Set HALO_OPENROUTER_MODEL in .env."
+    return True, OK, f"OpenRouter configured with model '{cfg.router.openrouter_model}'"
+
+
+def _check_elevenlabs() -> tuple[bool, str, str]:
+    key_env = cfg.voice.elevenlabs_api_key_env
+    if not os.environ.get(key_env):
+        return False, WARN, f"ElevenLabs key missing. Set {key_env} in .env."
+    if not cfg.voice.elevenlabs_voice_id:
+        return False, WARN, "ElevenLabs voice id missing. Set HALO_ELEVENLABS_VOICE_ID in .env."
+    return True, OK, f"ElevenLabs configured with voice '{cfg.voice.elevenlabs_voice_id}'"
+
+
 def _check_optional_binaries() -> list[tuple[bool, str, str]]:
     """Nice-to-haves that don't block Halo from starting but enable
     specific features (Node for installing claude/codex via npm)."""
@@ -105,11 +125,11 @@ def run() -> int:
     print("halo doctor — checking dependencies")
     print("=" * 50)
 
-    checks: list[Callable[[], object]] = [
-        ("Python",  _check_python),
-        ("Ollama",  _check_ollama),
-        ("Kokoro",  _check_kokoro),
-    ]
+    checks: list[tuple[str, Callable[[], object]]] = [("Python", _check_python)]
+    router_provider = (cfg.router.provider or "ollama").strip().lower()
+    voice_provider = (cfg.voice.provider or "kokoro").strip().lower()
+    checks.append(("OpenRouter", _check_openrouter) if router_provider == "openrouter" else ("Ollama", _check_ollama))
+    checks.append(("ElevenLabs", _check_elevenlabs) if voice_provider == "elevenlabs" else ("Kokoro", _check_kokoro))
 
     any_fail = False
 

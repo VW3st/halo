@@ -13,6 +13,7 @@ isn't on disk (so a fresh checkout without the model still boots).
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 
@@ -23,42 +24,40 @@ from openwakeword.model import Model
 
 from halo import bus
 from halo.config import MODELS_DIR, SAMPLE_RATE
+from halo.userconfig import cfg as _user_cfg
 
-# Preferred wake: our custom `halo.onnx`. If not on disk (fresh clone,
-# user hasn't downloaded models), fall back to the openWakeWord builtin.
-WAKE_WORD = "halo"
+# Wake word + all sensitivity knobs come from [wake] config (env / TOML) so
+# they can be tuned per-machine WITHOUT editing source. Defaults live in
+# halo/userconfig.py WakeConfig. Lower threshold / vad_gate = more sensitive
+# (fires more easily; more false positives). Preferred wake model is the
+# custom `<word>.onnx`; if it's not on disk we fall back to a builtin.
+WAKE_WORD = (_user_cfg.wake.word or "halo").strip() or "halo"
 WAKE_WORD_FALLBACK = "hey_jarvis"
 _WAKE_MODEL_PATH = MODELS_DIR / f"{WAKE_WORD}.onnx"
 
-# Single-word "halo" collides acoustically with hello / hollow / hallow /
-# Hawaii, so we pre-trained on confusables and bump the activation
-# threshold above the openWakeWord default (0.5) to filter the rest.
-# Tune in this range:
-#   0.55  more sensitive   — more false positives, fewer missed wakes
-#   0.65  balanced
-#   0.75  conservative default — what shipped after live testing showed
-#                                room-noise false fires at 0.65 (Blue
-#                                Snowball + no hardware noise suppression
-#                                + reverberant room). Raise to 0.80+ if
-#                                still false-firing on quiet utterances.
-THRESHOLD = 0.75
+# Activation threshold (0..1): the wake DNN must score at least this.
+THRESHOLD = float(_user_cfg.wake.threshold)
+# Sustained-activation debounce (see listen_for_wake). A wake fires when the
+# score stays >= THRESHOLD for WAKE_MIN_CONSEC consecutive 80 ms frames.
+#   1 = fire on a single qualifying frame — needed for mics/voices whose
+#       "halo" peaks for just one frame (e.g. a Blue Snowball topping out
+#       ~0.52). Safe when the mic's noise floor stays well under THRESHOLD.
+#   2 = require ~160 ms of sustained activation — use on a hotter mic where a
+#       lone transient frame false-fires (e.g. a BRIO spiking to 0.70 on
+#       random speech).
+# There is deliberately NO separate "strong peak" gate any more: that bar was
+# derived from one mic's levels and silently broke quieter mics. Tune the pair
+# THRESHOLD + min_consecutive to the mic instead (see `halo` config).
+WAKE_MIN_CONSEC = max(1, int(_user_cfg.wake.min_consecutive))
 
-# silero-VAD gate on top of the wake model. openWakeWord supports an
-# auxiliary VAD check that requires the silero model to ALSO score
-# above this value before a wake counts. The wake DNN occasionally
-# finds "halo"-shaped patterns in pure room noise; gating on silero
-# means the fire only counts when there's also actual human speech.
-# Dropped false-positive rate to ~zero in our testing. Set to 0.0 to
-# disable the gate entirely. Documented in the openWakeWord README
-# under "Voice Activity Detection (VAD)".
-#
-# 0.5 turned out too permissive — silero rates a lot of room noise
-# (fans, HVAC, distant typing) above 0.5 because it's looking for
-# any human-vocal-ish energy. 0.7 means "I'm pretty sure this is
-# speech". 0.85+ is "definitely speech, miss soft whispers".
-WAKE_VAD_THRESHOLD = 0.7
+# silero-VAD gate baked into openWakeWord: silero must ALSO score above this
+# before a wake counts (filters wake-DNN hallucinations on room noise). Too
+# high and a quiet mic's real speech is suppressed and the wake never fires
+# — the usual cause of "I say halo and nothing happens". Lower it (or 0.0 to
+# disable) if wakes are MISSED; raise it if room noise false-fires.
+WAKE_VAD_THRESHOLD = float(_user_cfg.wake.vad_gate)
 CHUNK_SIZE = 1280  # 80 ms at 16 kHz — openWakeWord's expected frame size
-COOLDOWN_SEC = 2.0
+COOLDOWN_SEC = float(_user_cfg.wake.cooldown_sec)
 
 _model: Model | None = None
 _active_wake_key: str = WAKE_WORD  # mutated by _get_model if we fall back
@@ -66,8 +65,8 @@ _active_wake_key: str = WAKE_WORD  # mutated by _get_model if we fall back
 # Print a one-line score update whenever we hear *something* that
 # resembles the wake word but doesn't cross THRESHOLD. Helps you tell
 # "mic is dead" from "mic works but my pronunciation isn't matching".
-LIVE_SCORE_FLOOR = 0.05
-LIVE_SCORE_INTERVAL = 0.5
+LIVE_SCORE_FLOOR = 0.03
+LIVE_SCORE_INTERVAL = 0.3
 
 # Last ~PRE_WAKE_BUFFER_SEC of mic audio is kept around so the turn
 # orchestrator can seed Moonshine with whatever the user said in the
@@ -123,8 +122,10 @@ def _describe_input_device() -> str:
         return f"<unknown: {exc}>"
 
 
-def listen_for_wake() -> None:
-    """Block until the wake word is detected.
+def listen_for_wake() -> float:
+    """Block until the wake word is detected. Returns the DNN score at the
+    moment it fired (used by the caller's STT verification as a confidence
+    prior — a strong fire is trusted more readily).
 
     While waiting, keeps the last ~PRE_WAKE_BUFFER_SEC of audio in a
     ring buffer so callers can recover whatever the user said in the
@@ -135,6 +136,9 @@ def listen_for_wake() -> None:
     detected = threading.Event()
     last_detection = 0.0
     last_score_print = 0.0
+    consec = 0     # consecutive frames at/above THRESHOLD (sustain counter)
+    run_peak = 0.0  # peak score within the current consecutive run
+    fired_score = [0.0]  # mutable holder so the consumer can hand back the score
 
     ring_capacity = int(SAMPLE_RATE * PRE_WAKE_BUFFER_SEC)
     ring = np.zeros(ring_capacity, dtype=np.int16)
@@ -142,20 +146,23 @@ def listen_for_wake() -> None:
     ring_filled = False
     ring_lock = threading.Lock()
 
+    # Realtime callback only writes the ring + enqueues the chunk. The wake
+    # DNN (model.predict, which also runs silero VAD) is far too heavy for
+    # the audio thread — running it inline overran the block budget and
+    # caused PortAudio "input overflow" that dropped frames and degraded
+    # wake scoring. It now runs on the consumer thread below.
+    pred_q: queue.Queue = queue.Queue(maxsize=256)
+    stop = threading.Event()
+
     def callback(indata: np.ndarray, frames: int, time_info, status) -> None:
-        # `global` must be inside this nested function — putting it on
-        # listen_for_wake only would make this assignment local and
-        # silently throw away the captured audio.
-        global _pre_wake_audio, _last_audio_status_print
-        nonlocal last_detection, last_score_print, ring_pos, ring_filled
+        global _last_audio_status_print
+        nonlocal ring_pos, ring_filled
         if status:
             now_t = time.monotonic()
             if now_t - _last_audio_status_print > _AUDIO_STATUS_THROTTLE_SEC:
                 _last_audio_status_print = now_t
                 print(f"audio status: {status}")
-        chunk = indata[:, 0]
-
-        # Write chunk into the ring buffer (handles wrap-around).
+        chunk = indata[:, 0].copy()
         n = len(chunk)
         with ring_lock:
             if n >= ring_capacity:
@@ -173,45 +180,87 @@ def listen_for_wake() -> None:
                 if end >= ring_capacity:
                     ring_filled = True
                 ring_pos = end % ring_capacity
-
-        scores = model.predict(chunk)
-        score = float(scores.get(_active_wake_key, 0.0))
-        now = time.monotonic()
-        if score >= LIVE_SCORE_FLOOR and now - last_score_print > LIVE_SCORE_INTERVAL:
-            last_score_print = now
-            print(f"  heard something (score={score:.2f})")
-            bus.emit("wake.heard", score=score)
-        if score >= THRESHOLD and now - last_detection > COOLDOWN_SEC:
-            last_detection = now
-            # Always print the score that actually fired wake — overrides
-            # the rate-limited "heard something" line above so the user
-            # sees what crossed threshold and can tune accordingly.
-            print(f"  wake fired (score={score:.2f}, threshold={THRESHOLD})")
-            bus.emit("wake.fired", score=score, threshold=THRESHOLD)
-            # Snapshot the ring buffer in chronological order before
-            # we hand control back to the turn orchestrator.
-            with ring_lock:
-                if ring_filled:
-                    snapshot = np.concatenate([ring[ring_pos:], ring[:ring_pos]]).copy()
-                else:
-                    snapshot = ring[:ring_pos].copy()
-            _pre_wake_audio = snapshot
-            detected.set()
-
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="int16",
-        blocksize=CHUNK_SIZE,
-        callback=callback,
-    ):
-        print(f"mic: {_describe_input_device()}")
-        print(f"listening for wake word {_active_wake_key!r} (threshold={THRESHOLD})...")
-        # Poll instead of blocking forever so Ctrl-C propagates on Windows.
-        # Event.wait() without a timeout doesn't let SIGINT through cleanly
-        # when sounddevice has an active callback.
-        while not detected.wait(timeout=0.25):
+        try:
+            pred_q.put_nowait(chunk)
+        except queue.Full:
             pass
+
+    def consumer() -> None:
+        global _pre_wake_audio
+        nonlocal last_detection, last_score_print, consec, run_peak
+        while not stop.is_set():
+            try:
+                chunk = pred_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                break
+            scores = model.predict(chunk)
+            score = float(scores.get(_active_wake_key, 0.0))
+            now = time.monotonic()
+            # Sustain counter: how many consecutive frames have stayed
+            # >= THRESHOLD. Fire on a run of >= WAKE_MIN_CONSEC frames. No
+            # separate peak gate — threshold + min_consecutive are the only
+            # knobs, tuned per mic (a brittle fixed peak silently broke quiet
+            # mics). run_peak is tracked for display only.
+            if score >= THRESHOLD:
+                consec += 1
+                run_peak = max(run_peak, score)
+            else:
+                consec = 0
+                run_peak = 0.0
+            cooled = now - last_detection > COOLDOWN_SEC
+            fired = cooled and consec >= WAKE_MIN_CONSEC
+            # Visibility: show what the wake model hears AND why a near-miss
+            # didn't fire, so threshold / min_consecutive can be tuned by ear.
+            if score >= LIVE_SCORE_FLOOR and now - last_score_print > LIVE_SCORE_INTERVAL:
+                last_score_print = now
+                if fired:
+                    note = ""
+                elif score >= THRESHOLD:
+                    note = (f"  [>= {THRESHOLD:.2f} but not sustained: "
+                            f"frame {consec}/{WAKE_MIN_CONSEC}]")
+                else:
+                    note = f"  [below threshold {THRESHOLD:.2f}]"
+                print(f"  heard {_active_wake_key!r} score={score:.2f}{note}")
+                bus.emit("wake.heard", score=score)
+            if fired:
+                last_detection = now
+                fired_score[0] = score
+                print(f"  wake fired (score={score:.2f}, threshold={THRESHOLD})")
+                bus.emit("wake.fired", score=score, threshold=THRESHOLD)
+                with ring_lock:
+                    if ring_filled:
+                        snapshot = np.concatenate([ring[ring_pos:], ring[:ring_pos]]).copy()
+                    else:
+                        snapshot = ring[:ring_pos].copy()
+                _pre_wake_audio = snapshot
+                detected.set()
+                return
+
+    worker = threading.Thread(target=consumer, daemon=True, name="halo-wake-predict")
+    worker.start()
+    try:
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="int16",
+            blocksize=CHUNK_SIZE,
+            latency="high",
+            callback=callback,
+        ):
+            print(f"mic: {_describe_input_device()}")
+            print(f"listening for wake word {_active_wake_key!r} (threshold={THRESHOLD})...")
+            while not detected.wait(timeout=0.25):
+                pass
+    finally:
+        stop.set()
+        try:
+            pred_q.put_nowait(None)
+        except queue.Full:
+            pass
+        worker.join(timeout=1.0)
+    return fired_score[0]
 
 
 if __name__ == "__main__":

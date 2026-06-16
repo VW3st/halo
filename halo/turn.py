@@ -39,7 +39,13 @@ from halo.config import (
     TURN_MAX_WAIT_FOR_FIRST_SPEECH_SEC,
 )
 from halo import bus
-from halo.record import RecorderState, open_stream, play_backchannel, play_chime
+from halo.record import (
+    RecorderState,
+    SPEECH_RMS_FLOOR,
+    open_stream,
+    play_backchannel,
+    play_chime,
+)
 from halo.router import check_turn_complete, understand_and_route
 from halo.stt import BatchTranscriber
 from halo.tools import is_pure_tool
@@ -61,6 +67,16 @@ TERMINATORS_RE = re.compile(
 HOLD_RE = re.compile(
     r"\b(wait|hold on|hold up|give me (?:a sec|a moment|a minute)|one moment|"
     r"one sec|just a sec|just a moment)\s*[.!?,]*\s*$",
+    re.IGNORECASE,
+)
+
+BARGE_IN_RE = re.compile(
+    r"^\s*(?:"
+    r"stop|stop talking|stop speaking|quiet|be quiet|shut up|"
+    r"wait|hold on|pause|hang on|"
+    r"no|nope|cancel|never mind|nevermind|"
+    r"back to halo|halo stop|halo wait"
+    r")\s*[.!?,]*\s*$",
     re.IGNORECASE,
 )
 
@@ -124,8 +140,81 @@ def _strip_terminator(text: str) -> tuple[str, bool]:
     return text[: match.start()].rstrip(" ,.!?"), True
 
 
+# Dangling words to peel off a transcript the user ABANDONED mid-sentence
+# ("...build a landing page and", "...refactor the"). Deliberately
+# conjunctions / articles / possessives ONLY — NOT prepositions like
+# for/to/in/of, because those legitimately end real questions
+# ("what is it for", "where are you from"). Applied only on the
+# incomplete-commit paths, never to a transcript Stage 1 judged complete.
+_TRAILING_DANGLING_RE = re.compile(
+    r"[\s,]+\b(?:and|or|but|so|then|also|plus|because|the|a|an|my|your)\b"
+    r"[\s,.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_trailing_dangling(text: str) -> str:
+    t = (text or "").rstrip()
+    for _ in range(2):  # "...the landing page and the" -> peel up to two
+        new = _TRAILING_DANGLING_RE.sub("", t).rstrip(" ,.!?")
+        if not new or new == t:
+            break
+        t = new
+    return t or text
+
+
 def _has_hold(text: str) -> bool:
     return bool(HOLD_RE.search(text))
+
+
+def is_barge_in_phrase(text: str) -> bool:
+    """True for the deliberately tiny interrupt vocabulary accepted while
+    Halo is speaking. Keep this strict; during TTS the mic can hear Halo's
+    own output, so arbitrary speech must not be routed here."""
+    return bool(BARGE_IN_RE.match((text or "").strip()))
+
+
+def listen_for_barge_in(timeout: float = 20.0) -> str | None:
+    """Listen for a short interrupt phrase while TTS is active.
+
+    Returns the transcribed interrupt phrase, or None if Halo finishes
+    speaking / timeout elapses without a trusted interrupt. This does NOT
+    route arbitrary user speech; it only accepts `is_barge_in_phrase()`.
+    """
+    from halo.voice import is_speaking as _voice_is_speaking
+
+    transcriber = BatchTranscriber()
+    state = RecorderState(
+        min_silence_ms=300,
+        on_audio=transcriber.feed,
+        suppress_tts_echo=False,
+    )
+    deadline = time.monotonic() + timeout
+    try:
+        with open_stream(state):
+            while _voice_is_speaking() and time.monotonic() < deadline:
+                if not state.wait_for_speech(timeout=0.08):
+                    continue
+                state.clear_speech_event()
+                # Interrupt words are short; if there is no silence quickly,
+                # treat it as non-interrupt audio and keep waiting.
+                if not state.wait_for_silence(timeout=1.2):
+                    state.clear_silence_event()
+                    continue
+                state.clear_silence_event()
+                text = transcriber.transcribe().strip()
+                if not text:
+                    continue
+                cleaned = _strip_wake_prefix(text).rstrip(" .,!?")
+                print(f"  barge-in candidate: {cleaned!r}")
+                if is_barge_in_phrase(cleaned):
+                    return cleaned
+    finally:
+        try:
+            transcriber.stop()
+        except Exception:
+            pass
+    return None
 
 
 def _route(text: str) -> dict:
@@ -197,6 +286,7 @@ def run_turn(
     *,
     skip_routing: bool = False,
     max_wait_first_speech_sec: float | None = None,
+    seed_pre_wake: bool = True,
 ) -> dict | None:
     """Run one wake-triggered turn.
 
@@ -221,11 +311,14 @@ def run_turn(
     )
     transcriber = BatchTranscriber()
 
-    # Seed with the audio we captured just before wake fired so commands
-    # said in the same breath as the wake word aren't lost.
-    pre = get_pre_wake_audio()
-    if pre.size > 0:
-        transcriber.seed(pre)
+    # Seed only the first turn after wake with the audio captured just before
+    # wake fired, so "halo open calculator" said in one breath is not lost.
+    # Follow-up turns must not reuse that same buffer or the original wake
+    # utterance gets re-transcribed and re-routed on every loop.
+    if seed_pre_wake:
+        pre = get_pre_wake_audio()
+        if pre.size > 0:
+            transcriber.seed(pre)
 
     # "Polling" mode: orchestrator passes a short first_wait (<3s) when
     # we're just checking for a follow-up between agent-job ticks. We
@@ -259,13 +352,41 @@ def run_turn(
         }
 
     try:
-        with open_stream(state):
+        # Ensure Halo has finished speaking BEFORE the mic opens, so the
+        # chime / "I'm here" / a prior reply isn't captured and the
+        # first-speech clock starts when the user can actually talk. (Only
+        # for real turns; polling follow-ups must stay snappy.)
+        if not polling:
+            try:
+                from halo.voice import wait_until_silent as _wait_until_silent
+                _wait_until_silent(timeout=20.0)
+            except Exception:
+                pass
+            # Chime before opening the stream so the beep isn't recorded.
             play_chime()
+        with open_stream(state):
             if not polling:
                 print("  [speak now]")
             bus.emit("record.opened")
             if not state.wait_for_speech(first_wait):
                 if not polling:
+                    # VAD can under-score a quiet/AGC-less mic. If the
+                    # transcriber captured words anyway, use them instead of
+                    # dropping the whole turn.
+                    fallback = transcriber.transcribe()
+                    # Only trust the no-VAD fallback if the buffer actually
+                    # had speech-level energy. Otherwise Whisper hallucinated
+                    # words from room tone and we'd dispatch a phantom turn.
+                    peak = transcriber.peak_rms()
+                    if fallback and fallback.strip() and peak >= SPEECH_RMS_FLOOR:
+                        print(f"  [no VAD start, captured anyway] {fallback!r} "
+                              f"(peak rms {peak:.3f})")
+                        cleaned, _ = _strip_terminator(fallback)
+                        return _commit(cleaned or fallback)
+                    if fallback and fallback.strip():
+                        print(f"  [no VAD start] discarded low-energy "
+                              f"{fallback!r} (peak rms {peak:.3f} < "
+                              f"{SPEECH_RMS_FLOOR})")
                     print(f"  no speech detected within {first_wait:.1f}s")
                 return None
             state.clear_speech_event()
@@ -341,7 +462,9 @@ def run_turn(
                 print(f"  stage 1 incomplete -> extending {TURN_EXTENSION_SEC}s")
                 if not _wait_with_backchannel(state, TURN_EXTENSION_SEC, "thinking", deadline):
                     print("  user did not continue -> committing")
-                    return _commit(text)
+                    # Abandoned mid-sentence — peel a dangling conjunction/
+                    # article so we don't route "...build a landing page and".
+                    return _commit(_strip_trailing_dangling(text))
                 state.clear_speech_event()
 
             # Hard-timeout fall-through.
@@ -349,7 +472,7 @@ def run_turn(
             if not final:
                 return None
             cleaned, _ = _strip_terminator(final)
-            return _commit(cleaned or final)
+            return _commit(_strip_trailing_dangling(cleaned or final))
     finally:
         try:
             transcriber.stop()

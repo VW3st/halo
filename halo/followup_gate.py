@@ -54,7 +54,10 @@ _CONTINUATION_MARKERS = {
     # Question/request openers clearly addressed to the agent.
     "what about", "how about", "what if",
     "can you", "could you", "would you", "will you",
-    "please", "let's", "lets",
+    "please",
+    "yes", "yeah", "yep", "correct", "right", "no", "nope",
+    "same", "same again", "do that", "that one", "this one",
+    "the first one", "the second one", "the other one",
 }
 
 # Imperatives that almost always indicate a command to the coding agent.
@@ -79,6 +82,7 @@ _CODING_IMPERATIVES = {
     "switch", "toggle", "enable", "disable", "hide", "reveal",
     "append", "prepend", "insert", "replace", "swap",
     "style", "color", "resize", "shrink", "grow", "expand", "collapse",
+    "move", "align", "center", "tighten", "loosen", "increase", "decrease",
 }
 
 # Technical nouns / code-context vocabulary. The presence of ANY of
@@ -120,6 +124,9 @@ _CODING_NOUNS = {
     "shadow", "shadows", "animation", "animations", "transition",
     "font", "fonts", "size", "spacing",
     "mode",  # "dark mode", "light mode"
+    "it", "that", "this", "one", "top", "bottom", "left", "right",
+    "bigger", "smaller", "larger", "shorter", "taller", "wider",
+    "higher", "lower", "brighter", "darker", "lighter",
     # Backend / data
     "database", "db", "table", "tables", "column", "columns", "row", "rows",
     "query", "queries", "migration", "migrations",
@@ -207,9 +214,17 @@ _AGENT_NAME_PATTERNS: dict[str, re.Pattern[str]] = {}
 
 
 def _build_agent_patterns() -> None:
-    """Compile a whole-word regex for every agent's trigger list."""
+    """Compile a whole-word regex for every agent's CANONICAL name triggers.
+
+    Deliberately uses voice_triggers ONLY — NOT fuzzy_triggers. Fuzzy triggers
+    are STT-mishearing recoveries (e.g. "cloud", "claus" for "Claude") meant
+    for the explicit vocative/verbal dispatch regexes where a comma or verb
+    already disambiguates. Using them here made ordinary side-talk ("moved it
+    to the cloud", "iCloud") read as "addressed to the agent" and leak into the
+    live session — the exact thing this gate exists to prevent.
+    """
     for key, cfg in AGENTS.items():
-        triggers = tuple(cfg.voice_triggers) + tuple(cfg.fuzzy_triggers)
+        triggers = tuple(cfg.voice_triggers)
         if not triggers:
             continue
         # Escape each trigger and join with | inside a (?: ... ) group.

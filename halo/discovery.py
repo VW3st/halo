@@ -28,6 +28,7 @@ Design notes:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -90,6 +91,13 @@ _AGENT_FINGERPRINTS: dict[str, tuple[str, ...]] = {
 #   - Electron child processes (renderer / gpu-process / utility)
 _HALO_SPAWNED_MARKERS: tuple[str, ...] = (
     "--input-format",       # only Halo's persistent Claude uses this
+    # Halo's one-shot Claude fallback (first_call / continue_call). Neither
+    # flag is something an interactive user types — they're automation/SDK
+    # flags Halo uses to stream and parse the reply. Without these, a
+    # fallback spawn self-registers as a discoverable session and Halo can
+    # try to dispatch to its own child (audit finding).
+    "--include-partial-messages",
+    "--output-format stream-json",
     "codex exec",            # only Halo's one-shot Codex
     "/WindowsApps/Claude_",   # Claude desktop app (Electron)
     "/WindowsApps/Codex_",    # Codex desktop app (if installed)
@@ -98,6 +106,11 @@ _HALO_SPAWNED_MARKERS: tuple[str, ...] = (
     "--type=gpu-process",    # Electron GPU child
     "--type=utility",        # Electron utility child
     "--type=crashpad-handler",
+    # Claude Code's INTERNAL persistent bash shell (one per session) sources
+    # a snapshot under ~/.claude/shell-snapshots. It is a child of a real
+    # claude session, NOT a session itself — counting it double-reports.
+    "shell-snapshots",
+    "shell-snapshot",
 )
 
 # Shell / terminal process names — used to walk back from an agent
@@ -149,6 +162,34 @@ def is_available() -> bool:
     return psutil is not None
 
 
+# Set HALO_DISCOVERY_DEBUG=1 to print every node/claude/codex-ish process the
+# scanner sees and why it was kept or skipped — the way to debug "found 0".
+_DISCOVERY_DEBUG = bool(os.environ.get("HALO_DISCOVERY_DEBUG"))
+
+
+def _classify_by_name(name: Optional[str]) -> Optional[str]:
+    """Fallback classification by executable name alone. Catches the
+    standalone `claude.exe` / `codex.exe` even when psutil can't read the
+    process cmdline (AccessDenied across integrity levels on Windows)."""
+    n = (name or "").lower()
+    if n in ("claude.exe", "claude"):
+        return "claude_code"
+    if n in ("codex.exe", "codex"):
+        return "codex_cli"
+    return None
+
+
+def _is_excluded_cmdline(cmdline_parts: Iterable[str]) -> bool:
+    """True if the cmdline is a Halo-spawned process or a desktop app —
+    something we must NOT report as a discoverable session. Used both by
+    `_classify_cmdline` and (critically) by the scan loop so the
+    executable-name fallback can't resurrect a process the cmdline
+    explicitly disqualified (e.g. a WinGet `claude.exe` Halo spawned with
+    `--output-format stream-json`)."""
+    joined = " ".join(cmdline_parts).replace("\\", "/")
+    return any(marker in joined for marker in _HALO_SPAWNED_MARKERS)
+
+
 def _classify_cmdline(cmdline_parts: Iterable[str]) -> Optional[str]:
     """Return the agent_key whose fingerprint matches `cmdline_parts`, or None.
 
@@ -157,15 +198,23 @@ def _classify_cmdline(cmdline_parts: Iterable[str]) -> Optional[str]:
     paths. Halo-spawned processes and desktop-app variants are
     filtered first.
     """
-    joined = " ".join(cmdline_parts).replace("\\", "/")
     # Filter Halo-spawned processes + Electron desktop apps first.
-    for marker in _HALO_SPAWNED_MARKERS:
-        if marker in joined:
-            return None
+    if _is_excluded_cmdline(cmdline_parts):
+        return None
+    joined = " ".join(cmdline_parts).replace("\\", "/")
     for agent_key, fingerprints in _AGENT_FINGERPRINTS.items():
         for fp in fingerprints:
             if fp in joined:
                 return agent_key
+    # Broad fallback for variant install layouts. Require the PACKAGE name
+    # ("claude-code" / "@openai/codex"), not a bare "claude"/"codex" — the
+    # latter false-matches plugin caches like ~/.claude/plugins/... and
+    # project dirs that merely contain the word.
+    low = joined.lower()
+    if "claude-code" in low:
+        return "claude_code"
+    if "@openai/codex" in low or "codex-cli" in low or "codex/cli" in low:
+        return "codex_cli"
     return None
 
 
@@ -228,15 +277,36 @@ def scan_once() -> list[DiscoveredSession]:
         try:
             if self_pid is not None and proc.pid == self_pid:
                 continue
+            name = ""
+            try:
+                name = proc.info.get("name") or ""
+            except Exception:
+                pass
             cmdline = _safe_cmdline(proc)
-            if not cmdline:
-                continue
-            agent_key = _classify_cmdline(cmdline)
+            # Classify by cmdline first (precise), then fall back to the
+            # executable name so a claude.exe whose cmdline is access-denied
+            # is still discovered instead of silently dropped.
+            agent_key = _classify_cmdline(cmdline) if cmdline else None
             if agent_key is None:
+                # Don't let the executable-name fallback resurrect a process
+                # the cmdline explicitly disqualified (Halo's own spawn /
+                # desktop app). Only fall back to name when the cmdline was
+                # unreadable or simply didn't match a positive fingerprint.
+                if cmdline and _is_excluded_cmdline(cmdline):
+                    if _DISCOVERY_DEBUG:
+                        print(f"  [discovery] skip (halo-spawned) pid={proc.pid} "
+                              f"name={name!r}")
+                    continue
+                agent_key = _classify_by_name(name)
+            if agent_key is None:
+                if _DISCOVERY_DEBUG:
+                    low = name.lower()
+                    if "claude" in low or "codex" in low or "node" in low:
+                        cl = "<denied>" if cmdline is None else " ".join(cmdline)[:90]
+                        print(f"  [discovery] skip pid={proc.pid} name={name!r} cmdline={cl}")
                 continue
-            cwd = _safe_cwd(proc)
-            if not cwd:
-                continue
+            if _DISCOVERY_DEBUG:
+                print(f"  [discovery] MATCH pid={proc.pid} name={name!r} -> {agent_key}")
             parent = _safe_parent(proc)
             parent_pid: Optional[int] = None
             parent_name: Optional[str] = None
@@ -246,6 +316,20 @@ def scan_once() -> list[DiscoveredSession]:
                     parent_name = parent.name()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
+            # cwd() raises AccessDenied for many same-user/elevated processes
+            # on Windows. DON'T drop the session for that — it's the #1 reason
+            # discovery reported "0 sessions". Fall back to the parent shell's
+            # cwd, then to an empty cwd with a pid-derived label so the
+            # session is still discoverable and targetable by voice.
+            cwd = _safe_cwd(proc)
+            if not cwd and parent is not None:
+                cwd = _safe_cwd(parent)
+            if cwd:
+                label = _label_for(cwd)
+            else:
+                cwd = ""
+                short = agent_key.split("_")[0]
+                label = f"{short}-{proc.pid}"
             joined = " ".join(cmdline)
             if len(joined) > 200:
                 joined = joined[:197] + "..."
@@ -254,7 +338,7 @@ def scan_once() -> list[DiscoveredSession]:
                     agent_key=agent_key,
                     pid=proc.pid,
                     cwd=cwd,
-                    label=_label_for(cwd),
+                    label=label,
                     parent_pid=parent_pid,
                     parent_name=parent_name,
                     cmdline=joined,
@@ -267,6 +351,46 @@ def scan_once() -> list[DiscoveredSession]:
             # Don't let a single bad row kill the whole scan.
             continue
     return out
+
+
+def diagnose() -> None:
+    """Print every node/claude/codex-ish process and whether it classified.
+
+    Called automatically when discovery finds 0 sessions so the user can see
+    WHY — without setting any env var. The usual culprits: (a) the real
+    Claude CLI is a `node.exe ...cli.js` whose cmdline psutil can't read
+    across Windows integrity levels, or (b) there simply is no local Claude
+    CLI running (claude.ai in a browser is not a local process Halo can see).
+    """
+    if psutil is None:
+        print("  [discovery] psutil not installed — cannot diagnose")
+        return
+    print("  [discovery] diagnostic scan (node / claude / codex processes):")
+    n = 0
+    for proc in psutil.process_iter(attrs=["pid", "name"]):
+        try:
+            name = proc.info.get("name") or ""
+            low = name.lower()
+            cmdline = _safe_cmdline(proc)
+            cl = " ".join(cmdline) if cmdline else None
+            interesting = (
+                "node" in low or "claude" in low or "codex" in low or "bun" in low
+                or (cl and ("claude" in cl.lower() or "codex" in cl.lower()))
+            )
+            if not interesting:
+                continue
+            n += 1
+            cls = (_classify_cmdline(cmdline) if cmdline else None) or _classify_by_name(name)
+            shown = "<cmdline ACCESS DENIED>" if cmdline is None else (cl[:130] if cl else "<empty>")
+            print(f"    pid={proc.pid:<6} name={name!r:<16} class={cls or '—'}  {shown}")
+        except Exception:
+            continue
+    if n == 0:
+        print("    none found — no local Claude/Codex CLI is running in another")
+        print("    terminal. (A claude.ai browser tab is NOT a local process.)")
+    else:
+        print("    ^ if your session shows class=— with ACCESS DENIED, run this")
+        print("      terminal as the same user/elevation as that session.")
 
 
 class DiscoveryThread:
@@ -293,6 +417,16 @@ class DiscoveryThread:
     def start(self) -> None:
         if self._thread is not None:
             return
+        # Do the FIRST scan synchronously in the caller's thread, BEFORE
+        # spawning the background loop. Previously the first scan lived in
+        # _loop() (the spawned thread), so a caller that start()s and then
+        # immediately snapshot()s raced the thread and got an empty list —
+        # the real cause of intermittent "discovery: found 0 sessions" at
+        # startup even when sessions were clearly present.
+        try:
+            self.refresh_now()
+        except Exception as exc:
+            print(f"  [discovery] initial scan error: {exc}")
         self._thread = threading.Thread(
             target=self._loop, name="halo-discovery", daemon=True,
         )
@@ -315,9 +449,8 @@ class DiscoveryThread:
         return sessions
 
     def _loop(self) -> None:
-        # First scan is synchronous so callers that start() and immediately
-        # snapshot() get real data instead of an empty list.
-        self.refresh_now()
+        # start() already performed the first (synchronous) scan; here we
+        # just re-scan on the interval to pick up new/closed sessions.
         while not self._stop.wait(self._interval):
             try:
                 sessions = scan_once()

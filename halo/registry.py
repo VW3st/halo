@@ -85,11 +85,31 @@ class SessionRegistry:
         """
         deduped = self._dedupe_labels(sessions)
         with self._lock:
+            old_active = self._active_label
+            old_session = self._sessions.get(old_active) if old_active else None
             self._sessions = deduped
-            if self._active_label is not None and self._active_label not in deduped:
-                # Active session disappeared (terminal closed, etc.).
-                # Best effort: try to find it again by cwd.
+            if old_active is None:
                 self._active_label = None
+                return
+            if old_active in deduped:
+                self._active_label = old_active
+                return
+            # The active label can change after a rescan when collisions are
+            # re-deduped. Preserve the user's selected terminal by stable
+            # identity before declaring it gone.
+            if old_session is not None:
+                for label, session in deduped.items():
+                    same_pid = old_session.pid == session.pid
+                    same_project = (
+                        bool(old_session.cwd)
+                        and old_session.cwd == session.cwd
+                        and old_session.agent_key == session.agent_key
+                    )
+                    if same_pid or same_project:
+                        self._active_label = label
+                        return
+            # Active session really disappeared.
+            self._active_label = None
 
     @staticmethod
     def _dedupe_labels(sessions: list[DiscoveredSession]) -> dict[str, DiscoveredSession]:
@@ -214,6 +234,24 @@ class SessionRegistry:
             if label.lower() in normalized:
                 return ResolvedTarget(kind="session", label=label)
 
+        # If the user says a PID/suffix-like number, prefer the label that
+        # actually contains that number over a shorter shared prefix label.
+        digits = re.findall(r"\d+", normalized)
+        for digit in digits:
+            for label in labels:
+                if digit in label:
+                    return ResolvedTarget(kind="session", label=label)
+
+        # Compact match: spoken "social manager" should match a project
+        # label like "socialmanager". Voice transcripts often insert or
+        # remove separators that are meaningful to humans but not paths.
+        compact = re.sub(r"[\s/\\\-_.]+", "", normalized)
+        if compact:
+            for label in labels:
+                label_compact = re.sub(r"[\s/\\\-_.]+", "", label.lower())
+                if compact in label_compact or label_compact in compact:
+                    return ResolvedTarget(kind="session", label=label)
+
         # Token overlap. Split both by non-word chars and any of /, \, -, _.
         spoken_tokens = set(self._tokens(normalized))
         best: tuple[int, Optional[str]] = (0, None)
@@ -236,7 +274,7 @@ class SessionRegistry:
 
     @staticmethod
     def _tokens(text: str) -> list[str]:
-        return re.split(r"[\s/\\\-_.]+", text.strip())
+        return [t for t in re.split(r"[\s/\\\-_.#]+", text.strip()) if t]
 
     # --- voice-friendly summaries -----------------------------------------
 

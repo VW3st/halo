@@ -27,9 +27,9 @@ from __future__ import annotations
 
 import itertools
 import json
-import random
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Callable, Literal, Optional
 
 from halo import bus
+from halo.userconfig import cfg as user_cfg
 
 # Default to the directory Halo was launched from. Most users will
 # `cd <project>` before running Halo; agents then act on that project.
@@ -83,6 +84,10 @@ VOICE_SYSTEM_PROMPT = (
     "## YOUR SESSION NAME\n"
     "Your spoken name in this session is {NAME}. You may introduce "
     "yourself by that name once at the start of a session.\n\n"
+    "## USER CONTEXT\n"
+    "The user's name is {USER_NAME}. Their role/context is {USER_ROLE}. "
+    "Halo's configured character is: {HALO_CHARACTER}. Address the user "
+    "by name when it sounds natural, but do not force it into every sentence.\n\n"
     "## EXAMPLES\n"
     "Bad:  'Created at `D:\\\\Halo\\\\hello.py` — a one-line script.\\n\\n"
     "**Output:**\\n```python\\nprint(\"hello\")\\n```'\n"
@@ -91,14 +96,6 @@ VOICE_SYSTEM_PROMPT = (
     "Good: 'I added auth, wrote tests, and updated the readme.'\n\n"
     "Bad:  (silent for 40 seconds while running a full test suite)\n"
     "Good: 'Running the test suite, this takes about thirty seconds.'"
-)
-
-# Pool of Roman mythology names; one is assigned per agent session and
-# spoken back to the user ("Mars is on it", "Juno wrote it to login.html").
-_MYTHOLOGY_NAMES = (
-    "Mars", "Mercury", "Neptune", "Jupiter", "Apollo", "Diana", "Minerva",
-    "Vulcan", "Juno", "Saturn", "Bacchus", "Ceres", "Pluto", "Vesta",
-    "Janus", "Aurora", "Flora", "Fortuna",
 )
 
 # 5 minutes — coding tasks often need this. Per-call override is supported.
@@ -179,7 +176,7 @@ class AgentConfig:
 AGENTS: dict[str, AgentConfig] = {
     "claude_code": AgentConfig(
         key="claude_code",
-        spoken_name="Claude",
+        spoken_name="Claude Code",
         voice_triggers=("claude", "claude code"),
         # --permission-mode bypassPermissions: the only way to run Claude
         # by voice. acceptEdits still pops a TUI prompt on every Bash
@@ -231,7 +228,7 @@ AGENTS: dict[str, AgentConfig] = {
     ),
     "codex_cli": AgentConfig(
         key="codex_cli",
-        spoken_name="Codex",
+        spoken_name="Codex CLI",
         voice_triggers=("codex", "open ai codex", "openai codex"),
         # -c approval_policy="never": OpenAI's documented recommendation
         # for non-interactive runs. Without it Codex pauses for approval
@@ -272,6 +269,34 @@ _availability_cache: dict[str, dict] = {}
 _availability_lock = threading.Lock()
 
 
+def _resolve_executable(binary: str) -> str | None:
+    """Return a subprocess-launchable executable path for `binary`.
+
+    On Windows, npm global shims often put both `codex` and `codex.cmd` on
+    PATH. PowerShell can run the extensionless shim, but Python CreateProcess
+    cannot. Prefer the .cmd/.exe form when present.
+    """
+    found = shutil.which(binary)
+    if sys.platform != "win32":
+        return found
+    candidates = []
+    if found:
+        candidates.append(found)
+    if not Path(binary).suffix:
+        candidates.extend(
+            p for p in (
+                shutil.which(binary + ".cmd"),
+                shutil.which(binary + ".exe"),
+                shutil.which(binary + ".bat"),
+            )
+            if p
+        )
+    for candidate in candidates:
+        if Path(candidate).suffix.lower() in {".exe", ".cmd", ".bat", ".com"}:
+            return candidate
+    return found
+
+
 def check_availability(refresh: bool = False) -> dict[str, dict]:
     """Probe every registered agent for installed-ness and responsiveness.
 
@@ -291,12 +316,17 @@ def check_availability(refresh: bool = False) -> dict[str, dict]:
         result: dict[str, dict] = {}
         for key, cfg in AGENTS.items():
             binary = cfg.first_call[0]
-            installed = shutil.which(binary) is not None
+            executable = _resolve_executable(binary)
+            installed = executable is not None
             responsive = installed
             if installed and cfg.check_call:
                 try:
+                    check_cmd = list(cfg.check_call)
+                    resolved_check = _resolve_executable(check_cmd[0])
+                    if resolved_check:
+                        check_cmd[0] = resolved_check
                     proc = subprocess.run(
-                        list(cfg.check_call),
+                        check_cmd,
                         capture_output=True,
                         timeout=10.0,
                         text=True,
@@ -310,6 +340,7 @@ def check_availability(refresh: bool = False) -> dict[str, dict]:
                 "responsive": responsive,
                 "install_hint": cfg.install_hint,
                 "binary": binary,
+                "executable": executable or binary,
             }
         _availability_cache.clear()
         _availability_cache.update(result)
@@ -354,21 +385,34 @@ def session_key(agent_key: str, cwd: Path | str | None) -> str:
 _sessions_active: dict[str, bool] = {}
 # Per-(agent, cwd) spoken session name ("Mars", "Juno", ...).
 _session_names: dict[str, str] = {}
+# Guards _sessions_active, _session_names, and _last_by_session. These are
+# written on the background agent-runner thread and read by both the main
+# orchestrator loop AND the web /api/state poll (~750ms). Without this lock,
+# iterating one while the runner mutates it raises "dict changed size during
+# iteration" and crashes the reader. RLock so nested same-thread calls are safe.
+_session_state_lock = threading.RLock()
 
 
 def _new_session_name(skey: str) -> str:
-    # Don't repeat the current name for the same session if we can help it.
-    current = _session_names.get(skey)
-    pool = [n for n in _MYTHOLOGY_NAMES if n != current] or list(_MYTHOLOGY_NAMES)
-    return random.choice(pool)
+    """Voice label for a session: model/CLI + project label.
+
+    Replaces the old mythology codenames. Users need to know which real
+    session/model they are talking to, e.g. "Claude Code in socialmanager".
+    """
+    agent_key, _, cwd = skey.partition("@")
+    cfg = AGENTS.get(agent_key)
+    model = cfg.spoken_name if cfg else agent_key
+    project = Path(cwd).name if cwd else ""
+    return f"{model} in {project}" if project else model
 
 
 def session_name(agent_key: str, cwd: Path | str | None = None) -> str:
     """Spoken name for the live (or last) session of `agent_key` in `cwd`."""
     skey = session_key(agent_key, cwd)
-    if skey not in _session_names:
-        _session_names[skey] = _new_session_name(skey)
-    return _session_names[skey]
+    with _session_state_lock:
+        if skey not in _session_names:
+            _session_names[skey] = _new_session_name(skey)
+        return _session_names[skey]
 
 
 def reset_session(agent: str | None = None, cwd: Path | str | None = None) -> None:
@@ -390,22 +434,25 @@ def reset_session(agent: str | None = None, cwd: Path | str | None = None) -> No
     # _SentenceBuffer + _extract_* helpers from this module.
     from halo import sessions as _sessions
 
-    if agent is None:
-        targets = list(_sessions_active.keys())
-    elif cwd is not None:
-        targets = [session_key(agent, cwd)]
-    else:
-        prefix = f"{agent}@"
-        targets = [k for k in _sessions_active if k.startswith(prefix)]
-        # Also catch sessions that were named but never marked active.
-        targets += [k for k in _session_names if k.startswith(prefix) and k not in targets]
+    with _session_state_lock:
+        if agent is None:
+            targets = list(_sessions_active.keys())
+        elif cwd is not None:
+            targets = [session_key(agent, cwd)]
+        else:
+            prefix = f"{agent}@"
+            targets = [k for k in _sessions_active if k.startswith(prefix)]
+            # Also catch sessions that were named but never marked active.
+            targets += [k for k in _session_names if k.startswith(prefix) and k not in targets]
+        for skey in targets:
+            if skey in _sessions_active:
+                _sessions_active[skey] = False
+            if skey in _session_names:
+                _session_names[skey] = _new_session_name(skey)
 
+    # Persistent process teardown — only for Claude-style agents. Done OUTSIDE
+    # the state lock (sessions.close has its own lock + can block on join).
     for skey in targets:
-        if skey in _sessions_active:
-            _sessions_active[skey] = False
-        if skey in _session_names:
-            _session_names[skey] = _new_session_name(skey)
-        # Persistent process teardown — only for Claude-style agents.
         agent_key = skey.split("@", 1)[0]
         if AGENTS.get(agent_key) and AGENTS[agent_key].session_kind == "persistent":
             _sessions.close(skey)
@@ -419,7 +466,9 @@ def session_status() -> dict[str, bool]:
     should use `session_status_detail()` instead.
     """
     agg: dict[str, bool] = {key: False for key in AGENTS}
-    for skey, active in _sessions_active.items():
+    with _session_state_lock:
+        snapshot = list(_sessions_active.items())
+    for skey, active in snapshot:
         if not active:
             continue
         agent_key = skey.split("@", 1)[0]
@@ -434,11 +483,75 @@ def session_status_detail() -> dict[str, bool]:
     New in v1.2 — exposes the full per-project state for the dashboard,
     registry, and orchestrator.
     """
-    return dict(_sessions_active)
+    with _session_state_lock:
+        return dict(_sessions_active)
 
 
 def known_agents() -> list[str]:
     return list(AGENTS.keys())
+
+
+# MCP (Model Context Protocol): when enabled in [mcp] config, Halo passes
+# --mcp-config to every Claude session it spawns so the agent gains extra
+# tools (desktop control, etc.). Only injected for `claude` invocations
+# (Codex has no --mcp-config flag).
+def _resolve_uvx() -> str:
+    """Absolute path to uvx, preferring the venv we installed it into so the
+    MCP server launches even when Halo is run without the venv activated.
+    Falls back to bare 'uvx' (PATH lookup) if not found."""
+    sub = "Scripts" if sys.platform == "win32" else "bin"
+    exe = "uvx.exe" if sys.platform == "win32" else "uvx"
+    cand = Path(sys.prefix) / sub / exe
+    if cand.is_file():
+        return str(cand)
+    return shutil.which("uvx") or "uvx"
+
+
+def _default_mcp_config() -> dict:
+    return {
+        "mcpServers": {
+            # Windows-MCP: native Windows computer-use (click/type/screenshot,
+            # app + window control). Runs via uvx in its own isolated env.
+            "windows-mcp": {
+                "command": _resolve_uvx(),
+                "args": ["windows-mcp", "serve"],
+            },
+        }
+    }
+
+
+def _ensure_default_mcp_config() -> Optional[Path]:
+    """Return the bundled mcp.json path, writing the desktop-control default
+    on first use. Returns None if it can't be written."""
+    path = Path.home() / ".halo" / "mcp.json"
+    if path.is_file():
+        return path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_default_mcp_config(), indent=2), encoding="utf-8")
+        print(f"  [mcp] wrote default desktop-control config -> {path}")
+        return path
+    except Exception as exc:
+        print(f"  [mcp] could not write default config: {exc}")
+        return None
+
+
+def _mcp_args() -> list[str]:
+    """`--mcp-config <path>` (+ optional --strict-mcp-config) when [mcp] is
+    enabled and a config file exists; otherwise empty (MCP off)."""
+    mcp = getattr(user_cfg, "mcp", None)
+    if mcp is None or not getattr(mcp, "enabled", False):
+        return []
+    raw = (getattr(mcp, "config_path", "") or "").strip()
+    path = Path(raw) if raw else _ensure_default_mcp_config()
+    if path is None or not Path(path).is_file():
+        if raw:
+            print(f"  [mcp] config_path not found: {raw!r} — MCP not loaded")
+        return []
+    args = ["--mcp-config", str(path)]
+    if getattr(mcp, "strict", False):
+        args.append("--strict-mcp-config")
+    return args
 
 
 def _build_cmd(
@@ -458,7 +571,30 @@ def _build_cmd(
             out.append(system_prompt)
         else:
             out.append(arg)
+    # Claude-only: append MCP server config so spawned sessions get the
+    # configured tools. Gated on the unresolved template token, not out[0]
+    # (which gets rewritten to a full path just below).
+    if template and template[0] == "claude":
+        out.extend(_mcp_args())
+    if out:
+        resolved = _resolve_executable(out[0])
+        if resolved:
+            out[0] = resolved
     return out
+
+
+def _system_prompt_for_session(name: str) -> str:
+    persona = user_cfg.persona
+    user_name = (persona.user_name or "the user").strip()
+    user_role = (persona.user_role or "not specified").strip()
+    character = (persona.halo_character or "direct, practical voice coding assistant").strip()
+    return (
+        VOICE_SYSTEM_PROMPT
+        .replace("{NAME}", name)
+        .replace("{USER_NAME}", user_name)
+        .replace("{USER_ROLE}", user_role)
+        .replace("{HALO_CHARACTER}", character)
+    )
 
 
 class _SentenceBuffer:
@@ -823,7 +959,7 @@ def dispatch(
 
     # Assign / reuse a spoken name for this (agent, cwd) session.
     name = session_name(config.key, workdir)
-    system_prompt = VOICE_SYSTEM_PROMPT.replace("{NAME}", name)
+    system_prompt = _system_prompt_for_session(name)
 
     # For agents that don't take a system-prompt flag (Codex), prepend
     # the voice brief to the user prompt directly. Use a fenced marker
@@ -847,7 +983,8 @@ def dispatch(
     err = ""
 
     if persistent_first_choice:
-        _sessions_active[skey] = True  # process IS the session
+        with _session_state_lock:
+            _sessions_active[skey] = True  # process IS the session
         ok, stdout, err = _dispatch_persistent(
             config,
             prompt=prompt,
@@ -861,18 +998,21 @@ def dispatch(
         # Fall through to one-shot for THIS call so the user isn't left
         # hanging.
         if not ok and config.key not in _persistent_disabled:
-            _sessions_active[skey] = False
+            with _session_state_lock:
+                _sessions_active[skey] = False
             return False, f"{config.spoken_name} failed: {err}"
         if not ok:
-            _sessions_active[skey] = False
+            with _session_state_lock:
+                _sessions_active[skey] = False
 
     if not ok:
         # One-shot dispatch — either the agent is one-shot by design
         # (Codex) or persistent spawn fell back due to CLI mismatch.
         # See _persistent_disabled note above for the latter case.
-        was_active = _sessions_active.get(skey, False)
+        with _session_state_lock:
+            was_active = _sessions_active.get(skey, False)
+            _sessions_active[skey] = True
         template = config.continue_call if was_active else config.first_call
-        _sessions_active[skey] = True
         cmd = _build_cmd(
             template, prompt=prompt, cwd=workdir, system_prompt=system_prompt,
         )
@@ -956,6 +1096,46 @@ _job_id_seq = itertools.count(1)
 # Keyed by session_key (agent_key@cwd) so cross-project lookups work.
 _last_by_session: dict[str, AgentJob] = {}
 
+# --- Voice floor (single-speaker guarantee) --------------------------------
+# Only ONE job at a time may narrate live or murmur keepalives. Without this,
+# a fan-out ("dispatch to all") makes every session's _speak_chunk call say()
+# concurrently and the spoken audio interleaves into garbage. The most
+# recently dispatched streaming job claims the floor; older jobs keep running
+# and are summarized on completion, but stop speaking live.
+_voice_floor_job_id: Optional[int] = None
+_voice_floor_lock = threading.Lock()
+
+
+def claim_voice_floor(job_id: int) -> None:
+    """Make `job_id` the sole live speaker. Call right after start_job."""
+    global _voice_floor_job_id
+    with _voice_floor_lock:
+        _voice_floor_job_id = job_id
+
+
+def owns_voice_floor(job_id: Optional[int]) -> bool:
+    """True if `job_id` currently owns the floor (or no job_id is set yet —
+    the just-dispatched foreground turn, before its id is registered)."""
+    if job_id is None:
+        return True
+    with _voice_floor_lock:
+        return _voice_floor_job_id == job_id
+
+
+def release_voice_floor(job_id: int) -> None:
+    """Drop the floor if `job_id` still holds it (job finished)."""
+    global _voice_floor_job_id
+    with _voice_floor_lock:
+        if _voice_floor_job_id == job_id:
+            _voice_floor_job_id = None
+
+
+# Keepalive cadence — how Halo fills dead air during a long, quiet job
+# (e.g. Claude running a multi-second tool with no text deltas).
+_KEEPALIVE_POLL_SEC = 2.0      # how often the watchdog checks
+_KEEPALIVE_QUIET_SEC = 13.0    # silence before the first murmur
+_KEEPALIVE_MAX = 4             # cap murmurs per job so it isn't naggy
+
 
 class AgentBusy(RuntimeError):
     """Raised when start_job is called for an agent that already has an
@@ -1008,16 +1188,52 @@ def start_job(
         )
 
         # Wrap the user's on_text_chunk so we can also push streaming
-        # sentences onto the bus for the web dashboard.
+        # sentences onto the bus for the web dashboard. A sentence only
+        # reaches the live TTS speaker if THIS job owns the voice floor —
+        # otherwise (a concurrent / fan-out job) it's still emitted to the
+        # dashboard and accumulated for the end-of-job summary, but stays
+        # silent so two agents never talk over each other.
         spoken = session_name(agent_key, workdir)
+        _last_chunk_at = time.monotonic()
+        _chunk_lock = threading.Lock()
 
         def _on_chunk(sentence: str) -> None:
+            nonlocal _last_chunk_at
+            with _chunk_lock:
+                _last_chunk_at = time.monotonic()
             bus.emit(
                 "agent.streaming",
                 agent=agent_key, name=spoken, cwd=workdir, sentence=sentence,
             )
-            if on_text_chunk is not None:
+            if on_text_chunk is not None and owns_voice_floor(job.job_id):
                 on_text_chunk(sentence)
+
+        def _keepalive() -> None:
+            """Fill dead air: if the foreground job goes quiet for a while
+            (long tool run, no text deltas), murmur a short 'still working'
+            so the user knows Halo didn't freeze. Persistent Claude sessions
+            had no such cue before (audit finding)."""
+            nonlocal _last_chunk_at  # we read AND reassign it below
+            from halo import voice  # lazy — voice doesn't import agents
+            murmured = 0
+            while not job.is_done and murmured < _KEEPALIVE_MAX:
+                time.sleep(_KEEPALIVE_POLL_SEC)
+                if job.is_done:
+                    break
+                # Only the active speaker murmurs, and only when nothing is
+                # already playing and the stream has actually gone silent.
+                if not owns_voice_floor(job.job_id):
+                    continue
+                if voice.is_speaking():
+                    continue
+                with _chunk_lock:
+                    quiet = time.monotonic() - _last_chunk_at
+                if quiet < _KEEPALIVE_QUIET_SEC:
+                    continue
+                voice.say_one_of(voice.WORKING_PHRASES, blocking=False)
+                murmured += 1
+                with _chunk_lock:
+                    _last_chunk_at = time.monotonic()  # space the next one out
 
         def _runner() -> None:
             bus.emit(
@@ -1025,6 +1241,10 @@ def start_job(
                 agent=agent_key, name=spoken, cwd=workdir, prompt=prompt,
                 job_id=job.job_id,
             )
+            ka = threading.Thread(
+                target=_keepalive, daemon=True, name=f"keepalive-{job.job_id}"
+            )
+            ka.start()
             try:
                 ok, text = dispatch(
                     agent_key, prompt,
@@ -1036,7 +1256,9 @@ def start_job(
             job.ok = ok
             job.result = text
             job.completed_at = time.monotonic()
-            _last_by_session[skey] = job
+            release_voice_floor(job.job_id)
+            with _session_state_lock:
+                _last_by_session[skey] = job
             bus.emit(
                 "agent.done" if ok else "agent.error",
                 agent=agent_key, name=spoken, cwd=workdir,
@@ -1048,6 +1270,10 @@ def start_job(
         thread = threading.Thread(target=_runner, daemon=True, name=f"agent-{job.job_id}")
         job._thread = thread
         _jobs.append(job)
+        # Claim the voice floor BEFORE the runner starts so this dispatch's
+        # very first streamed sentence isn't suppressed by the gate in
+        # _on_chunk. The latest dispatch always wins the floor.
+        claim_voice_floor(job.job_id)
 
     thread.start()
     return job
@@ -1075,11 +1301,13 @@ def last_result_for(agent_key: str, cwd: Path | str | None = None) -> Optional[A
     ALL projects (back-compat with v1.1 callers). Pass a cwd to scope
     to one project.
     """
-    if cwd is not None:
-        return _last_by_session.get(session_key(agent_key, cwd))
+    with _session_state_lock:
+        if cwd is not None:
+            return _last_by_session.get(session_key(agent_key, cwd))
+        values = list(_last_by_session.values())
     # Find the most recent across any cwd.
     best: Optional[AgentJob] = None
-    for j in _last_by_session.values():
+    for j in values:
         if j.agent_key != agent_key or j.completed_at is None:
             continue
         if best is None or (j.completed_at or 0) > (best.completed_at or 0):
@@ -1092,10 +1320,12 @@ def status_summary() -> str:
     actives = active_jobs()
     if not actives:
         # Mention the most recent completed job per session if any.
-        if not _last_by_session:
+        with _session_state_lock:
+            recent = list(_last_by_session.values())
+        if not recent:
             return "Everything is idle."
         parts = []
-        for j in _last_by_session.values():
+        for j in recent:
             if j.completed_at is None:
                 continue
             cfg = AGENTS[j.agent_key]
