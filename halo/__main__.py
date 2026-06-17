@@ -1361,6 +1361,45 @@ def _agent_open_intent(text: str) -> list[str]:
     return [k for _, k in hits]
 
 
+# A polite/interrogative request IS a command ("can you open paint",
+# "could you open the browser") — must not be mistaken for narration below.
+_POLITE_CMD_RE = re.compile(
+    r"\b(?:can|could|would|will|can'?t|won'?t|please|kindly)\s+(?:you\s+)?"
+    r"(?:please\s+)?(?:open|launch|start|fire up|bring up|pull up)\b",
+    re.IGNORECASE,
+)
+# Narration / past tense / reference — the user is TALKING ABOUT opening
+# something, not commanding it ("you did open paint", "I opened it", "I say
+# open and then you open"). Without this guard, the tool fast-path re-launched
+# the app every time the user merely mentioned it.
+_NARRATED_ACTION_RE = re.compile(
+    r"\b(?:"
+    r"opened|launched|re-?opened|"  # past tense is always narration
+    # subject (+ optional aux) + open: "you open", "you did open", "I just
+    # opened", "he keeps opening" — but NOT "can you open" (handled above)
+    r"(?:you|i|we|he|she|it|they|u)\s+"
+    r"(?:did|just|already|have|'ve|had|'d|keep|kept|always|usually|"
+    r"gonna|will|would|can)?\s*"
+    r"open(?:ed|ing|s)?|"
+    r"did\s+(?:you|i|we|they)\s+open|"           # "did you open ...?"
+    r"(?:say|said|saying|means?|meant)\s+open|"  # "when I say open"
+    r"(?:so|then|and|when|if|whenever|because|since|as)\s+"
+    r"(?:you|i|we|he|she|it|they)\s+open"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_narrated_action(text: str) -> bool:
+    """True when an 'open X' is narration / past tense / reference rather than
+    an imperative command, so we don't re-launch the app every time the user
+    MENTIONS having opened it ('okay so you did open paint')."""
+    t = text or ""
+    if _POLITE_CMD_RE.search(t):
+        return False  # "can you open paint" is a real command
+    return bool(_NARRATED_ACTION_RE.search(t))
+
+
 def _wants_back_to_halo(text: str) -> bool:
     return bool(_BACK_TO_HALO_RE.search(text or ""))
 
@@ -1792,12 +1831,17 @@ def _handle_decision(
     decision: dict,
     *,
     brief: _ConversationBrief | None = None,
+    raw_text: str | None = None,
 ) -> str:
     """Act on a decision dict. Returns the short phrase to speak back.
 
     v1.2: respects target_session for per-turn dispatch routing.
     Session-level actions (switch / list / where_am_i) are handled by
     `_handle_session_action()` before this is called.
+
+    `raw_text` (when given) is the user's ORIGINAL utterance, used to suppress
+    tool execution when an "open X" is narration rather than a command — the
+    LLM's cleaned_text often strips the narration markers, so we check the raw.
     """
     status = decision.get("status", "?")
     intent = decision.get("intent", "?")
@@ -1831,7 +1875,7 @@ def _handle_decision(
     # intent=question (or system) inconsistently, then the question branch
     # just speaks a useless "Okay." Try the local tools FIRST for non-code
     # intents so these always resolve locally and instantly.
-    if intent != "code":
+    if intent != "code" and not _is_narrated_action(raw_text or ""):
         handled, summary, leftover = execute_system_intent(cleaned)
         if handled:
             print(f"  executed (local tool): {summary}")
@@ -2510,7 +2554,7 @@ def run_conversation() -> None:
             continue
 
         from halo.tools import is_pure_tool
-        if cleaned and is_pure_tool(cleaned):
+        if cleaned and is_pure_tool(cleaned) and not _is_narrated_action(cleaned):
             handled, summary, _ = execute_system_intent(cleaned)
             if handled:
                 print(f"  tool fast-path: {summary}")
@@ -2519,6 +2563,10 @@ def run_conversation() -> None:
                 brief.add_halo(summary)  # remember what was opened ("what did you open first?")
                 last_activity = time.monotonic()
                 continue
+        if cleaned and _is_narrated_action(cleaned) and is_pure_tool(cleaned):
+            # The user is narrating, not commanding ("so you did open paint").
+            # Don't re-launch — let it fall through to a conversational reply.
+            print(f"  narrated action, not a command -> not re-opening: {cleaned!r}")
 
         # 8. Direct-dialogue mode — pipe to active agent.
         if direct_agent is not None:
@@ -2698,7 +2746,7 @@ def run_conversation() -> None:
             last_activity = time.monotonic()
             continue
 
-        phrase = _handle_decision(lm_decision, brief=brief)
+        phrase = _handle_decision(lm_decision, brief=brief, raw_text=cleaned)
         if phrase:
             print(f"  speaking: {phrase!r}")
             say(phrase, blocking=True)

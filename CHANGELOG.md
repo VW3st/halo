@@ -10,6 +10,21 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.4.5] — 2026-06-17
+
+### Fixed
+- **Stop re-opening apps when you only MENTION them** — saying "okay so you did
+  open paint" / "I opened it already" / "I say open and then you open" used to
+  re-launch the app every time, because the tool fast-path matched "open <app>"
+  anywhere. New `_is_narrated_action` guard distinguishes a command from
+  narration/past-tense/reference (subject+verb, "opened", "did you open",
+  "when I say open"), while still firing on real commands — including polite
+  ones ("can you open paint"). Guards both the tool fast-path and the Stage-2
+  `execute_system_intent` path (via a `raw_text` hint, since the LLM's
+  cleaned_text often strips the narration markers).
+
+---
+
 ## [1.4.4] — 2026-06-17
 
 Live-test fixes — spinning up agent sessions by voice, and a few rough edges.

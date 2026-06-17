@@ -191,6 +191,31 @@ def main() -> int:
         m._agent_open_intent("open the cloud storage") == [],
     )
 
+    # --- narration vs command (stop re-opening apps when MENTIONED) --------
+    for narration in (
+        "okay so you did open paint",
+        "you did open paint",
+        "I opened it already",
+        "as you can see I say open and then you open",
+        "so you opened the browser",
+        "did you open the calculator",
+    ):
+        failed += check(
+            f"narration not a command: {narration!r}",
+            m._is_narrated_action(narration) is True,
+        )
+    for command in (
+        "open paint",
+        "I want you to open paint",
+        "can you open paint",
+        "open chrome and open paint",
+        "please open notepad",
+    ):
+        failed += check(
+            f"command still fires: {command!r}",
+            m._is_narrated_action(command) is False,
+        )
+
     # --- confirmation: "yes please" and friends ----------------------------
     failed += check("'Yes, please' confirms", m._is_yes("Yes, please") is True)
     failed += check("'yeah go ahead' confirms", m._is_yes("yeah go ahead") is True)
