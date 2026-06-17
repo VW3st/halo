@@ -91,6 +91,10 @@ REGISTRY = SessionRegistry()
 _DISCOVERY: DiscoveryThread | None = None
 _desktop_last_sent: dict[str, str] = {}
 _desktop_last_error: str = ""
+# A chained command may finish its local parts but leave a task only an agent
+# can do ("open a browser AND search the web for X"). _handle_decision stashes
+# that delegatable remainder here; the conversation loop offers to hand it off.
+_system_leftover: str = ""
 
 
 def _user_name() -> str:
@@ -108,9 +112,14 @@ def _personalize_reply(reply: str) -> str:
     name = _user_name()
     if not name or not reply:
         return reply
-    if reply.lower().startswith(("good", "all good", "hi", "hey")):
-        return reply.rstrip(".") + f", {name}."
-    return reply
+    if not reply.lower().startswith(("good", "all good", "hi", "hey", "sure", "okay", "ok")):
+        return reply
+    # Tuck the name in BEFORE the final terminal punctuation so "What's up?"
+    # becomes "What's up, Valentino?" not the broken "What's up?, Valentino."
+    m = re.search(r"\s*([.!?]+)\s*$", reply)
+    if m:
+        return f"{reply[:m.start()].rstrip()}, {name}{m.group(1)}"
+    return f"{reply}, {name}."
 
 
 class _StreamState:
@@ -902,20 +911,32 @@ def _strip_leading_greeting(text: str) -> str:
 
 
 # Phrases that close the conversation and send us back to wake-listening.
-# Matched anywhere in the cleaned transcript (case-insensitive, word boundaries).
-_END_CONVERSATION_RE = re.compile(
+# Split into STRONG (unambiguous — fire even mid-utterance) and WEAK
+# (reaction-prone: "that's it?", "that's all", "bye" double as casual replies).
+# Weak enders only end when they're the WHOLE utterance AND it isn't a question
+# — fixes "That's it?" (= "is that all you've got?") slamming the session shut.
+_END_STRONG_RE = re.compile(
     r"\b("
     r"over and out|over n out|"
     r"go to sleep|go back to sleep|back to sleep|sleep now|"
     r"you can sleep|i want you to sleep|go to bed|halo sleep|"
     r"stop listening|stop conversation|end conversation|end session|"
-    r"end of session|session end|that'?s enough|that'?s it|"
-    r"good ?bye|bye bye|bye|see you|"
-    r"that'?s all|that will be all|i'?m done|done for now|"
-    r"thanks that'?s all|"
+    r"end of session|session end|"
+    r"good ?bye|bye bye|see you(?: later)?|"
     r"stand by|standby|"
     r"shut up|leave me alone"
     r")\b",
+    re.IGNORECASE,
+)
+# Reaction-prone enders. Anchored ^...$ so they must be the entire utterance
+# (after optional leading filler / trailing "for now"), never a substring.
+_END_WEAK_RE = re.compile(
+    r"^(?:ok(?:ay)?|alright|all ?right|well|yeah|yep|so|and|no|cool|"
+    r"thanks?|thank you)?[,\s]*"
+    r"(?:that'?s (?:it|all|enough)|that'?ll be all|that will be all|"
+    r"i'?m done|we'?re done|all done|done for (?:now|today)|bye)"
+    r"(?:\s+for (?:now|today|the day))?"
+    r"[.\s!]*$",
     re.IGNORECASE,
 )
 
@@ -1121,12 +1142,95 @@ def _agent_switch_target(text: str) -> str | None:
     return None
 
 
+# Curated, STT-garble-tolerant aliases used ONLY to decide "did the user just
+# name the OTHER agent" while in direct mode. Deliberately excludes real English
+# words that appear in cfg.fuzzy_triggers ("cloud", "codec", "codecs", "clod") so
+# a normal coding instruction ("use the codec library") never yanks the
+# conversation to the wrong agent. Non-word mis-transcriptions only.
+_AGENT_REDIRECT_ALIASES: dict[str, tuple[str, ...]] = {
+    "claude_code": ("claude", "claude code", "claud", "clawde", "clawd", "clyde", "clode"),
+    "codex_cli": ("codex", "codex cli", "kodex", "krodex", "kadex", "cadex",
+                  "crodex", "kodaks"),
+}
+# Verbs that mark a deliberate hand-off to a named agent. Required before we
+# redirect — a passing mention ("the codex output looks good") must NOT switch.
+_AGENT_REDIRECT_VERB_RE = re.compile(
+    r"\b(?:ask|tell|have|get|use|let|try|switch|spawn|open|launch|start|"
+    r"bring up|fire up|go to|talk to|hand (?:it|this) to|give (?:it|this) to|"
+    r"put me on|transfer)\b",
+    re.IGNORECASE,
+)
+# Connectors / fluff peeled off the FRONT of a redirected instruction so
+# "spawn codex AS WELL AND generate images" dispatches "generate images".
+_REDIRECT_LEAD_RE = re.compile(
+    r"^(?:\s*(?:to|and|also|as well|please|for|now|then|that|the|it|them|"
+    r"if you can|can you|could you|would you|i want you to|i need you to)\b[\s,]*)+",
+    re.IGNORECASE,
+)
+
+
+def _mentioned_agents(text: str) -> list[str]:
+    """Agent keys named in `text` (garble-tolerant), ordered by first
+    appearance. Uses the curated redirect aliases, not the loose fuzzy set."""
+    low = (text or "").lower()
+    hits: list[tuple[int, str]] = []
+    for key, aliases in _AGENT_REDIRECT_ALIASES.items():
+        if key not in AGENTS:
+            continue
+        best: int | None = None
+        for alias in aliases:
+            m = re.search(r"\b" + re.escape(alias) + r"\b", low)
+            if m and (best is None or m.start() < best):
+                best = m.start()
+        if best is not None:
+            hits.append((best, key))
+    hits.sort()
+    return [k for _, k in hits]
+
+
+def _direct_redirect(text: str, current_agent: str) -> tuple[str, str] | None:
+    """While in direct dialogue with `current_agent`, detect a command aimed at
+    a DIFFERENT agent ("ask Codex to ...", "switch to Codex", "spawn Codex").
+
+    Returns (target_agent, instruction); instruction "" means a pure switch.
+    None when the utterance is not cross-agent — forward to current as usual.
+
+    This is the fix for "I asked it to spawn Codex and it kept feeding Claude":
+    in direct mode every utterance used to go to the active agent, even an
+    explicit hand-off to the other one (made worse by Whisper hearing
+    'Codex' as 'Kodex'/'Krodex', which the strict dispatch regexes missed).
+    """
+    others = [a for a in _mentioned_agents(text) if a != current_agent]
+    if not others:
+        return None
+    if not _AGENT_REDIRECT_VERB_RE.search(text or ""):
+        return None
+    target = others[0]
+    # Instruction = whatever follows the LAST mention of the target's name.
+    low = (text or "").lower()
+    end: int | None = None
+    for alias in _AGENT_REDIRECT_ALIASES[target]:
+        for m in re.finditer(r"\b" + re.escape(alias) + r"\b", low):
+            if end is None or m.end() > end:
+                end = m.end()
+    rest = (text[end:] if end is not None else "").strip()
+    rest = _REDIRECT_LEAD_RE.sub("", rest).strip().rstrip(".,!?")
+    return (target, rest)
+
+
 def _wants_back_to_halo(text: str) -> bool:
     return bool(_BACK_TO_HALO_RE.search(text or ""))
 
 
-def _is_end_phrase(text: str) -> bool:
-    return bool(_END_CONVERSATION_RE.search(text or ""))
+def _is_end_phrase(text: str, raw: str = "") -> bool:
+    t = (text or "").strip()
+    if _END_STRONG_RE.search(t):
+        return True
+    # A weak ender phrased as a question is a reaction, not a command. The raw
+    # transcript keeps the "?" that cleaned_text strips, so check it when given.
+    if (raw or "").strip().endswith("?"):
+        return False
+    return bool(_END_WEAK_RE.match(t))
 
 
 def _is_new_session_phrase(text: str) -> bool:
@@ -1457,9 +1561,11 @@ def _start_agent_and_ack(
         # (the original prompt is already stored on the job for the summarizer)
         print(f"  job #{job.job_id} started in background"
               f"{' (streaming)' if config.streams_text_deltas else ''}")
+        # Conversational hand-off: the job runs in the background, so invite
+        # the next request instead of leaving dead air while the agent works.
         if active == "starting":
-            return f"On it. Starting {spoken}."
-        return f"On it. {spoken}{where} is working."
+            return f"On it — starting {spoken}{where}. Anything else while that runs?"
+        return f"On it — {spoken}{where} is on it. Anything else while you wait?"
     except AgentBusy as exc:
         return str(exc)
 
@@ -1583,9 +1689,18 @@ def _handle_decision(
     # just speaks a useless "Okay." Try the local tools FIRST for non-code
     # intents so these always resolve locally and instantly.
     if intent != "code":
-        handled, summary = execute_system_intent(cleaned)
+        handled, summary, leftover = execute_system_intent(cleaned)
         if handled:
             print(f"  executed (local tool): {summary}")
+            # A chained command may leave a part no local tool can do
+            # ("open a browser AND search the web for X"). Stash it so the
+            # conversation loop can offer to delegate instead of dropping it.
+            global _system_leftover
+            _system_leftover = (
+                leftover if (leftover and _looks_like_real_task(leftover)) else ""
+            )
+            if _system_leftover:
+                print(f"  leftover for delegation -> {_system_leftover!r}")
             return summary
 
     if intent == "question" and agent == "none":
@@ -1804,13 +1919,16 @@ def run_conversation() -> None:
     # Halo remembers earlier turns instead of forgetting every time it sleeps.
     # Reset only on an explicit "new session". Also exposed module-level so
     # background-job completions can fold the agent's reply into it.
-    global _active_brief
+    global _active_brief, _system_leftover
     if _active_brief is None:
         _active_brief = _ConversationBrief()
     brief = _active_brief
     first_turn_after_wake = True
 
     while True:
+        # Fresh each turn — set by _handle_decision only when a chained command
+        # leaves an agent-only remainder, read right after the Stage 2 call.
+        _system_leftover = ""
         # Speak any background-job results that landed since last turn.
         _drain_completed_jobs()
 
@@ -1885,6 +2003,10 @@ def run_conversation() -> None:
 
         cleaned = (decision.get("cleaned_text") or "").strip()
         cleaned = _strip_leading_greeting(cleaned)
+        # Raw transcript keeps trailing punctuation ("That's it?") that
+        # cleaned_text strips — the end-phrase guard uses it to tell a casual
+        # question apart from a real "we're done" command.
+        raw_transcript = (decision.get("transcript") or cleaned)
         print(f"  heard: {cleaned!r}")
 
         # Empty after wake/greeting strip = Whisper transcribed silence,
@@ -1952,7 +2074,7 @@ def run_conversation() -> None:
         # conversation, even with a pending confirmation/clarification open.
         # (Previously a pending clarification swallowed it as a "cancel", so
         # the conversation refused to sleep.)
-        if _is_end_phrase(cleaned):
+        if _is_end_phrase(cleaned, raw_transcript):
             print("  end-phrase -> closing conversation")
             bus.emit("route.matched", handler="end_phrase")
             say("Goodbye.", blocking=True)
@@ -2186,7 +2308,7 @@ def run_conversation() -> None:
 
         from halo.tools import is_pure_tool
         if cleaned and is_pure_tool(cleaned):
-            handled, summary = execute_system_intent(cleaned)
+            handled, summary, _ = execute_system_intent(cleaned)
             if handled:
                 print(f"  tool fast-path: {summary}")
                 bus.emit("route.matched", handler="tool", text=summary)
@@ -2199,6 +2321,31 @@ def run_conversation() -> None:
         if direct_agent is not None:
             if not cleaned:
                 print("  direct-dialogue: empty after wake-strip, ignoring")
+                continue
+
+            # Cross-agent hand-off FIRST: if the user named the OTHER agent
+            # with a targeting verb ("switch to Codex", "spawn Codex", "ask
+            # Codex to ..."), switch/dispatch THERE instead of feeding the
+            # current agent. Without this, "spawn Codex" got piped to Claude.
+            redirect = _direct_redirect(cleaned, direct_agent)
+            if redirect is not None:
+                target, instruction = redirect
+                direct_agent = _set_direct(target)
+                direct_session_label = None
+                if instruction:
+                    print(f"  direct-mode redirect -> {target}: {instruction!r}")
+                    bus.emit("route.matched", handler="direct_redirect", target=target)
+                    phrase = _start_agent_and_ack(
+                        target, instruction, cwd=_cwd_for_dispatch(""), brief=brief
+                    )
+                    if phrase:
+                        say(phrase, blocking=True)
+                else:
+                    spoken = session_name(target)
+                    print(f"  direct-mode switch -> {target} ({spoken})")
+                    bus.emit("route.matched", handler="direct_switch", target=target)
+                    say(f"Switching to {spoken}.", blocking=True)
+                last_activity = time.monotonic()
                 continue
 
             # Follow-up gate: every direct-mode utterance has to look
@@ -2353,6 +2500,30 @@ def run_conversation() -> None:
             print(f"  speaking: {phrase!r}")
             say(phrase, blocking=True)
             brief.add_halo(phrase)
+
+        # A chained command did its local parts but left a task only an agent
+        # can do ("open a browser AND search the web for the score"). Per the
+        # "confirm before Claude" policy, offer to delegate the remainder
+        # instead of silently spawning a session — a "yes" hands it off.
+        if _system_leftover:
+            leftover = _system_leftover
+            _system_leftover = ""
+            pending_action = {
+                "status": "ready",
+                "intent": "code",
+                "agent": "claude_code" if "claude_code" in AGENTS else "none",
+                "cleaned_text": leftover,
+                "confirmation": "",
+                "clarification": "",
+                "target_session": lm_decision.get("target_session", ""),
+            }
+            offer = "I can't do that part myself — want me to put Claude on it?"
+            print(f"  offering to delegate leftover -> {leftover!r}")
+            bus.emit("route.matched", handler="offer_delegate", text=leftover)
+            say(offer, blocking=True)
+            brief.add_halo(offer)
+            last_activity = time.monotonic()
+            continue
 
         # Auto-enter direct-dialogue with whichever agent Stage 2 picked.
         if lm_decision.get("status") == "ready":

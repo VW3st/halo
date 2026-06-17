@@ -489,11 +489,15 @@ def try_match(text: str) -> bool:
     return False
 
 
-def execute_system_intent(cleaned_text: str) -> tuple[bool, str]:
+def execute_system_intent(cleaned_text: str) -> tuple[bool, str, str]:
     """Run every matching local tool in `cleaned_text`.
 
     Splits on "and"/"then"/comma so "open calculator and open chrome"
-    fires both handlers. Returns (any_handled, joined_summary).
+    fires both handlers. Returns (any_handled, joined_summary, leftover)
+    where `leftover` joins the phrases NO local tool could satisfy — e.g.
+    "open a browser AND search the web for X" opens the browser and hands
+    back "search the web for X" so the caller can offer to delegate it to a
+    coding agent instead of silently dropping it.
     """
     text = _strip_politeness(cleaned_text).rstrip(".!?,")
 
@@ -502,11 +506,12 @@ def execute_system_intent(cleaned_text: str) -> tuple[bool, str]:
     shandled, sspoken = _try_say(text)
     if shandled:
         bus.emit("tools.invoke", name="say", text=sspoken)
-        return True, sspoken
+        return True, sspoken, ""
 
     parts = [p.strip() for p in _SPLIT_RE.split(text) if p and p.strip()] or [text]
 
     summaries: list[str] = []
+    leftovers: list[str] = []  # phrases no local tool could handle
     any_handled = False
     fired: set[str] = set()  # don't double-fire the same tool in one turn
     # "open A and B" splits to ["open A", "B"]; the bare "B" lost the verb.
@@ -577,5 +582,9 @@ def execute_system_intent(cleaned_text: str) -> tuple[bool, str]:
             summaries.append(asummary)
             any_handled = True
             bus.emit("tools.invoke", name="open_app", text=asummary)
+        else:
+            # Nothing local matched this segment — keep it as a leftover the
+            # caller may delegate ("...and search the web for the score").
+            leftovers.append(part)
 
-    return any_handled, "  ".join(summaries)
+    return any_handled, "  ".join(summaries), "  ".join(leftovers)

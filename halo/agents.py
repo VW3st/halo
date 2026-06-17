@@ -224,7 +224,8 @@ AGENTS: dict[str, AgentConfig] = {
         check_call=("claude", "--version"),
         install_hint="npm install -g @anthropic-ai/claude-code  (then: claude login)",
         session_kind="persistent",
-        fuzzy_triggers=("claud", "clawed", "clod", "cloud", "clawde", "claus"),
+        fuzzy_triggers=("claud", "clawed", "clod", "cloud", "clawde", "claus",
+                        "clyde", "clode", "clawd"),
     ),
     "codex_cli": AgentConfig(
         key="codex_cli",
@@ -256,7 +257,8 @@ AGENTS: dict[str, AgentConfig] = {
         accepts_system_prompt_arg=False,
         check_call=("codex", "--version"),
         install_hint="npm install -g @openai/codex  (then: codex login)",
-        fuzzy_triggers=("codec", "codecs", "kodex", "co dex", "co-dex"),
+        fuzzy_triggers=("codec", "codecs", "kodex", "co dex", "co-dex",
+                        "krodex", "kadex", "cadex", "kodaks", "crodex"),
     ),
 }
 

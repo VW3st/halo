@@ -16,7 +16,12 @@ from halo.tools import (
 )
 
 
+_ran = 0
+
+
 def check(label: str, ok: bool) -> int:
+    global _ran
+    _ran += 1
     marker = "OK" if ok else "FAIL"
     print(f"  [{marker}] {label}")
     return 0 if ok else 1
@@ -59,7 +64,7 @@ def main() -> int:
     failed += check("plain question is not 'say'", _try_say("what time is it")[0] is False)
     failed += check(
         "exec say speaks remainder",
-        execute_system_intent("say we are live") == (True, "we are live"),
+        execute_system_intent("say we are live") == (True, "we are live", ""),
     )
     # Qualified time questions must NOT be answered by the local clock.
     failed += check("plain time is local", is_pure_tool("what time is it"))
@@ -72,18 +77,29 @@ def main() -> int:
     )
     failed += check(
         "exec doesn't answer Brisbane locally",
-        execute_system_intent("what is the date and time in Brisbane") == (False, ""),
+        execute_system_intent("what is the date and time in Brisbane")[0] is False,
     )
     # Multitask: a single command naming 2+ apps must open ALL of them.
     failed += check(
         "open A in B opens both (one phrase, two tools)",
         execute_system_intent("open calculator in the browser")
-        == (True, "Opened calculator.  Opened browser."),
+        == (True, "Opened calculator.  Opened browser.", ""),
     )
     failed += check(
         "open A and B opens both (bare list item gets the verb)",
         execute_system_intent("open the calculator and paint")
-        == (True, "Opened calculator.  Opened Paint."),
+        == (True, "Opened calculator.  Opened Paint.", ""),
+    )
+    # Chained command: do the local part, hand the agent-only part BACK as a
+    # leftover instead of silently dropping it ("...and search up the score").
+    failed += check(
+        "chained command hands back the agent-only remainder",
+        execute_system_intent("open a browser and search up the score")
+        == (True, "Opened browser.", "search up the score"),
+    )
+    failed += check(
+        "pure local multitask leaves no leftover",
+        execute_system_intent("open chrome and notepad")[2] == "",
     )
     failed += check(
         "open A and B and C — all three",
@@ -107,8 +123,7 @@ def main() -> int:
         "polite non-tool stays non-tool",
         not is_pure_tool("can you tell me a joke"),
     )
-    total = 26
-    print(f"\n{total - failed}/{total} passed")
+    print(f"\n{_ran - failed}/{_ran} passed")
     return 1 if failed else 0
 
 

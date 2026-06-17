@@ -429,11 +429,19 @@ To switch agents mid-flow:
 
 ```
 "switch to codex" / "talk to codex"        -> direct dialogue with Codex
+"spawn codex" / "open codex"                -> same (switch to Codex)
+"ask codex to generate the images"          -> dispatches THAT to Codex AND switches
 "transfer me to codex" / "transfer to ..."  -> same as switch
 "Codex, ..."                                -> dispatches to Codex AND switches
 "back to halo" / "talk to me"               -> exit direct dialogue
 "transfer me back to halo"                  -> same
 ```
+
+Naming the *other* agent mid-flow always wins — even while you're deep in a
+Claude thread, *"spawn Codex and generate the images"* goes to **Codex**, not
+Claude. (Whisper mis-hearing "Codex" as "Kodex"/"Krodex" is handled too.) A
+passing mention with no hand-off verb — *"the codec library"*, *"the cloud
+function"* — does **not** switch.
 
 Once you're in direct dialogue with an agent, Halo never auto-sleeps —
 the conversation stays open until you explicitly say `"goodbye"`,

@@ -10,6 +10,49 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.4.1] — 2026-06-17
+
+Conversation-feel fixes from live testing — stop the wrong agent swallowing
+your commands, stop a casual "that's it?" hanging up on you, and stop dropping
+the half of a command Halo can't do locally.
+
+### Fixed
+- **Direct-mode cross-agent hand-off** — while talking to one agent, naming the
+  OTHER ("switch to Codex", "spawn Codex", "ask Codex to …") used to get piped
+  to the current agent instead. Whisper hearing "Codex" as "Kodex"/"Krodex"
+  made it worse — the strict dispatch regexes missed the garble, so it fell
+  through to the active session. New `_direct_redirect` (+ curated, garble-
+  tolerant `_AGENT_REDIRECT_ALIASES`) intercepts a verb-marked mention of a
+  different agent in direct mode and switches/dispatches THERE. Real words that
+  collide with fuzzy triggers ("codec", "cloud") are excluded so a normal
+  instruction never yanks the conversation. Extra Whisper garbles added to the
+  agents' `fuzzy_triggers`.
+- **End phrase too eager** — a reaction like "That's it?" (= "is that all?")
+  ended the conversation. End phrases are now split into STRONG (unambiguous:
+  "go to sleep", "goodbye", "stop listening" — fire anywhere) and WEAK
+  ("that's it", "that's all", "bye" — only end when they're the WHOLE utterance
+  AND not a question). The raw transcript's trailing "?" (which `cleaned_text`
+  strips) is the question signal.
+- **Name punctuation** — "Good. What's up?" + name produced "What's up?,
+  Valentino." The name is now tucked in before the final terminal punctuation:
+  "What's up, Valentino?".
+
+### Added
+- **Delegate the part Halo can't do** — a chained command does its local parts
+  and hands back the remainder instead of dropping it: "open a browser AND
+  search the web for X" opens the browser, then offers "I can't do that part
+  myself — want me to put Claude on it?". `execute_system_intent` now returns
+  the unhandled leftover; the loop offers to delegate (honoring "confirm before
+  Claude"). A "yes" dispatches it.
+- **Conversational hand-off ack** — dispatching to an agent now says "On it —
+  starting Claude. Anything else while that runs?" instead of dead air, so you
+  can keep going while the job works in the background.
+- `scripts/test_conversation_flow.py` (18 checks: end-phrase split, name
+  punctuation, direct-mode redirect). Tool regressions now cover the chained-
+  command leftover (28 checks total).
+
+---
+
 ## [1.4.0] — 2026-06-16
 
 Persistent memory — no more amnesia.
