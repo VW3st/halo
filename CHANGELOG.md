@@ -6,7 +6,25 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ## [Unreleased]
 
-Multi-agent command-center work (phased). Phases 1–2 shipped below.
+Multi-agent command-center work (phased). Phases 1–3 shipped below.
+
+---
+
+## [1.5.2] — 2026-06-17
+
+Phase 3 — the return loop: answer an agent's question and it goes back to that
+session.
+
+### Added
+- **Agent question → your answer routes back** — when a finished agent's reply
+  ENDS on a question ("…want me to send it a first prompt, or are you driving
+  it yourself?"), Halo reads the question out (even in quiet mode; skipped if you
+  already heard it stream live) and **arms answer-routing**: your very next
+  utterance goes straight back to that agent's session, bypassing the follow-up
+  gate (a plain "yes" / "I'm driving it" wouldn't pass it otherwise). A control
+  phrase ("go back" / "switch to Codex" / "stop") still wins, so you can
+  redirect instead of answering. (`_result_is_question`, `_extract_question`,
+  `_agent_question_pending`, handler 5d.)
 
 ---
 

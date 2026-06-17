@@ -255,6 +255,19 @@ def main() -> int:
         m._is_yes("yes but make it blue") is False,
     )
 
+    # --- agent question detection (answer routes back to that session) -----
+    q = ("A new Claude session just opened. Want me to send it a first prompt, "
+         "or are you driving it yourself?")
+    r = ("It's open now: a luxury coastal page with a hero form. "
+         "I wrote it to goldcoast-landing.html.")
+    failed += check("agent question detected", m._result_is_question(q) is True)
+    failed += check("plain result is NOT a question", m._result_is_question(r) is False)
+    failed += check(
+        "extracts the trailing question",
+        m._extract_question(q)
+        == "Want me to send it a first prompt, or are you driving it yourself?",
+    )
+
     # --- quiet / work mode toggle -----------------------------------------
     for on in ("quiet mode", "work mode", "stop narrating", "work quietly"):
         failed += check(f"quiet ON: {on!r}", m._wants_quiet_on(on) is True)

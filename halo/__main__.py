@@ -97,6 +97,11 @@ _desktop_last_error: str = ""
 # can do ("open a browser AND search the web for X"). _handle_decision stashes
 # that delegatable remainder here; the conversation loop offers to hand it off.
 _system_leftover: str = ""
+# Set by _drain_completed_jobs when a finished agent's reply ENDS in a question
+# ("…want me to send it a prompt, or are you driving?"). The conversation loop
+# consumes it to route the user's next answer straight back to that session,
+# bypassing the follow-up gate.
+_agent_question_pending: str | None = None
 # Navigation MRU: the agent/session frames we've been in, most-recent first,
 # so "go back" / "the other one" / "previous session" / "back to Codex" can
 # return to where we were. (agent_key, session_label) tuples; persists across
@@ -1557,6 +1562,23 @@ def _join_names(names: list[str]) -> str:
     return f"{', '.join(names[:-1])} and {names[-1]}"
 
 
+def _result_is_question(text: str) -> bool:
+    """True when an agent's reply ENDS on a question — i.e. it's waiting on the
+    user ('…or are you driving it yourself?'), not just reporting a result."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    parts = re.split(r"(?<=[.!?])\s+", t)
+    return parts[-1].strip().endswith("?")
+
+
+def _extract_question(text: str) -> str:
+    """The trailing question sentence from an agent reply, for read-back."""
+    t = (text or "").strip()
+    parts = re.split(r"(?<=[.!?])\s+", t)
+    return (parts[-1].strip() if parts else t)
+
+
 def _summarize_with_timeout(reply_text: str, prompt: str, timeout: float = 6.0) -> str:
     """`summarize_reply` with a hard wall-clock cap.
 
@@ -1642,6 +1664,28 @@ def _drain_completed_jobs() -> None:
     # Single completion — full detailed cap.
     spoken_name, job, stream_state, cfg = drained[0]
     if job.ok:
+        # The agent's reply ends on a question -> it's waiting on the user.
+        # Arm answer-routing (the loop sends the user's next utterance straight
+        # back to this session) and read the question out, unless the user
+        # already heard it stream live.
+        full_reply = (job.result or "").strip()
+        if _result_is_question(full_reply):
+            global _agent_question_pending
+            _agent_question_pending = job.agent_key
+            bus.emit("agent.question", agent=job.agent_key, name=spoken_name)
+            spoke_live = (
+                cfg.streams_text_deltas
+                and stream_state is not None
+                and not stream_state.was_truncated
+            )
+            if spoke_live:
+                print(f"  agent question (heard live) -> {job.agent_key}")
+            else:
+                q = _extract_question(full_reply)
+                print(f"  agent question -> {job.agent_key}: {q!r}")
+                say(f"{spoken_name} is asking. {q}", blocking=True)
+            mark_consumed(job)
+            return
         if cfg.streams_text_deltas:
             # Streaming agent: spoke first N sentences live. If the
             # reply ran past the live budget, summarize the
@@ -2161,7 +2205,7 @@ def run_conversation() -> None:
     # Halo remembers earlier turns instead of forgetting every time it sleeps.
     # Reset only on an explicit "new session". Also exposed module-level so
     # background-job completions can fold the agent's reply into it.
-    global _active_brief, _system_leftover
+    global _active_brief, _system_leftover, _agent_question_pending
     if _active_brief is None:
         _active_brief = _ConversationBrief()
     brief = _active_brief
@@ -2267,6 +2311,20 @@ def run_conversation() -> None:
         last_activity = time.monotonic()
         engaged = True
         brief.add_user(cleaned)
+
+        # If an agent just asked a question, this utterance is the answer —
+        # route it straight back to that session (see handler 5d), unless the
+        # user instead says a control phrase (end/switch/nav/quiet) handled
+        # earlier. One-shot: armed only for the turn right after the question.
+        answer_armed = False
+        if _agent_question_pending is not None:
+            qa = _agent_question_pending
+            _agent_question_pending = None
+            if qa in AGENTS:
+                direct_agent = _set_direct(qa)
+                direct_session_label = None
+                answer_armed = True
+                print(f"  answer routing armed -> {qa}")
 
         # Dictation trigger wins over EVERYTHING — including a pending
         # confirmation/clarification — so a mis-heard "dictate" can never
@@ -2539,6 +2597,22 @@ def run_conversation() -> None:
             print("  quiet/work mode OFF")
             bus.emit("route.matched", handler="quiet_off")
             say("Back to narrating.", blocking=True)
+            last_activity = time.monotonic()
+            continue
+
+        # 5d. Answering an agent's question — route straight back to that
+        #     session, bypassing the follow-up gate (a plain "yes" / "I'm
+        #     driving it" answer wouldn't pass it). Runs AFTER the control
+        #     handlers above, so a redirect ("go back" / "switch to Codex")
+        #     still wins over treating the utterance as an answer.
+        if answer_armed and direct_agent in AGENTS:
+            print(f"  answering {direct_agent}'s question -> {cleaned!r}")
+            bus.emit("route.matched", handler="answer_question", target=direct_agent)
+            phrase = _start_agent_and_ack(
+                direct_agent, cleaned, cwd=_cwd_for_dispatch(""), brief=brief
+            )
+            if phrase:
+                say(phrase, blocking=True)
             last_activity = time.monotonic()
             continue
 
