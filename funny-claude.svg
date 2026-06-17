@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600" width="800" height="600" font-family="Segoe UI, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="1" stop-color="#1c2550"/>
+    </linearGradient>
+    <linearGradient id="term" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#11183a"/>
+      <stop offset="1" stop-color="#0c1330"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="800" height="600" fill="url(#bg)"/>
+
+  <!-- floating sparkles -->
+  <g fill="#5ce1c8" opacity="0.8">
+    <circle cx="120" cy="90" r="4"><animate attributeName="cy" values="90;75;90" dur="4s" repeatCount="indefinite"/></circle>
+    <circle cx="700" cy="120" r="5"><animate attributeName="cy" values="120;105;120" dur="5s" repeatCount="indefinite"/></circle>
+    <circle cx="660" cy="470" r="3"><animate attributeName="cy" values="470;458;470" dur="3.5s" repeatCount="indefinite"/></circle>
+  </g>
+
+  <!-- terminal window -->
+  <g transform="translate(180,150)">
+    <rect x="0" y="0" width="440" height="300" rx="22" fill="url(#term)" stroke="#7c8cff" stroke-width="2"/>
+    <rect x="0" y="0" width="440" height="46" rx="22" fill="#1a2350"/>
+    <rect x="0" y="24" width="440" height="22" fill="#1a2350"/>
+    <circle cx="28" cy="23" r="7" fill="#ff5f57"/>
+    <circle cx="52" cy="23" r="7" fill="#febc2e"/>
+    <circle cx="76" cy="23" r="7" fill="#28c840"/>
+
+    <!-- cute face -->
+    <g transform="translate(220,150)">
+      <!-- body glow -->
+      <ellipse cx="0" cy="20" rx="120" ry="90" fill="#7c8cff" opacity="0.12"/>
+      <!-- eyes -->
+      <g>
+        <ellipse cx="-45" cy="0" rx="22" ry="26" fill="#eef1ff"/>
+        <ellipse cx="45" cy="0" rx="22" ry="26" fill="#eef1ff"/>
+        <circle cx="-40" cy="4" r="9" fill="#0b1020">
+          <animate attributeName="cx" values="-40;-50;-40;-30;-40" dur="6s" repeatCount="indefinite"/>
+        </circle>
+        <circle cx="50" cy="4" r="9" fill="#0b1020">
+          <animate attributeName="cx" values="50;40;50;60;50" dur="6s" repeatCount="indefinite"/>
+        </circle>
+        <!-- blink -->
+        <rect x="-67" y="-26" width="44" height="0" fill="#0c1330">
+          <animate attributeName="height" values="0;0;0;52;0" dur="5s" repeatCount="indefinite"/>
+        </rect>
+        <rect x="23" y="-26" width="44" height="0" fill="#0c1330">
+          <animate attributeName="height" values="0;0;0;52;0" dur="5s" repeatCount="indefinite"/>
+        </rect>
+      </g>
+      <!-- big grin -->
+      <path d="M -55 45 Q 0 95 55 45" fill="none" stroke="#5ce1c8" stroke-width="8" stroke-linecap="round"/>
+      <!-- rosy cheeks -->
+      <circle cx="-78" cy="40" r="12" fill="#ff7aa8" opacity="0.4"/>
+      <circle cx="78" cy="40" r="12" fill="#ff7aa8" opacity="0.4"/>
+    </g>
+  </g>
+
+  <!-- speech bubble -->
+  <g transform="translate(470,90)">
+    <rect x="0" y="0" width="280" height="64" rx="16" fill="#eef1ff"/>
+    <path d="M 40 60 L 30 92 L 70 62 Z" fill="#eef1ff"/>
+    <text x="140" y="32" text-anchor="middle" font-size="18" font-weight="700" fill="#0b1020">I pressed Shift+Tab</text>
+    <text x="140" y="52" text-anchor="middle" font-size="18" font-weight="700" fill="#7c2d8a">and now I'm unstoppable</text>
+  </g>
+
+  <!-- caption -->
+  <text x="400" y="510" text-anchor="middle" font-size="30" font-weight="800" fill="#eef1ff">When you finally learn the shortcuts</text>
+  <text x="400" y="548" text-anchor="middle" font-size="18" fill="#9aa3c7">Esc to stop. Shift+Tab to fly. Coffee optional.</text>
+</svg>

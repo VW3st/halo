@@ -233,6 +233,15 @@ class _ConversationBrief:
     def add_halo(self, text: str) -> None:
         self._add("halo", text)
 
+    def drop_last_user(self) -> None:
+        """Remove the most recent 'user' turn — called when an utterance is
+        dropped as side-talk so a phone call / muttering / reacting to the
+        screen doesn't pollute the agent's prompt context or the brain history."""
+        for i in range(len(self.turns) - 1, -1, -1):
+            if self.turns[i][0] == "user":
+                del self.turns[i]
+                break
+
     def clear(self) -> None:
         self.turns.clear()
 
@@ -1091,7 +1100,10 @@ _AGENT_VOCATIVE_RE = re.compile(
 _BACK_TO_HALO_RE = re.compile(
     r"\b(?:back to halo|halo (?:back|take over)|stop (?:talking to|using) "
     r"(?:claude|codex)|exit (?:claude|codex)|leave (?:claude|codex)|"
-    r"talk to me|hand it back|transfer (?:me )?back to halo)\b",
+    r"talk to me|hand it back|transfer (?:me )?back to halo|"
+    r"(?:go |come |get )?back to (?:the )?brain|"        # "back to the brain"
+    r"(?:to |talk to )the brain|brain mode|halo,? you take it|"
+    r"i'?m talking to you halo|let me talk to halo)\b",
     re.IGNORECASE,
 )
 
@@ -2838,6 +2850,12 @@ def run_conversation() -> None:
                         reason=reason,
                         agent=direct_agent,
                     )
+                    # Drop it from the rolling memory too — it was added at the
+                    # top of the turn, but side-talk (reactions, jokes, a phone
+                    # call) must not pile into the agent's prompt context. This
+                    # is what stuffed dispatches full of "He slid down the
+                    # stairs" etc.
+                    brief.drop_last_user()
                     # Stay in direct mode. Don't reset last_activity —
                     # we don't want a phone call to keep the engaged
                     # window alive indefinitely; the existing 90s

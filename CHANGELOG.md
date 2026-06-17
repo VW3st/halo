@@ -6,7 +6,22 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ## [Unreleased]
 
-(none yet)
+Real image generation (researching) — "generate an image" should produce an
+actual PNG, not a hand-drawn SVG.
+
+---
+
+## [1.5.6] — 2026-06-17
+
+### Fixed
+- **Side-talk no longer pollutes the agent's context** — every utterance was
+  added to the rolling memory at the top of the turn, so reactions / jokes / a
+  phone call that the follow-up gate then dropped still piled into the next
+  dispatch's prompt (dispatches were full of "He slid down the stairs"). The
+  gate-drop now also `drop_last_user()`s it from the brief.
+- **"back to the brain" exits direct dialogue** — you couldn't get back to
+  Halo's own brain while talking to an agent; only "back to halo" / "talk to
+  me" worked. Added "(go/come/get) back to the brain", "brain mode", etc.
 
 ---
 

@@ -255,6 +255,23 @@ def main() -> int:
         m._is_yes("yes but make it blue") is False,
     )
 
+    # --- back to the brain / drop side-talk from context -------------------
+    for p in ("go back to the brain", "back to the brain", "brain mode"):
+        failed += check(f"'{p}' exits direct mode", m._wants_back_to_halo(p) is True)
+    failed += check(
+        "'the brain is slow' does NOT exit direct mode",
+        m._wants_back_to_halo("the brain is slow") is False,
+    )
+    _b = m._ConversationBrief()
+    _b.add_user("real command")
+    _b.add_halo("ok")
+    _b.add_user("he slid down the stairs")  # side-talk
+    _b.drop_last_user()
+    failed += check(
+        "drop_last_user removes only the last user turn (side-talk)",
+        [t for (r, t, _ts) in _b.turns if r == "user"] == ["real command"],
+    )
+
     # --- memory-aware wake greeting ---------------------------------------
     uc.cfg.persona.user_name = "Valentino"
     m._last_wake_at = None
