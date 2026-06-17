@@ -106,6 +106,28 @@ def set_quiet(on: bool) -> None:
     _QUIET_MODE = bool(on)
 
 
+# Barge-in CAPTURE: accept a substantive interruption (not just "stop"/"wait")
+# while Halo is speaking. Off unless HALO_BARGE_IN_CAPTURE=1 OR an echo-
+# cancelling mic (NVIDIA Broadcast / RTX Voice / Krisp) is detected at startup,
+# in which case __main__ turns it on (hardware AEC keeps Halo from hearing
+# itself; the recently_spoke() word-overlap guard is the software backstop).
+_BARGE_CAPTURE = os.getenv("HALO_BARGE_IN_CAPTURE", "").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+# Whether the env var was explicitly set — auto-detect won't override a
+# deliberate HALO_BARGE_IN_CAPTURE=0.
+BARGE_CAPTURE_EXPLICIT = "HALO_BARGE_IN_CAPTURE" in os.environ
+
+
+def is_barge_capture() -> bool:
+    return _BARGE_CAPTURE
+
+
+def set_barge_capture(on: bool) -> None:
+    global _BARGE_CAPTURE
+    _BARGE_CAPTURE = bool(on)
+
+
 # Recent spoken text, for the barge-in echo guard. When the mic captures speech
 # while Halo is talking, we compare it against what Halo just said — if it
 # overlaps heavily it's mic echo of Halo's own voice, not the user.

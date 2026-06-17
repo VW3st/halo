@@ -328,6 +328,18 @@ def main() -> int:
         cfg.TURN_MAX_SEC < cfg.TURN_MAX_HARD_SEC
         and cfg.TURN_CONTINUATION_GRACE_SEC > 0,
     )
+    # Echo-cancelling mic -> auto-enable talk-over (barge-in capture).
+    failed += check(
+        "NVIDIA Broadcast mic is recognized as echo-cancelling",
+        bool(m._ECHO_CANCEL_MIC_RE.search("Microphone (NVIDIA Broadcast)")) is True,
+    )
+    failed += check(
+        "Blue Snowball is NOT flagged as echo-cancelling",
+        bool(m._ECHO_CANCEL_MIC_RE.search("Microphone (Blue Snowball)")) is False,
+    )
+    _v.set_barge_capture(True)
+    failed += check("barge-capture flag round-trips", _v.is_barge_capture() is True)
+    _v.set_barge_capture(False)
 
     # --- dictation voice exit ---------------------------------------------
     failed += check(

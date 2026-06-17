@@ -29,7 +29,6 @@ import time
 
 from halo.config import (
     BACKCHANNEL_AFTER_SEC,
-    BARGE_IN_CAPTURE,
     BARGE_IN_CAPTURE_MIN_WORDS,
     HOLD_SUPPRESS_SEC,
     MODE_SILENCE_SEC,
@@ -214,11 +213,13 @@ def listen_for_barge_in(timeout: float = 20.0) -> str | None:
                 print(f"  barge-in candidate: {cleaned!r}")
                 if is_barge_in_phrase(cleaned):
                     return cleaned
-                # Opt-in capture: a real, substantive interruption (not one of
-                # Halo's own echoed words) stops the reply and gets routed —
-                # "capture what I say even while you're talking".
+                # Capture: a real, substantive interruption (not one of Halo's
+                # own echoed words) stops the reply and gets routed — "capture
+                # what I say even while you're talking". Live flag so an
+                # echo-cancelling mic can enable it at startup.
+                from halo.voice import is_barge_capture as _barge_capture_on
                 if (
-                    BARGE_IN_CAPTURE
+                    _barge_capture_on()
                     and len(cleaned.split()) >= BARGE_IN_CAPTURE_MIN_WORDS
                 ):
                     from halo.voice import recently_spoke as _recently_spoke

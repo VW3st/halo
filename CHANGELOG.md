@@ -6,9 +6,28 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ## [Unreleased]
 
-Multi-agent command-center work (phased). Phases 1–5 shipped below.
-Phase 6 (acoustic echo cancellation for always-on talk-over) is the remaining
-item — it needs live-mic validation, so it's deferred to a dedicated pass.
+(none yet)
+
+---
+
+## [1.5.5] — 2026-06-17
+
+Phase 6 — talk over Halo (when the mic can take it).
+
+### Added
+- **Auto talk-over on echo-cancelling mics** — rather than ship a heavy DSP
+  echo-canceller into the audio path (which needs live-mic tuning), Halo now
+  detects when the input device already cancels echo — **NVIDIA Broadcast**,
+  RTX Voice, Krisp — and turns on **barge-in capture** automatically: you can
+  interrupt with a real command while Halo is speaking, and it stops and acts on
+  it. The hardware AEC keeps Halo from hearing itself; the `recently_spoke()`
+  word-overlap guard is the software backstop. A deliberate
+  `HALO_BARGE_IN_CAPTURE=0` is still respected. (`_mic_has_echo_cancellation`,
+  `voice.is_barge_capture/set_barge_capture` — now a live flag so it can flip at
+  startup.)
+- Best results on other mics: enable your mic's echo cancellation (NVIDIA
+  Broadcast "Echo Removal"), or set `HALO_BARGE_IN_CAPTURE=1` and test. Full
+  software AEC (WebRTC APM) remains a future option for mics without it.
 
 ---
 

@@ -76,10 +76,12 @@ from halo.router import (
 from halo.tools import _try_say, execute_system_intent
 from halo.turn import listen_for_barge_in, run_turn
 from halo.userconfig import cfg as user_cfg
+from halo.voice import BARGE_CAPTURE_EXPLICIT as _barge_capture_explicit
 from halo.voice import is_available as voice_available
 from halo.voice import is_quiet as voice_is_quiet
 from halo.voice import is_speaking as voice_is_speaking
 from halo.voice import preload_voice, say
+from halo.voice import set_barge_capture as voice_set_barge_capture
 from halo.voice import set_quiet as voice_set_quiet
 from halo.voice import stop as voice_stop
 from halo.voice import wait_until_silent as voice_wait_until_silent
@@ -736,6 +738,25 @@ def _wake_greeting() -> str:
         [f"{greet}. What can I do?", f"{greet}. What's the plan?",
          f"{greet}. What do you need?"]
     )
+
+
+# Mics with built-in echo cancellation / noise removal — when one of these is
+# the input device, Halo can safely capture talk-over (it won't hear itself).
+_ECHO_CANCEL_MIC_RE = re.compile(
+    r"nvidia broadcast|rtx voice|krisp|echo cancel|aec|chat\s*150|elgato wave",
+    re.IGNORECASE,
+)
+
+
+def _mic_has_echo_cancellation() -> bool:
+    """True when the current input device name suggests hardware/driver echo
+    cancellation (NVIDIA Broadcast, RTX Voice, Krisp, …)."""
+    try:
+        import sounddevice as sd
+        name = str(sd.query_devices(kind="input").get("name", ""))
+        return bool(_ECHO_CANCEL_MIC_RE.search(name))
+    except Exception:
+        return False
 
 
 def _converse(text: str, brief: "_ConversationBrief | None" = None) -> str:
@@ -3062,6 +3083,15 @@ def main() -> None:
             joined = ", ".join(avail[:-1]) + f", and {avail[-1]}"
             say(f"Halo online. Connected: {joined}.{sess_tail}", blocking=False)
     print(f"agents: {', '.join(available_agents()) or '(none connected)'}")
+
+    # Talk-over: if the input device does its own echo cancellation (NVIDIA
+    # Broadcast / RTX Voice / Krisp), enable barge-in capture so the user can
+    # interrupt with a real command while Halo speaks — the hardware AEC keeps
+    # Halo from hearing itself (the recently_spoke guard is the backstop). Don't
+    # override a deliberate HALO_BARGE_IN_CAPTURE=0.
+    if not _barge_capture_explicit and _mic_has_echo_cancellation():
+        voice_set_barge_capture(True)
+        print("  echo-cancelling mic detected -> talk-over (barge-in capture) ON")
 
     try:
         while True:
