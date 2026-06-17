@@ -6,7 +6,25 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ## [Unreleased]
 
-Multi-agent command-center work (phased). Phases 1–4 shipped below.
+Multi-agent command-center work (phased). Phases 1–5 shipped below.
+Phase 6 (acoustic echo cancellation for always-on talk-over) is the remaining
+item — it needs live-mic validation, so it's deferred to a dedicated pass.
+
+---
+
+## [1.5.4] — 2026-06-17
+
+Phase 5 — a greeting that knows you.
+
+### Added
+- **Memory-aware wake greeting** — instead of a hard-coded "I'm here." every
+  time, Halo now greets you by name with a little variation, and weaves in what
+  you've been working on when memory has it ("Welcome back, Valentino. Last
+  time we were on the bakery site. What's next?"). A rapid re-wake (within
+  10 min) gets a short ack ("Yes?" / "Go ahead.") instead of a full welcome, so
+  it isn't repetitive; after a gap it greets warmly again. Pulls the project
+  from durable memory facts (`_project_hint` / `_wake_greeting`); falls back to
+  a friendly varied line when there's nothing stored.
 
 ---
 

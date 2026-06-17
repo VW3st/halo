@@ -255,6 +255,30 @@ def main() -> int:
         m._is_yes("yes but make it blue") is False,
     )
 
+    # --- memory-aware wake greeting ---------------------------------------
+    uc.cfg.persona.user_name = "Valentino"
+    m._last_wake_at = None
+    first = m._wake_greeting()
+    failed += check("first wake greets warmly with the name", "Valentino" in first)
+    rapid = m._wake_greeting()
+    failed += check(
+        "rapid re-wake gets a short ack (cooldown)",
+        rapid in ("Yes?", "Go ahead.", "I'm here.", "Mm-hm?", "Yeah?"),
+    )
+    m._last_wake_at = m.time.monotonic() - (m._WAKE_REGREET_SEC + 10)
+    failed += check("after the gap, greets warmly again", "Valentino" in m._wake_greeting())
+
+    class _FakeMem:
+        def top_facts(self, limit=6):
+            return [("project", "I'm working on the bakery site")]
+    _saved_mem = m._MEMORY
+    m._MEMORY = _FakeMem()
+    failed += check(
+        "project hint humanizes 'I'm working on the bakery site'",
+        m._project_hint() == "the bakery site",
+    )
+    m._MEMORY = _saved_mem
+
     # --- agent question detection (answer routes back to that session) -----
     q = ("A new Claude session just opened. Want me to send it a first prompt, "
          "or are you driving it yourself?")

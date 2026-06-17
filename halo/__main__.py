@@ -97,6 +97,10 @@ _desktop_last_error: str = ""
 # can do ("open a browser AND search the web for X"). _handle_decision stashes
 # that delegatable remainder here; the conversation loop offers to hand it off.
 _system_leftover: str = ""
+# Wake-greeting cooldown: a full "welcome back" on the first wake / after a gap,
+# a short ack on a rapid re-wake. monotonic, so a restart always greets warmly.
+_last_wake_at: float | None = None
+_WAKE_REGREET_SEC = 600.0
 # Set by _drain_completed_jobs when a finished agent's reply ENDS in a question
 # ("…want me to send it a prompt, or are you driving?"). The conversation loop
 # consumes it to route the user's next answer straight back to that session,
@@ -688,6 +692,50 @@ def _chitchat_reply(text: str) -> str | None:
         if pattern.search(text):
             return random.choice(replies)
     return None
+
+
+def _project_hint() -> str:
+    """A short human phrase for what the user has been working on, from durable
+    memory — for a contextual wake greeting. "" when nothing's stored."""
+    if _MEMORY is None:
+        return ""
+    try:
+        for cat, fact in _MEMORY.top_facts(limit=6):
+            if cat == "project" and (fact or "").strip():
+                t = fact.strip().rstrip(".")
+                t = re.sub(
+                    r"^(?:works?|working|i'?m\s+working|we'?re\s+working)\s+on\s+|"
+                    r"^(?:my|the)\s+project\s+is\s+|^building\s+",
+                    "", t, flags=re.IGNORECASE,
+                ).strip()
+                return t
+    except Exception:
+        pass
+    return ""
+
+
+def _wake_greeting() -> str:
+    """The line Halo speaks on wake. Memory-aware + varied; a rapid re-wake gets
+    a short ack instead of a full 'welcome back' (cooldown)."""
+    import random
+    global _last_wake_at
+    now = time.monotonic()
+    rapid = _last_wake_at is not None and (now - _last_wake_at) < _WAKE_REGREET_SEC
+    _last_wake_at = now
+    if rapid:
+        return random.choice(["Yes?", "Go ahead.", "I'm here.", "Mm-hm?", "Yeah?"])
+    name = _user_name()
+    opener = random.choice(
+        ["Hey", "Welcome back", "Hey there", "Good to see you", "Back at it"]
+    )
+    greet = f"{opener}, {name}" if name else opener
+    hint = _project_hint()
+    if hint:
+        return f"{greet}. Last time we were on {hint}. What's next?"
+    return random.choice(
+        [f"{greet}. What can I do?", f"{greet}. What's the plan?",
+         f"{greet}. What do you need?"]
+    )
 
 
 def _converse(text: str, brief: "_ConversationBrief | None" = None) -> str:
@@ -3027,7 +3075,7 @@ def main() -> None:
                 continue
             print("\nwake word detected -- entering conversation\n")
             bus.emit("convo.entered")
-            say("I'm here.", blocking=True)
+            say(_wake_greeting(), blocking=True)
             run_conversation()
             bus.emit("convo.exited")
             print("conversation ended -- back to wake-listening\n")
