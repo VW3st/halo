@@ -688,6 +688,7 @@ def _run(
     label: str,
     on_voice_tick: Optional[Callable[[float], None]] = None,
     on_text_chunk: Optional[Callable[[str], None]] = None,
+    on_output_line: Optional[Callable[[str], None]] = None,
     stream_text_deltas: bool = False,
     json_result_field: str = "result",
 ) -> tuple[bool, str, str]:
@@ -784,12 +785,32 @@ def _run(
                 stderr_thread.join(timeout=2.0)
                 done.set()
         else:
+            # Read stdout line-by-line (not communicate()) so a non-streaming
+            # agent like Codex is VISIBLE: each line is pushed to the dashboard
+            # as it arrives instead of the session going dark until it finishes.
+            # The final result is the joined output, same as before.
+            lines: list[str] = []
             try:
-                stdout, _ = proc.communicate(timeout=timeout)
-                box["stdout"] = stdout or ""
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                box["error"] = f"timed out after {timeout:.0f}s"
+                stream = proc.stdout
+                if stream is not None:
+                    for line in stream:
+                        line = line.rstrip("\n")
+                        lines.append(line)
+                        if line.strip():
+                            print(f"    [{label}] {line}")
+                            if on_output_line is not None:
+                                try:
+                                    on_output_line(line)
+                                except Exception:
+                                    pass
+                try:
+                    proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    box["error"] = f"timed out after {timeout:.0f}s"
+                box["stdout"] = "\n".join(lines)
+            except (ValueError, OSError):
+                box["stdout"] = "\n".join(lines)
             finally:
                 stderr_thread.join(timeout=2.0)
                 done.set()
@@ -937,6 +958,7 @@ def dispatch(
     timeout: float = DEFAULT_TIMEOUT_SEC,
     on_voice_tick: Optional[Callable[[float], None]] = None,
     on_text_chunk: Optional[Callable[[str], None]] = None,
+    on_output_line: Optional[Callable[[str], None]] = None,
 ) -> tuple[bool, str]:
     """Synchronous one-shot dispatch (used by start_job and tests).
 
@@ -1023,6 +1045,7 @@ def dispatch(
             label=f"{config.key}-{Path(workdir).name or 'root'}",
             on_voice_tick=on_voice_tick,
             on_text_chunk=on_text_chunk if config.streams_text_deltas else None,
+            on_output_line=on_output_line if not config.streams_text_deltas else None,
             stream_text_deltas=config.streams_text_deltas,
             json_result_field=config.json_result_field,
         )
@@ -1210,6 +1233,19 @@ def start_job(
             if on_text_chunk is not None and owns_voice_floor(job.job_id):
                 on_text_chunk(sentence)
 
+        def _on_output(line: str) -> None:
+            """Non-streaming agents (Codex): push each stdout line to the
+            dashboard so the session is VISIBLE live. Shown, never spoken —
+            and it resets the keepalive clock so murmurs don't fire while
+            Codex is actively producing output."""
+            nonlocal _last_chunk_at
+            with _chunk_lock:
+                _last_chunk_at = time.monotonic()
+            bus.emit(
+                "agent.streaming",
+                agent=agent_key, name=spoken, cwd=workdir, sentence=line,
+            )
+
         def _keepalive() -> None:
             """Fill dead air: if the foreground job goes quiet for a while
             (long tool run, no text deltas), murmur a short 'still working'
@@ -1255,6 +1291,7 @@ def start_job(
                     agent_key, prompt,
                     cwd=Path(workdir), timeout=timeout,
                     on_text_chunk=_on_chunk,
+                    on_output_line=_on_output,
                 )
             except Exception as exc:  # safety net so the thread never crashes silently
                 ok, text = False, f"unexpected error: {exc}"

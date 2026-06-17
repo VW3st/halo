@@ -6,7 +6,24 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ## [Unreleased]
 
-Multi-agent command-center work (phased). Phases 1–3 shipped below.
+Multi-agent command-center work (phased). Phases 1–4 shipped below.
+
+---
+
+## [1.5.3] — 2026-06-17
+
+Phase 4 — see Codex run.
+
+### Added
+- **Codex live visibility** — Codex (`codex exec`) is one-shot and used to go
+  dark until it finished ("couldn't see Codex running"). `_run`'s batch branch
+  now reads stdout **line-by-line** and pushes each line onto the bus as an
+  `agent.streaming` event — the same event the dashboard already renders for
+  Claude — so you can watch Codex work in real time at http://127.0.0.1:7070.
+  Lines are shown, never spoken, and they reset the keepalive clock so murmurs
+  don't fire while Codex is producing output. The final result is unchanged
+  (joined output). Threaded via a new `on_output_line` callback
+  (`_run` → `dispatch` → `start_job._on_output`); no frontend rebuild needed.
 
 ---
 
