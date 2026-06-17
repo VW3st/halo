@@ -255,6 +255,21 @@ def main() -> int:
         m._is_yes("yes but make it blue") is False,
     )
 
+    # --- quiet / work mode toggle -----------------------------------------
+    for on in ("quiet mode", "work mode", "stop narrating", "work quietly"):
+        failed += check(f"quiet ON: {on!r}", m._wants_quiet_on(on) is True)
+    for off in ("narrate", "verbose mode", "read it out", "start narrating"):
+        failed += check(f"quiet OFF: {off!r}", m._wants_quiet_off(off) is True)
+    failed += check(
+        "bare 'be quiet' is NOT a mode toggle (means stop now)",
+        m._wants_quiet_on("be quiet") is False,
+    )
+    import halo.voice as _v
+    _v.set_quiet(True)
+    failed += check("voice.is_quiet True after set_quiet(True)", _v.is_quiet() is True)
+    _v.set_quiet(False)
+    failed += check("voice.is_quiet False after set_quiet(False)", _v.is_quiet() is False)
+
     # --- barge-in echo guard ("never lose the mic" / capture-while-talking) -
     import halo.voice as v
     import halo.config as cfg

@@ -6,7 +6,23 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ## [Unreleased]
 
-Multi-agent command-center work (phased). Phase 1 below.
+Multi-agent command-center work (phased). Phases 1–2 shipped below.
+
+---
+
+## [1.5.1] — 2026-06-17
+
+Phase 2 — quiet/work mode (stop the constant narration while you work).
+
+### Added
+- **Quiet / work mode** — say *"quiet mode"* / *"work mode"* / *"stop
+  narrating"* / *"work quietly"* and Halo stops reading agent output aloud and
+  drops the "still working" murmurs; it only speaks when a job **finishes** or
+  needs you. Say *"narrate"* / *"verbose mode"* / *"start narrating"* to turn it
+  back on. Also `HALO_QUIET_MODE=1`. Direct replies (acks, confirmations,
+  answers to you) still speak. Bare *"quiet"* / *"be quiet"* still means "stop
+  talking now," not the mode. (`voice.is_quiet/set_quiet`, gated in
+  `_start_agent_and_ack` live budget and the `agents.py` keepalive watchdog.)
 
 ---
 

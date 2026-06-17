@@ -1222,6 +1222,9 @@ def start_job(
                 time.sleep(_KEEPALIVE_POLL_SEC)
                 if job.is_done:
                     break
+                # Quiet/work mode: no "still working" murmurs at all.
+                if voice.is_quiet():
+                    continue
                 # Only the active speaker murmurs, and only when nothing is
                 # already playing and the stream has actually gone silent.
                 if not owns_voice_floor(job.job_id):

@@ -88,6 +88,24 @@ def is_speaking() -> bool:
         return _active_say_count > 0 or _time.monotonic() < _speaking_until
 
 
+# Quiet / work mode: when on, agents do NOT narrate their output live and Halo
+# skips the "still working" keepalive murmurs — it only speaks when a job
+# finishes or needs the user. Direct replies (acks, confirmations, answers to
+# the user) still speak. Toggled by voice ("quiet mode" / "narrate") or
+# HALO_QUIET_MODE=1. Read by _start_agent_and_ack (live budget) and the
+# agents.py keepalive watchdog.
+_QUIET_MODE = os.getenv("HALO_QUIET_MODE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def is_quiet() -> bool:
+    return _QUIET_MODE
+
+
+def set_quiet(on: bool) -> None:
+    global _QUIET_MODE
+    _QUIET_MODE = bool(on)
+
+
 # Recent spoken text, for the barge-in echo guard. When the mic captures speech
 # while Halo is talking, we compare it against what Halo just said — if it
 # overlaps heavily it's mic echo of Halo's own voice, not the user.

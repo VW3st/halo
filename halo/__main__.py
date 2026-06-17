@@ -77,8 +77,10 @@ from halo.tools import _try_say, execute_system_intent
 from halo.turn import listen_for_barge_in, run_turn
 from halo.userconfig import cfg as user_cfg
 from halo.voice import is_available as voice_available
+from halo.voice import is_quiet as voice_is_quiet
 from halo.voice import is_speaking as voice_is_speaking
 from halo.voice import preload_voice, say
+from halo.voice import set_quiet as voice_set_quiet
 from halo.voice import stop as voice_stop
 from halo.voice import wait_until_silent as voice_wait_until_silent
 from halo.wake import WAKE_WORD, _get_model, listen_for_wake
@@ -1422,6 +1424,31 @@ def _is_narrated_action(text: str) -> bool:
     return bool(_NARRATED_ACTION_RE.search(t))
 
 
+# Quiet / work mode toggles. Specific multi-word phrases so bare "quiet" /
+# "be quiet" still mean "stop talking NOW" (handled by _BARE_STOP_RE / barge-in).
+_QUIET_ON_RE = re.compile(
+    r"\b(?:quiet mode|work mode|silent mode|focus mode|hush mode|"
+    r"stop narrating|don'?t narrate|no narration|stop the narration|"
+    r"stop reading it (?:out|to me)|work quietly|work in silence|"
+    r"keep it quiet|be quiet while you work|stop talking while you work)\b",
+    re.IGNORECASE,
+)
+_QUIET_OFF_RE = re.compile(
+    r"\b(?:narrate|narration on|verbose mode|read it (?:out|to me)|"
+    r"think out loud|talk me through it|start narrating|loud mode|"
+    r"turn narration (?:back )?on|say it out loud|out loud mode)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_quiet_on(text: str) -> bool:
+    return bool(_QUIET_ON_RE.search(text or ""))
+
+
+def _wants_quiet_off(text: str) -> bool:
+    return bool(_QUIET_OFF_RE.search(text or ""))
+
+
 def _wants_back_to_halo(text: str) -> bool:
     return bool(_BACK_TO_HALO_RE.search(text or ""))
 
@@ -1723,7 +1750,10 @@ def _start_agent_and_ack(
     # Hybrid streaming state (v1.2.1). Only used for agents with
     # streams_text_deltas=True. The first N sentences are spoken live;
     # the rest is buffered silently and summarized in _drain.
-    stream_state = _StreamState(max_live_sentences=LIVE_STREAM_MAX_SENTENCES)
+    # Quiet/work mode: 0 live sentences -> nothing spoken while the agent works;
+    # the whole reply is buffered and summarized once on completion.
+    _max_live = 0 if voice_is_quiet() else LIVE_STREAM_MAX_SENTENCES
+    stream_state = _StreamState(max_live_sentences=_max_live)
 
     def _speak_chunk(sentence: str) -> None:
         # Non-blocking so a long monologue queues sentence-by-sentence
@@ -2491,6 +2521,24 @@ def run_conversation() -> None:
             print("  nav back -> nothing to return to")
             bus.emit("route.matched", handler="nav_back_empty")
             say("There's nothing to go back to yet.", blocking=True)
+            last_activity = time.monotonic()
+            continue
+
+        # 5c. Quiet / work mode toggle — stop (or resume) narrating agent
+        #     output and the "still working" murmurs. Works in direct mode too.
+        if _wants_quiet_on(cleaned):
+            voice_set_quiet(True)
+            print("  quiet/work mode ON")
+            bus.emit("route.matched", handler="quiet_on")
+            say("Quiet mode on. I'll only speak up when something's done or I "
+                "need you.", blocking=True)
+            last_activity = time.monotonic()
+            continue
+        if _wants_quiet_off(cleaned):
+            voice_set_quiet(False)
+            print("  quiet/work mode OFF")
+            bus.emit("route.matched", handler="quiet_off")
+            say("Back to narrating.", blocking=True)
             last_activity = time.monotonic()
             continue
 
