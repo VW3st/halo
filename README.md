@@ -324,6 +324,7 @@ real-time accent-aware cleanup. Controls (spoken):
 | *"new line"* / *"new paragraph"* | line break(s), keep dictating |
 | *"period"* / *"comma"* / *"question mark"* … | punctuation |
 | *"send it"* / *"send the message"* / *"enter"* | press Enter (submit) **and** return to conversation |
+| *"back to the session"* / *"back to Halo"* / *"exit"* | leave dictation (no Enter) and resume the conversation — back with whatever agent you were talking to |
 | *"stop"* / *"smart stop"* | end dictation |
 
 Tunables under `[dictation]` in config: `silence_ms`, `auto_period`,
@@ -433,9 +434,17 @@ To switch agents mid-flow:
 "ask codex to generate the images"          -> dispatches THAT to Codex AND switches
 "transfer me to codex" / "transfer to ..."  -> same as switch
 "Codex, ..."                                -> dispatches to Codex AND switches
+"go back" / "the other one" / "previous session" -> return to the LAST session
+"back to codex" / "go to the previous one"  -> same, resolved from history
 "back to halo" / "talk to me"               -> exit direct dialogue
 "transfer me back to halo"                  -> same
 ```
+
+Halo keeps a small **navigation history** (most-recent-first) of the agents and
+project sessions you've been in, so *"go back"*, *"the other one"*, *"previous
+session"*, or *"back to Codex"* drop you exactly where you were — handy for the
+"give Claude a task → jump to Codex → go back to Claude" flow. It persists
+across sleep/wake within a run and resets on *"new session"*.
 
 Naming the *other* agent mid-flow always wins — even while you're deep in a
 Claude thread, *"spawn Codex and generate the images"* goes to **Codex**, not

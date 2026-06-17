@@ -6,7 +6,33 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ## [Unreleased]
 
-(none yet)
+- **Mic robustness ("never lose the mic")** — continuation stitching after a
+  forced commit + a longer grace for genuinely-incomplete long utterances.
+  In progress, behind a flag so it can't regress turn-taking.
+
+---
+
+## [1.4.2] — 2026-06-17
+
+Fluid switching — move between agents/sessions and dictation the way you'd
+expect a real assistant to.
+
+### Added
+- **Session back-navigation** — Halo keeps a most-recent-first navigation MRU of
+  the agent/project sessions you've been in. *"go back"*, *"the other one"*,
+  *"previous session"*, *"go to the previous one"*, or *"back to Codex"* return
+  you exactly where you were — built for "give Claude a task → jump to Codex →
+  go back to Claude". Garble-tolerant on names; anchored so an instruction that
+  merely contains "the last one" never navigates. Persists across sleep/wake
+  within a run; cleared on "new session". (`_session_mru`, `_nav_visit`,
+  `_resolve_nav`, `_NAV_BACK_RE`.)
+- **Voice exit from dictation** — *"back to the session"*, *"get back to the
+  session"*, *"back to Halo"*, *"exit"* leave dictation WITHOUT submitting and
+  resume the conversation (the loop already preserves the agent you were talking
+  to). Previously these got typed as text — only "stop"/"send it" exited.
+  (`_is_exit_dictation` / `_EXIT_DICTATION_PHRASES`.)
+- `scripts/test_conversation_flow.py` grows to 31 checks (nav MRU + dictation
+  exit).
 
 ---
 

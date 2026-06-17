@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from halo import __main__ as m  # noqa: E402
+from halo import dictation as d  # noqa: E402
 import halo.userconfig as uc  # noqa: E402
 
 _ran = 0
@@ -116,6 +117,69 @@ def main() -> int:
     failed += check(
         "from Codex, 'switch to claude' switches to Claude",
         m._direct_redirect("switch to claude please", X) == (C, ""),
+    )
+
+    # --- session back-navigation (MRU) ------------------------------------
+    # Build history: started with Claude, jumped to Codex.
+    m._session_mru = []
+    m._nav_visit("claude_code", None)
+    m._nav_visit("codex_cli", None)
+    claude, codex = ("claude_code", None), ("codex_cli", None)
+    failed += check(
+        "'go back' from Codex returns to Claude",
+        m._resolve_nav("go back", codex) == claude,
+    )
+    failed += check(
+        "'the other one' returns to Claude",
+        m._resolve_nav("the other one", codex) == claude,
+    )
+    failed += check(
+        "'go to the previous session' returns to Claude",
+        m._resolve_nav("okay go to the previous session", codex) == claude,
+    )
+    failed += check(
+        "named 'back to claude' returns to the Claude frame",
+        m._resolve_nav("back to claude please", codex) == claude,
+    )
+    m._nav_visit("claude_code", None)  # now back in Claude
+    failed += check(
+        "toggle: 'go back' from Claude returns to Codex",
+        m._resolve_nav("go back", claude) == codex,
+    )
+    failed += check(
+        "instruction containing 'the last one' does NOT navigate",
+        m._resolve_nav("use the last one for the header", claude) is None,
+    )
+    failed += check(
+        "'roll back the migration' does NOT navigate",
+        m._resolve_nav("tell codex to roll back the migration", claude) is None,
+    )
+    failed += check(
+        "'back to halo' is not a nav target (handled elsewhere)",
+        m._resolve_nav("back to halo", claude) is None,
+    )
+    m._session_mru = []
+    failed += check(
+        "empty history: 'go back' resolves to nothing",
+        m._resolve_nav("go back", (None, None)) is None,
+    )
+
+    # --- dictation voice exit ---------------------------------------------
+    failed += check(
+        "'back to the session' exits dictation",
+        d._is_exit_dictation("back to the session") is True,
+    )
+    failed += check(
+        "'get back to the session' exits dictation",
+        d._is_exit_dictation("get back to the session") is True,
+    )
+    failed += check(
+        "'back to halo' exits dictation",
+        d._is_exit_dictation("back to halo") is True,
+    )
+    failed += check(
+        "dictated content with 'back' is NOT an exit",
+        d._is_exit_dictation("go back to the file and edit it") is False,
     )
 
     print(f"\n{_ran - failed}/{_ran} passed")

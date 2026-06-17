@@ -164,6 +164,25 @@ def _is_send_exit(text: str) -> bool:
     return False
 
 
+# Leave dictation WITHOUT pressing Enter and return to the conversation (back
+# to whatever agent/session you were in). Distinct from stop ("Dictation off")
+# and send (which submits the field first). These used to get typed as text.
+_EXIT_DICTATION_PHRASES = {
+    "back to halo", "halo", "back to the session", "back to session",
+    "get back to the session", "get back to session", "return to the session",
+    "return to session", "back to the conversation", "back to the chat",
+    "back to claude", "back to codex", "back to the agent",
+    "exit", "exit dictation", "leave dictation", "close dictation",
+    "okay back", "ok back", "go back", "never mind go back",
+}
+
+
+def _is_exit_dictation(text: str) -> bool:
+    """True when the user wants to leave dictation and resume the conversation
+    (no Enter). Whole-utterance match so dictated content isn't swallowed."""
+    return _normalize_cmd(text) in _EXIT_DICTATION_PHRASES
+
+
 # Words commonly prepended before the real command; ignored when matching
 # the start trigger ("hey hey look dictate" -> "dictate").
 _LEAD_WORDS = {
@@ -466,6 +485,12 @@ def run_dictation() -> str:
             if _is_stop(text):
                 reason = "command"
                 break
+            # "Back to the session" / "back to Halo" / "exit": leave dictation
+            # WITHOUT submitting and resume the conversation (the loop restores
+            # whatever agent you were talking to). No Enter, unlike "send".
+            if _is_exit_dictation(text):
+                reason = "exit"
+                break
             # "Send it" / "send the message" / "enter": submit the field AND
             # return to conversation. Queue the Enter, then end dictation.
             if _is_send_exit(text):
@@ -492,6 +517,8 @@ def run_dictation() -> str:
     bus.emit("dictation.stop", reason=reason)
     if reason == "sent":
         return "Sent."
+    if reason == "exit":
+        return "Okay, back."
     if reason == "command" or st["typed"]:
         return "Dictation off."
     return "Dictation off. I didn't catch anything."

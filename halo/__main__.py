@@ -95,6 +95,11 @@ _desktop_last_error: str = ""
 # can do ("open a browser AND search the web for X"). _handle_decision stashes
 # that delegatable remainder here; the conversation loop offers to hand it off.
 _system_leftover: str = ""
+# Navigation MRU: the agent/session frames we've been in, most-recent first,
+# so "go back" / "the other one" / "previous session" / "back to Codex" can
+# return to where we were. (agent_key, session_label) tuples; persists across
+# sleep/wake within one Halo run, cleared on "new session".
+_session_mru: list[tuple[str, str | None]] = []
 
 
 def _user_name() -> str:
@@ -1218,6 +1223,88 @@ def _direct_redirect(text: str, current_agent: str) -> tuple[str, str] | None:
     return (target, rest)
 
 
+def _nav_visit(agent: str | None, label: str | None) -> None:
+    """Record the current agent/session at the front of the navigation MRU so
+    'go back' / 'the other one' / 'previous session' can return to it. Halo
+    mode (agent None) is not a frame — it's the absence of a session."""
+    global _session_mru
+    if agent is None:
+        return
+    frame = (agent, label)
+    if _session_mru and _session_mru[0] == frame:
+        return
+    _session_mru = [f for f in _session_mru if f != frame]
+    _session_mru.insert(0, frame)
+    del _session_mru[8:]
+
+
+# Standalone "go back" / "the other one" / "previous session" references.
+# Anchored ^...$ so an instruction that merely CONTAINS "the last one"
+# ("use the last one for the header") is NOT treated as navigation.
+_NAV_VERB = r"(?:go|jump|switch|head|come|take me|get me|bring me|put me)"
+_NAV_BACK_RE = re.compile(
+    r"^\s*(?:(?:ok(?:ay)?|now|so|and|yeah|please|hey|halo|alright)[,\s]+)*"
+    r"(?:"
+    # "(go) back", optionally "(to) the previous/last/other (one/session)"
+    rf"{_NAV_VERB}?\s*back"
+    r"(?:\s+(?:to\s+|over to\s+)?(?:the\s+)?(?:previous|last|other|prior)"
+    r"(?:\s+(?:one|session|agent|chat|task))?)?|"
+    # "go/switch to the previous/last/other (one/session)"
+    rf"{_NAV_VERB}\s+(?:to\s+|over to\s+|into\s+|onto\s+|on to\s+)?(?:the\s+)?"
+    r"(?:previous|last|other|prior)(?:\s+(?:one|session|agent|chat|task))?|"
+    # bare "the previous/last/other one/session"
+    r"(?:the\s+|that\s+)?(?:previous|last|other|prior)\s+(?:one|session|agent|chat|task)|"
+    r"previous session|last session|other session|"
+    r"resume(?:\s+the)?\s+(?:previous|last)(?:\s+session)?|"
+    r"where (?:i|we) (?:was|were)(?:\s+before)?"
+    r")"
+    r"\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+# "back to Codex" / "go back to the Claude one" — captures the target phrase so
+# we can resolve it (garble-tolerant) to an agent. Also anchored to standalone.
+_NAV_BACK_NAMED_RE = re.compile(
+    r"^\s*(?:(?:ok(?:ay)?|now|so|and|yeah|please|hey|halo|alright)[,\s]+)*"
+    r"(?:go |come |switch |head |jump |take me )?back (?:to|over to|into) "
+    r"(?:the |my )?(?P<rest>.+?)"
+    r"(?:\s+(?:session|one|chat|agent|please|now|again))?[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_nav_phrase(text: str) -> bool:
+    return bool(_NAV_BACK_RE.match((text or "").strip()))
+
+
+def _resolve_nav(
+    text: str, current: tuple[str | None, str | None]
+) -> tuple[str, str | None] | None:
+    """Resolve a back-navigation utterance to a target (agent, label) frame.
+
+      * named  — "back to Codex" / "go back to the Claude one": the most recent
+        MRU frame for that agent that isn't the current one (else (agent, None)).
+      * generic — "go back" / "the other one" / "previous session": the most
+        recent MRU frame that isn't the current one.
+
+    Returns None when it's not back-navigation (or there's nowhere to go)."""
+    t = (text or "").strip()
+    mnamed = _NAV_BACK_NAMED_RE.match(t)
+    if mnamed:
+        others = [a for a in _mentioned_agents(mnamed.group("rest")) if a != current[0]]
+        if others:
+            target = others[0]
+            for frame in _session_mru:
+                if frame[0] == target and frame != current:
+                    return frame
+            return (target, None)
+        # "back to the previous one" named nothing concrete — fall to generic.
+    if _NAV_BACK_RE.match(t):
+        for frame in _session_mru:
+            if frame != current:
+                return frame
+    return None
+
+
 def _wants_back_to_halo(text: str) -> bool:
     return bool(_BACK_TO_HALO_RE.search(text or ""))
 
@@ -1929,6 +2016,9 @@ def run_conversation() -> None:
         # Fresh each turn — set by _handle_decision only when a chained command
         # leaves an agent-only remainder, read right after the Stage 2 call.
         _system_leftover = ""
+        # Remember where we are (after last turn's switch) so "go back" / "the
+        # other one" can return here. Cheap, idempotent on the current frame.
+        _nav_visit(direct_agent, direct_session_label)
         # Speak any background-job results that landed since last turn.
         _drain_completed_jobs()
 
@@ -2148,6 +2238,7 @@ def run_conversation() -> None:
             pending_action = None
             pending_clarification = None
             brief.clear()
+            _session_mru.clear()  # nothing to "go back" to after a fresh start
             try:
                 REGISTRY.set_active(None)  # else next dispatch reuses old cwd
             except Exception:
@@ -2214,6 +2305,30 @@ def run_conversation() -> None:
             direct_session_label = None
             bus.emit("route.matched", handler="back_to_halo")
             say("Halo here.", blocking=True)
+            continue
+
+        # 5b. Back-navigation — "go back" / "the other one" / "previous
+        #     session" / "back to Codex". Returns to a session from the
+        #     navigation MRU instead of forwarding to the current agent. Runs
+        #     before status/chitchat/direct so the reference is honored.
+        nav_target = _resolve_nav(cleaned, (direct_agent, direct_session_label))
+        if nav_target is not None:
+            target_agent, target_label = nav_target
+            direct_agent = _set_direct(target_agent)
+            direct_session_label = target_label
+            if target_label:
+                REGISTRY.set_active(target_label)
+            spoken = session_name(target_agent)
+            print(f"  nav back -> {target_agent} ({spoken}), label={target_label!r}")
+            bus.emit("route.matched", handler="nav_back", target=target_agent)
+            say(f"Back with {spoken}.", blocking=True)
+            last_activity = time.monotonic()
+            continue
+        if _is_nav_phrase(cleaned):
+            print("  nav back -> nothing to return to")
+            bus.emit("route.matched", handler="nav_back_empty")
+            say("There's nothing to go back to yet.", blocking=True)
+            last_activity = time.monotonic()
             continue
 
         # 6. Status / replay
