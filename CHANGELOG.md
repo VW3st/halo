@@ -10,6 +10,23 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.4.6] — 2026-06-17
+
+### Fixed
+- **Tests no longer launch real apps** — the regression suite calls
+  `execute_system_intent("open calculator and paint")` etc. to verify routing,
+  which was *actually* opening Calculator / Paint / browser tabs on the
+  developer's desktop every run (the "three web pages, two calculators, and
+  paint kept popping up" report — it was the test runs, not Halo). `tools.py`
+  gains a dry-run mode (`set_dry_run()` / `HALO_TOOLS_DRY_RUN=1`) that no-ops
+  every launcher (`_spawn`, `_open_url`, new `_startfile` chokepoint for all
+  `os.startfile` calls) while still returning the summary string, so tests check
+  the logic without side effects. `test_tools_regressions.py` and
+  `test_conversation_flow.py` enable it. Real runs are unaffected (off by
+  default).
+
+---
+
 ## [1.4.5] — 2026-06-17
 
 ### Fixed

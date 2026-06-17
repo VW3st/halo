@@ -15,6 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from halo import __main__ as m  # noqa: E402
 from halo import dictation as d  # noqa: E402
 import halo.userconfig as uc  # noqa: E402
+import halo.tools as _tools  # noqa: E402
+
+_tools.set_dry_run(True)  # never launch real apps from the test suite
 
 _ran = 0
 

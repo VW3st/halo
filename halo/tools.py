@@ -105,8 +105,32 @@ _APP_ALIASES: dict[str, dict] = {
 }
 
 
+# Dry-run: when True, every launcher returns its normal summary string but does
+# NOT actually start a process / open a window. This exists so the regression
+# tests (which call execute_system_intent("open calculator and paint")) verify
+# the routing LOGIC without spawning real apps on the developer's desktop.
+# Enable via HALO_TOOLS_DRY_RUN=1 or tools.set_dry_run(True).
+_DRY_RUN = os.getenv("HALO_TOOLS_DRY_RUN", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def set_dry_run(on: bool) -> None:
+    """Toggle dry-run mode (no real launches). Used by the test suite."""
+    global _DRY_RUN
+    _DRY_RUN = bool(on)
+
+
+def _startfile(target: str) -> None:
+    """os.startfile, but a no-op in dry-run. Single chokepoint for Windows
+    ShellExecute launches so tests never actually open anything."""
+    if _DRY_RUN:
+        return
+    os.startfile(target)
+
+
 def _spawn(cmd: list[str]) -> None:
     """Detached background launch — don't block on the child process."""
+    if _DRY_RUN:
+        return
     kwargs: dict = {}
     if IS_WIN:
         kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
@@ -119,6 +143,8 @@ def _open_url(url: str) -> None:
     """Open `url` in the OS default browser. Falls back across handlers
     because webbrowser.open is flaky on some Windows configs (about:blank
     in particular hits an empty handler chain)."""
+    if _DRY_RUN:
+        return
     # webbrowser.open is the cross-platform answer when it works.
     try:
         if webbrowser.open(url, new=2):
@@ -127,7 +153,7 @@ def _open_url(url: str) -> None:
         pass
     # Platform-specific fallbacks.
     if IS_WIN:
-        os.startfile(url)  # uses HKEY_CLASSES_ROOT\http\shell\open\command
+        _startfile(url)  # uses HKEY_CLASSES_ROOT\http\shell\open\command
     elif IS_MAC:
         _spawn(["open", url])
     else:
@@ -136,7 +162,7 @@ def _open_url(url: str) -> None:
 
 def _open_app(win_exe: str, mac_app: str, linux_cmd: list[str]) -> None:
     if IS_WIN:
-        os.startfile(win_exe)
+        _startfile(win_exe)
     elif IS_MAC:
         _spawn(["open", "-a", mac_app])
     else:
@@ -170,7 +196,7 @@ def _open_notepad() -> str:
 
 def _open_explorer() -> str:
     if IS_WIN:
-        os.startfile("explorer.exe")
+        _startfile("explorer.exe")
     elif IS_MAC:
         _spawn(["open", os.path.expanduser("~")])
     else:
@@ -196,7 +222,7 @@ def _try_open_file(part: str) -> tuple[bool, str]:
         return True, f"I don't see {path.name} in this folder."
     try:
         if IS_WIN:
-            os.startfile(str(path))
+            _startfile(str(path))
         elif IS_MAC:
             _spawn(["open", str(path)])
         else:
@@ -269,7 +295,7 @@ def _open_app_target(part: str) -> str | None:
 def _launch_spec(spec: dict) -> bool:
     try:
         if IS_WIN:
-            os.startfile(spec["win"])  # ShellExecute: resolves App Paths/PATH/protocol
+            _startfile(spec["win"])  # ShellExecute: resolves App Paths/PATH/protocol
         elif IS_MAC:
             _spawn(["open", "-a", spec["mac"]])
         else:
@@ -285,7 +311,7 @@ def _launch_generic(name: str) -> bool:
     app fails cleanly instead of popping a Windows 'cannot find' dialog."""
     try:
         if IS_WIN:
-            os.startfile(name)
+            _startfile(name)
         elif IS_MAC:
             _spawn(["open", "-a", name])
         else:
@@ -331,16 +357,18 @@ def _try_open_app(part: str) -> tuple[bool, str]:
 
 def _open_terminal() -> str:
     if IS_WIN:
+        if _DRY_RUN:
+            return "Opened Windows Terminal."
         try:
-            os.startfile("wt.exe")  # Windows Terminal if installed
+            _startfile("wt.exe")  # Windows Terminal if installed
             return "Opened Windows Terminal."
         except OSError:
             pass
         try:
-            os.startfile("powershell.exe")
+            _startfile("powershell.exe")
             return "Opened PowerShell."
         except OSError:
-            os.startfile("cmd.exe")
+            _startfile("cmd.exe")
             return "Opened command prompt."
     if IS_MAC:
         _spawn(["open", "-a", "Terminal"])

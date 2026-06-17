@@ -13,7 +13,14 @@ from halo.tools import (
     _try_say,
     execute_system_intent,
     is_pure_tool,
+    set_dry_run,
 )
+
+# CRITICAL: these tests call execute_system_intent("open calculator and paint"),
+# which would otherwise actually launch Calculator/Paint/the browser on the
+# developer's desktop. Dry-run makes the launchers no-op while still returning
+# their summary strings, so we test routing without spawning anything.
+set_dry_run(True)
 
 
 _ran = 0
