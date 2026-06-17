@@ -6,7 +6,29 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ## [Unreleased]
 
-(none yet)
+Multi-agent command-center work (phased). Phase 1 below.
+
+---
+
+## [1.5.0] — 2026-06-17
+
+Phase 1 of the "command center" rework — make delegating to a second agent
+actually work.
+
+### Fixed
+- **"open Codex AND generate X" now dispatches X** — the open-agent handler used
+  to switch into the agent but silently DROP the trailing task, so a freshly
+  opened Codex got nothing. `_agent_open_intent` now returns `(agents, task)`
+  and the handler dispatches the task when one rides along (like the redirect
+  path already did). "open a Codex session" with no task still just readies it.
+- **Design/media commands no longer dropped by the follow-up gate** — "I want to
+  generate a hero" / "design a logo" / "make three slides" were dropped as
+  `no_signal` because words like "hero", "logo", "slide" weren't in the gate's
+  vocabulary. Added a design/media/content noun set, plus a Rule 3b: a short
+  utterance that OPENS with an unambiguous build verb (build/create/generate/
+  design/…) reaches the agent even when its object is a novel noun. Side-
+  conversation hard-drop still runs first, and the rule is length-bounded, so
+  ambient speech ("hey John, can you hear me?") is still dropped.
 
 ---
 

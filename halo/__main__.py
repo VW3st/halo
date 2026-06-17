@@ -1335,17 +1335,30 @@ _AGENT_OPEN_WEAK = {
 }
 
 
-def _agent_open_intent(text: str) -> list[str]:
-    """'open/start/spawn a Claude/Codex/cloud session' -> ordered agent keys, so
-    spinning up an agent switches into it instead of the app-launcher hunting
-    for an app named 'cloud session'. [] when it's not that intent."""
+# Leading session/connector fluff stripped off a task that follows the agent
+# name, so "open codex and generate X" yields the task "generate X".
+_OPEN_TASK_LEAD_RE = re.compile(
+    r"^[\s,]*(?:(?:session|sessions|cli|agent|instance|window|terminal|chat|"
+    r"thread|conversation|and|then|also|to|please|for|a|an|the|new|so|now|"
+    r"that|it|and then|as well|i want you to|i need you to|can you|could you|"
+    r"would you)\b[\s,]*)+",
+    re.IGNORECASE,
+)
+
+
+def _agent_open_intent(text: str) -> tuple[list[str], str]:
+    """'open/start/spawn a Claude/Codex/cloud session' -> (ordered agent keys,
+    trailing task). Spinning up an agent switches into it instead of the
+    app-launcher hunting for an app named 'cloud session'; and "open codex AND
+    generate X" carries "generate X" so it dispatches instead of being dropped.
+    Returns ([], "") when it's not an open-agent intent."""
     t = (text or "").lower()
     if not _OPEN_AGENT_VERB_RE.search(t):
-        return []
+        return [], ""
     tables = [_AGENT_OPEN_STRONG]
     if _AGENT_SESSION_CTX_RE.search(t):
         tables.append(_AGENT_OPEN_WEAK)
-    hits: list[tuple[int, str]] = []
+    hits: list[tuple[int, int, str]] = []  # (start, end, key)
     seen: set[str] = set()
     for table in tables:
         for key, aliases in table.items():
@@ -1354,11 +1367,20 @@ def _agent_open_intent(text: str) -> list[str]:
             for alias in aliases:
                 m = re.search(r"\b" + re.escape(alias) + r"\b", t)
                 if m:
-                    hits.append((m.start(), key))
+                    hits.append((m.start(), m.end(), key))
                     seen.add(key)
                     break
+    if not hits:
+        return [], ""
     hits.sort()
-    return [k for _, k in hits]
+    agents = [k for _, _, k in hits]
+    # Task = whatever follows the LAST agent name ("open codex and generate X").
+    last_end = hits[-1][1]
+    task = (text[last_end:] if last_end < len(text) else "").strip()
+    task = _OPEN_TASK_LEAD_RE.sub("", task).strip().rstrip(".,!?")
+    if task and not _looks_like_real_task(task):
+        task = ""  # trailing fluff ("...session please"), not a real task
+    return agents, task
 
 
 # A polite/interrogative request IS a command ("can you open paint",
@@ -2410,20 +2432,29 @@ def run_conversation() -> None:
 
         # 4b. "Open / spawn a Claude (or Codex) session" — spin up / switch
         #     into that agent instead of letting the app-launcher fail trying
-        #     to "open" an app named "cloud session". Lazy: entering direct mode
-        #     readies it; the next command dispatches (and spawns) the session.
-        open_agents = _agent_open_intent(cleaned)
+        #     to "open" an app named "cloud session". If a task rides along
+        #     ("open codex AND generate X"), dispatch it; otherwise the next
+        #     command dispatches (and spawns) the session.
+        open_agents, open_task = _agent_open_intent(cleaned)
         if open_agents:
             primary = open_agents[0]
             direct_agent = _set_direct(primary)
             direct_session_label = None
-            print(f"  open-agent intent -> {open_agents}")
             bus.emit("route.matched", handler="open_agent", target=primary)
-            if len(open_agents) >= 2:
+            if open_task:
+                print(f"  open-agent intent -> {open_agents} + task {open_task!r}")
+                phrase = _start_agent_and_ack(
+                    primary, open_task, cwd=_cwd_for_dispatch(""), brief=brief
+                )
+                if phrase:
+                    say(phrase, blocking=True)
+            elif len(open_agents) >= 2:
+                print(f"  open-agent intent -> {open_agents}")
                 names = " and ".join(session_name(a) for a in open_agents)
                 say(f"{names} are ready — you're in {session_name(primary)}. "
                     "What should it do?", blocking=True)
             else:
+                print(f"  open-agent intent -> {open_agents}")
                 say(f"{session_name(primary)} session ready. What should it do?",
                     blocking=True)
             last_activity = time.monotonic()

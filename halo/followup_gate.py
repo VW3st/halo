@@ -124,6 +124,20 @@ _CODING_NOUNS = {
     "shadow", "shadows", "animation", "animations", "transition",
     "font", "fonts", "size", "spacing",
     "mode",  # "dark mode", "light mode"
+    # Design / media / content — image & marketing work delegated to agents
+    # ("generate a hero", "make a logo", "create three slides"). Without these
+    # the gate dropped design tasks as "no_signal".
+    "hero", "banner", "graphic", "graphics", "logo", "logos",
+    "illustration", "illustrations", "picture", "pictures", "photo", "photos",
+    "thumbnail", "thumbnails", "avatar", "avatars", "mockup", "mockups",
+    "wireframe", "wireframes", "design", "designs", "visual", "visuals",
+    "asset", "assets", "slide", "slides", "deck", "presentation",
+    "video", "videos", "gif", "gifs", "screenshot", "screenshots",
+    "diagram", "diagrams", "chart", "charts", "graph", "graphs",
+    "palette", "gradient", "section", "sections", "card", "cards",
+    "badge", "badges", "carousel", "gallery", "hero image",
+    "testimonial", "testimonials", "pricing", "cta", "headline", "headlines",
+    "copy", "landing", "favicon", "illustration",
     "it", "that", "this", "one", "top", "bottom", "left", "right",
     "bigger", "smaller", "larger", "shorter", "taller", "wider",
     "higher", "lower", "brighter", "darker", "lighter",
@@ -300,6 +314,38 @@ def _contains_continuation_marker(text: str) -> bool:
     return False
 
 
+# Unambiguous "build something" verbs. A short utterance that OPENS with one of
+# these (after leading filler / "I want you to") is a command to the agent even
+# when its object isn't in the noun vocabulary ("generate a frobnicator").
+# Deliberately excludes ambiguous verbs ("make sure", "add up", "write back").
+_BUILD_OPENERS = {
+    "build", "create", "generate", "design", "implement", "scaffold",
+    "render", "prototype", "draft", "compose", "produce", "draw", "code",
+    "develop", "spin",  # "spin up"
+}
+_BUILD_LEAD_RE = re.compile(
+    r"^(?:uh|um|er|ah|ok|okay|so|well|alright|please|now|also|then|and|yeah|"
+    r"hey|halo|jarvis|can you|could you|would you|will you|"
+    r"i\s+(?:want|need|would\s+like)\s+(?:you\s+)?to|i'?d\s+like\s+to|"
+    r"let'?s|go\s+ahead\s+and)[\s,]+",
+    re.IGNORECASE,
+)
+
+
+def _starts_with_build_imperative(text: str) -> bool:
+    """True if the utterance opens with an unambiguous build verb (after light
+    leading filler / "I want you to"). Lets "generate a hero" / "design a logo"
+    reach the agent without a recognized noun."""
+    cleaned = (text or "").strip().lower()
+    for _ in range(3):  # peel stacked leads ("ok now I want you to ...")
+        new = _BUILD_LEAD_RE.sub("", cleaned)
+        if new == cleaned:
+            break
+        cleaned = new
+    m = re.match(r"([a-z']+)", cleaned)
+    return bool(m and m.group(1) in _BUILD_OPENERS)
+
+
 def _has_coding_imperative(words: set[str]) -> bool:
     return bool(words & _CODING_IMPERATIVES)
 
@@ -363,6 +409,13 @@ def passes(text: str, direct_agent: str | None) -> tuple[bool, str]:
 
     # Rule 3 — coding imperative + at least one signal anchor.
     if _has_coding_imperative(words) and _has_coding_signal(words, text):
+        return True, "coding_intent"
+
+    # Rule 3b — opens with an unambiguous build verb on a short utterance.
+    # Covers novel-object commands ("generate a hero", "design a logo") whose
+    # object isn't in the noun vocabulary, without opening the gate to ambient
+    # speech (side-conversation already hard-dropped above; bounded by length).
+    if _starts_with_build_imperative(text) and len(words) <= _SHORT_UTTERANCE_WORDS:
         return True, "coding_intent"
 
     return False, "no_signal"

@@ -170,28 +170,56 @@ def main() -> int:
     # --- "open a Claude/Codex/cloud session" -> spin up the agent -----------
     failed += check(
         "'open a cloud session' opens a Claude session (not an app)",
-        m._agent_open_intent("open a cloud session please") == ["claude_code"],
+        m._agent_open_intent("open a cloud session please") == (["claude_code"], ""),
     )
     failed += check(
         "'open a codex session' opens Codex",
-        m._agent_open_intent("okay open a codex session") == ["codex_cli"],
+        m._agent_open_intent("okay open a codex session") == (["codex_cli"], ""),
     )
     failed += check(
         "'open clod' (garble) opens Claude",
-        m._agent_open_intent("open clod") == ["claude_code"],
+        m._agent_open_intent("open clod") == (["claude_code"], ""),
     )
     failed += check(
-        "two-agent open returns both in order",
+        "two-agent open returns both in order, no task",
         m._agent_open_intent("open a session with Claude and a session with Codex")
-        == ["claude_code", "codex_cli"],
+        == (["claude_code", "codex_cli"], ""),
+    )
+    failed += check(
+        "'open codex AND generate X' carries the task",
+        m._agent_open_intent("open codex and generate a hero")
+        == (["codex_cli"], "generate a hero"),
     )
     failed += check(
         "'open the browser' is NOT an agent open",
-        m._agent_open_intent("open the browser") == [],
+        m._agent_open_intent("open the browser") == ([], ""),
     )
     failed += check(
         "'open the cloud storage' (no session ctx) is NOT an agent open",
-        m._agent_open_intent("open the cloud storage") == [],
+        m._agent_open_intent("open the cloud storage") == ([], ""),
+    )
+
+    # --- follow-up gate: design/media commands reach the agent -------------
+    import halo.followup_gate as fg
+    failed += check(
+        "'I want to generate a hero' reaches the agent (was dropped)",
+        fg.passes("I want to generate a hero", "codex_cli")[0] is True,
+    )
+    failed += check(
+        "'generate a hero' (novel object) reaches the agent",
+        fg.passes("generate a hero", "codex_cli")[0] is True,
+    )
+    failed += check(
+        "'design a logo' reaches the agent",
+        fg.passes("design a logo", "codex_cli")[0] is True,
+    )
+    failed += check(
+        "'make three slides' reaches the agent",
+        fg.passes("make three slides", "claude_code")[0] is True,
+    )
+    failed += check(
+        "a phone aside is still dropped",
+        fg.passes("hey John, can you hear me?", "claude_code")[0] is False,
     )
 
     # --- narration vs command (stop re-opening apps when MENTIONED) --------
