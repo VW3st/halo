@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import collections
 import random
 import re
 import threading
@@ -85,6 +86,42 @@ def is_speaking() -> bool:
     import time as _time
     with _active_count_lock:
         return _active_say_count > 0 or _time.monotonic() < _speaking_until
+
+
+# Recent spoken text, for the barge-in echo guard. When the mic captures speech
+# while Halo is talking, we compare it against what Halo just said — if it
+# overlaps heavily it's mic echo of Halo's own voice, not the user.
+_recent_spoken: "collections.deque[tuple[float, frozenset]]" = collections.deque(maxlen=16)
+_recent_spoken_lock = threading.Lock()
+
+
+def _sig_words(text: str) -> frozenset:
+    """Significant (length >= 3) lowercased word set, for overlap scoring."""
+    return frozenset(w for w in re.findall(r"[a-z']+", (text or "").lower()) if len(w) >= 3)
+
+
+def _note_spoken(text: str) -> None:
+    import time as _time
+    words = _sig_words(text)
+    if not words:
+        return
+    with _recent_spoken_lock:
+        _recent_spoken.append((_time.monotonic(), words))
+
+
+def recently_spoke(text: str, within_sec: float = 12.0, thresh: float = 0.7) -> bool:
+    """True if `text` substantially overlaps something Halo said in the last
+    `within_sec` — i.e. it's probably mic echo of Halo's own voice rather than
+    the user. The high threshold lets the user echo a word or two ("yes, Claude,
+    do it") without being mistaken for feedback."""
+    import time as _time
+    cand = _sig_words(text)
+    if not cand:
+        return False
+    now = _time.monotonic()
+    with _recent_spoken_lock:
+        entries = [w for (ts, w) in _recent_spoken if now - ts <= within_sec]
+    return any(spoken and len(cand & spoken) / len(cand) >= thresh for spoken in entries)
 
 
 def wait_until_silent(timeout: float = 15.0, poll_interval: float = 0.05) -> bool:
@@ -242,6 +279,7 @@ def say(
     spoken = _clean_for_speech(text)
     if not spoken:
         return
+    _note_spoken(spoken)  # for the barge-in echo guard
     bus.emit("tts.spoke", text=spoken, who="Halo")
     # Speaking.start drives the Output spectrogram + the central
     # "Speaking" ring on the dashboard. Duration is estimated from

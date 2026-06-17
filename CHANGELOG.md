@@ -6,9 +6,32 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ## [Unreleased]
 
-- **Mic robustness ("never lose the mic")** — continuation stitching after a
-  forced commit + a longer grace for genuinely-incomplete long utterances.
-  In progress, behind a flag so it can't regress turn-taking.
+(none yet)
+
+---
+
+## [1.4.3] — 2026-06-17
+
+"Never lose the mic" — stop cutting people off mid-sentence.
+
+### Added
+- **Continuation grace (default on)** — if you're *still actively talking* when
+  the 14 s soft cap hits, Halo no longer chops you off. It extends the turn in
+  6 s grace chunks up to a 40 s hard ceiling so a long thought finishes. Only
+  the continuously-speaking path extends — a paused/rambling turn still commits
+  at the soft cap — so the run-on pile-up the cap was added to prevent can't
+  come back. Disable with `HALO_TURN_CONTINUATION=0`. (`turn.py`, config
+  `TURN_CONTINUATION` / `TURN_CONTINUATION_GRACE_SEC` / `TURN_MAX_HARD_SEC`.)
+- **Barge-in capture (opt-in)** — while Halo is speaking, a substantive
+  interruption that isn't an echo of Halo's own voice now stops the reply and
+  gets routed, instead of only honoring "stop"/"wait". OFF by default
+  (`HALO_BARGE_IN_CAPTURE=1` to enable) because it depends on your room's echo —
+  a loud speaker with no echo cancellation can make Halo hear itself. Guarded by
+  `voice.recently_spoke()` (word-overlap echo filter, 0.7 threshold so you can
+  still echo a word or two) + a 4-word minimum. (`voice.py` `_note_spoken` /
+  `recently_spoke`, `turn.py` `listen_for_barge_in`.)
+- `scripts/test_conversation_flow.py` → 35 checks (echo guard + continuation
+  bounds).
 
 ---
 

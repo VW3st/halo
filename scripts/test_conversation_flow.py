@@ -164,6 +164,28 @@ def main() -> int:
         m._resolve_nav("go back", (None, None)) is None,
     )
 
+    # --- barge-in echo guard ("never lose the mic" / capture-while-talking) -
+    import halo.voice as v
+    import halo.config as cfg
+    v._note_spoken("Want me to put Claude on it?")
+    failed += check(
+        "exact echo of Halo's words is detected as echo",
+        v.recently_spoke("want me to put claude on it") is True,
+    )
+    failed += check(
+        "user echoing one word ('yes claude do it now') is NOT echo",
+        v.recently_spoke("yes claude do it now please") is False,
+    )
+    failed += check(
+        "a fresh interruption is NOT echo",
+        v.recently_spoke("actually also add a dark mode toggle") is False,
+    )
+    failed += check(
+        "continuation grace is bounded below the hard ceiling",
+        cfg.TURN_MAX_SEC < cfg.TURN_MAX_HARD_SEC
+        and cfg.TURN_CONTINUATION_GRACE_SEC > 0,
+    )
+
     # --- dictation voice exit ---------------------------------------------
     failed += check(
         "'back to the session' exits dictation",

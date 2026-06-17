@@ -83,9 +83,30 @@ CLAUDE_MODEL = "claude-haiku-4-5"
 # adds mode-dependent extra wait on top (see halo/turn.py:detect_mode).
 TURN_END_SILENCE_MS = 600
 TURN_EXTENSION_SEC = 2.0
-TURN_MAX_SEC = 14.0  # was 30 — cap run-on capture; 30s let rambling pile up
+TURN_MAX_SEC = 14.0  # soft cap — commit a long-but-paused utterance here
 TURN_MAX_WAIT_FOR_FIRST_SPEECH_SEC = 5.0
 TURN_MAX_INCOMPLETE_EXTENSIONS = 3
+# "Never lose the mic": if you're STILL talking when the soft cap hits, don't
+# chop you off mid-sentence — extend the window in grace chunks up to a hard
+# ceiling, so a genuinely long thought finishes. Only the continuously-speaking
+# path extends (a paused/rambling turn still commits at the soft cap), so this
+# can't reintroduce the run-on pile-up the 14s cap was added to prevent.
+# Set HALO_TURN_CONTINUATION=0 to disable.
+TURN_CONTINUATION = os.getenv("HALO_TURN_CONTINUATION", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+TURN_CONTINUATION_GRACE_SEC = 6.0   # extra window granted per extension
+TURN_MAX_HARD_SEC = 40.0            # absolute ceiling even while still talking
+# Barge-in CAPTURE (opt-in): while Halo is speaking, treat a substantive
+# utterance that ISN'T an echo of Halo's own voice as a real interruption —
+# stop talking and route it, instead of only honoring "stop"/"wait". OFF by
+# default because it depends on your room's echo: without echo cancellation a
+# loud speaker can make Halo hear itself. Enable with HALO_BARGE_IN_CAPTURE=1
+# and test; the voice.recently_spoke() echo guard filters Halo's own words.
+BARGE_IN_CAPTURE = os.getenv("HALO_BARGE_IN_CAPTURE", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+BARGE_IN_CAPTURE_MIN_WORDS = 4   # ignore short blips; real commands are longer
 CHIME_FREQ_HZ = 800
 CHIME_DURATION_MS = 60
 

@@ -29,11 +29,16 @@ import time
 
 from halo.config import (
     BACKCHANNEL_AFTER_SEC,
+    BARGE_IN_CAPTURE,
+    BARGE_IN_CAPTURE_MIN_WORDS,
     HOLD_SUPPRESS_SEC,
     MODE_SILENCE_SEC,
     SAMPLE_RATE,
+    TURN_CONTINUATION,
+    TURN_CONTINUATION_GRACE_SEC,
     TURN_END_SILENCE_MS,
     TURN_EXTENSION_SEC,
+    TURN_MAX_HARD_SEC,
     TURN_MAX_INCOMPLETE_EXTENSIONS,
     TURN_MAX_SEC,
     TURN_MAX_WAIT_FOR_FIRST_SPEECH_SEC,
@@ -209,6 +214,19 @@ def listen_for_barge_in(timeout: float = 20.0) -> str | None:
                 print(f"  barge-in candidate: {cleaned!r}")
                 if is_barge_in_phrase(cleaned):
                     return cleaned
+                # Opt-in capture: a real, substantive interruption (not one of
+                # Halo's own echoed words) stops the reply and gets routed —
+                # "capture what I say even while you're talking".
+                if (
+                    BARGE_IN_CAPTURE
+                    and len(cleaned.split()) >= BARGE_IN_CAPTURE_MIN_WORDS
+                ):
+                    from halo.voice import recently_spoke as _recently_spoke
+                    if _recently_spoke(cleaned):
+                        print(f"  barge-in ignored (echo of Halo): {cleaned!r}")
+                    else:
+                        print(f"  barge-in capture -> {cleaned!r}")
+                        return cleaned
     finally:
         try:
             transcriber.stop()
@@ -398,6 +416,23 @@ def run_turn(
                     break
 
                 if not state.wait_for_silence(timeout=deadline - now):
+                    # User is STILL talking at the soft cap. Don't chop them off
+                    # mid-sentence — extend the window in grace chunks up to the
+                    # hard ceiling so a long thought finishes ("never lose the
+                    # mic"). Only the continuously-speaking path extends; a
+                    # paused turn already committed above, so the run-on pile-up
+                    # the 14s cap guards against can't come back.
+                    if (
+                        TURN_CONTINUATION
+                        and (time.monotonic() - turn_start) < TURN_MAX_HARD_SEC
+                    ):
+                        deadline = min(
+                            turn_start + TURN_MAX_HARD_SEC,
+                            time.monotonic() + TURN_CONTINUATION_GRACE_SEC,
+                        )
+                        print("  still talking at soft cap -> extending the turn")
+                        bus.emit("turn.continuation")
+                        continue
                     print("  hard timeout while user still talking")
                     break
                 state.clear_silence_event()
