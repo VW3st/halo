@@ -76,6 +76,20 @@ OPENROUTER_SITE_URL = cfg.router.openrouter_site_url
 OPENROUTER_APP_NAME = cfg.router.openrouter_app_name
 OPENROUTER_TIMEOUT_SEC = cfg.router.openrouter_timeout_sec
 
+# Image generation (halo/image_gen.py). "generate an image of X" is a LOCAL
+# action — Halo calls an image model directly and opens the PNG, rather than
+# dispatching to a coding agent (which only draws SVGs). Default backend reuses
+# the OPENROUTER_API_KEY Halo already has, via Google's "Nano Banana 2" (fast,
+# cheap, renders text). Set HALO_IMAGE_PROVIDER=openai + OPENAI_API_KEY to use
+# gpt-image-1.5 instead (best text-in-image).
+IMAGE_PROVIDER = os.getenv("HALO_IMAGE_PROVIDER", "openrouter").strip().lower()
+IMAGE_MODEL = os.getenv(
+    "HALO_IMAGE_MODEL", "google/gemini-3.1-flash-image-preview"
+).strip()
+IMAGE_OPENAI_MODEL = os.getenv("HALO_IMAGE_OPENAI_MODEL", "gpt-image-1.5").strip()
+IMAGE_SIZE = os.getenv("HALO_IMAGE_SIZE", "1024x1024").strip()
+IMAGE_DIR = os.getenv("HALO_IMAGE_DIR", str(Path.home() / "Pictures" / "Halo"))
+
 CLAUDE_MODEL = "claude-haiku-4-5"
 
 # Turn-taking thresholds (step 3.5 — adaptive).

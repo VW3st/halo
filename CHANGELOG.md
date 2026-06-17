@@ -6,8 +6,31 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ## [Unreleased]
 
-Real image generation (researching) — "generate an image" should produce an
-actual PNG, not a hand-drawn SVG.
+(none yet)
+
+---
+
+## [1.5.7] — 2026-06-17
+
+Real image generation — "generate an image of X" makes an actual image.
+
+### Added
+- **Image generation** (`halo/image_gen.py`) — saying *"generate an image of a
+  sunset"* now calls a real image model and opens the PNG, instead of the coding
+  agents hand-drawing an SVG. It's a **local Halo action** (wired into
+  `tools.py` like "open chrome"), so it's deterministic and never dispatched to
+  Claude/Codex. Whole-utterance match so the subject ("a cat AND a dog") isn't
+  split; trailing "and open it" / "please" stripped; a light prompt template
+  adds quality nudges + a "no text" negative unless you ask for text.
+  - **Default backend: OpenRouter** (the key you already have) via Google's
+    "Nano Banana" (`google/gemini-3.1-flash-image-preview`) — fast, ~$0.002/
+    image, renders text. **Opt-in: OpenAI** `gpt-image-1.5`
+    (`HALO_IMAGE_PROVIDER=openai` + `OPENAI_API_KEY`) for best text-in-image.
+  - Config: `HALO_IMAGE_PROVIDER` / `HALO_IMAGE_MODEL` / `HALO_IMAGE_DIR`
+    (default `~/Pictures/Halo`). Runs in the background (90 s budget) and speaks
+    "Generating an image of X… I'll open it when it's ready," then opens it.
+    Fails open with a spoken apology on content-policy / network errors.
+  - Validated end-to-end against the live OpenRouter API.
 
 ---
 

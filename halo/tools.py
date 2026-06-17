@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
@@ -248,6 +249,93 @@ def _try_say(text: str) -> tuple[bool, str]:
     return True, spoken
 
 
+# --- image generation -------------------------------------------------------
+# "generate an image of X" is a LOCAL action: Halo calls a real image model
+# (halo/image_gen.py) and opens the PNG, instead of dispatching to a coding
+# agent (which only ever hand-draws SVGs). Whole-utterance match (before the
+# conjunction split) because image prompts naturally contain "and"
+# ("a cat AND a dog").
+_GEN_VERB = (
+    r"(?:generate|create|make|draw|paint|render|design|whip up|cook up|"
+    r"produce|give me|get me)"
+)
+_IMG_NOUN = (
+    r"(?:image|images|picture|pictures|photo|photos|photograph|drawing|"
+    r"illustration|graphic|graphics|artwork|painting|logo|icon|wallpaper|"
+    r"banner|poster|portrait|sketch|mockup|render)"
+)
+_IMAGE_REQUEST_RE = re.compile(
+    rf"\b{_GEN_VERB}\s+(?:me\s+)?(?:a|an|some|the|another|new)?\s*"
+    rf"(?:\w+\s+){{0,3}}?{_IMG_NOUN}\b",
+    re.IGNORECASE,
+)
+_IMAGE_OF_RE = re.compile(
+    rf"{_IMG_NOUN}\b\s*(?:of|showing|with|that shows?|depicting|about|for|:|,)?\s*"
+    r"(?P<subject>.*)$",
+    re.IGNORECASE,
+)
+_IMAGE_TRAIL_OPEN_RE = re.compile(
+    r"\s*(?:,|\.)?\s*(?:and|then|,)?\s*(?:and\s+)?open\s+"
+    r"(?:it|that|them|the (?:image|picture|file))\b.*$",
+    re.IGNORECASE,
+)
+_IMAGE_TRAIL_FLUFF_RE = re.compile(
+    r"\s*(?:please|thanks|thank you|for me|"
+    r"when (?:it'?s|they'?re|he'?s) ready|now)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _image_subject(text: str) -> str | None:
+    """If `text` is an image-generation request, return the cleaned subject
+    (possibly "" when none was given). None when it's not an image request."""
+    if not _IMAGE_REQUEST_RE.search(text or ""):
+        return None
+    m = _IMAGE_OF_RE.search(text)
+    subject = (m.group("subject") if m else "").strip()
+    subject = _IMAGE_TRAIL_OPEN_RE.sub("", subject).strip()
+    for _ in range(2):
+        subject = _IMAGE_TRAIL_FLUFF_RE.sub("", subject).strip()
+    return subject.strip(" .,!?")
+
+
+def _image_worker(subject: str) -> None:
+    """Background: generate the image, save it, open it, speak when ready."""
+    from halo import image_gen, voice
+    try:
+        bus.emit("image.start", subject=subject)
+        path = image_gen.generate_image(image_gen.build_prompt(subject))
+        print(f"  [image] saved: {path}")
+        bus.emit("image.done", subject=subject, path=path)
+        try:
+            _startfile(path)
+        except Exception:
+            pass
+        voice.say(f"Here's your image of {subject}.", blocking=False)
+    except Exception as exc:
+        print(f"  [image] error: {exc}")
+        bus.emit("image.error", subject=subject, error=str(exc))
+        voice.say("Sorry, I couldn't generate that image.", blocking=False)
+
+
+def _try_generate_image(text: str) -> tuple[bool, str]:
+    """'generate an image of X' -> kick off real image generation in the
+    background and return the ack to speak. (matched, ack)."""
+    subject = _image_subject(text)
+    if subject is None:
+        return False, ""
+    if not subject:
+        return True, "Sure — what should the image be of?"
+    bus.emit("tools.invoke", name="image", text=subject)
+    if _DRY_RUN:  # tests: confirm routing without a real API call
+        return True, f"Generating an image of {subject}."
+    threading.Thread(
+        target=_image_worker, args=(subject,), daemon=True,
+        name="halo-image-gen",
+    ).start()
+    return True, f"Generating an image of {subject}. I'll open it when it's ready."
+
+
 # Politeness wrappers that shroud a tool command ("can you open a browser
 # please" / "I want you to open Chrome"). Stripped ONLY inside the tool
 # matchers so "open a browser" reaches the local launcher instead of falling
@@ -480,6 +568,10 @@ def is_pure_tool(text: str) -> bool:
     # before splitting so the entire phrase counts as one local action.
     if _SAY_RE.search(cleaned):
         return True
+    # "generate an image of X" — whole-utterance local action (image prompts
+    # contain "and"), so it never gets split or dispatched to a coding agent.
+    if _image_subject(cleaned) is not None:
+        return True
     # Date/time phrases commonly contain "and" ("date and time"). Check the
     # datetime tool against the whole utterance before conjunction splitting.
     # A timezone/location qualifier disqualifies the LOCAL tool (see
@@ -535,6 +627,12 @@ def execute_system_intent(cleaned_text: str) -> tuple[bool, str, str]:
     if shandled:
         bus.emit("tools.invoke", name="say", text=sspoken)
         return True, sspoken, ""
+
+    # "generate an image of X" — whole-utterance, runs before the split so the
+    # subject ("a cat AND a dog") isn't broken up. Generates in the background.
+    ihandled, iack = _try_generate_image(text)
+    if ihandled:
+        return True, iack, ""
 
     parts = [p.strip() for p in _SPLIT_RE.split(text) if p and p.strip()] or [text]
 
