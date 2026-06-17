@@ -164,6 +164,41 @@ def main() -> int:
         m._resolve_nav("go back", (None, None)) is None,
     )
 
+    # --- "open a Claude/Codex/cloud session" -> spin up the agent -----------
+    failed += check(
+        "'open a cloud session' opens a Claude session (not an app)",
+        m._agent_open_intent("open a cloud session please") == ["claude_code"],
+    )
+    failed += check(
+        "'open a codex session' opens Codex",
+        m._agent_open_intent("okay open a codex session") == ["codex_cli"],
+    )
+    failed += check(
+        "'open clod' (garble) opens Claude",
+        m._agent_open_intent("open clod") == ["claude_code"],
+    )
+    failed += check(
+        "two-agent open returns both in order",
+        m._agent_open_intent("open a session with Claude and a session with Codex")
+        == ["claude_code", "codex_cli"],
+    )
+    failed += check(
+        "'open the browser' is NOT an agent open",
+        m._agent_open_intent("open the browser") == [],
+    )
+    failed += check(
+        "'open the cloud storage' (no session ctx) is NOT an agent open",
+        m._agent_open_intent("open the cloud storage") == [],
+    )
+
+    # --- confirmation: "yes please" and friends ----------------------------
+    failed += check("'Yes, please' confirms", m._is_yes("Yes, please") is True)
+    failed += check("'yeah go ahead' confirms", m._is_yes("yeah go ahead") is True)
+    failed += check(
+        "'yes but make it blue' is NOT a bare yes",
+        m._is_yes("yes but make it blue") is False,
+    )
+
     # --- barge-in echo guard ("never lose the mic" / capture-while-talking) -
     import halo.voice as v
     import halo.config as cfg

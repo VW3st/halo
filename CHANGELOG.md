@@ -10,6 +10,35 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.4.4] — 2026-06-17
+
+Live-test fixes — spinning up agent sessions by voice, and a few rough edges.
+
+### Fixed
+- **"open a Claude / Codex / cloud session"** now spins up / switches into that
+  agent instead of the app-launcher failing with "I couldn't find Session With
+  Claude to open." Garble-tolerant (Whisper "cloud"/"clod"/"cloth" → Claude,
+  "kodex"/"codec" → Codex); real words ("cloud", "codec") only count alongside a
+  session/agent context word, so "open the cloud storage" / "use the codec
+  library" don't switch. Handles "open a session with Claude AND Codex" (both).
+  (`_agent_open_intent`, routed before the app-launcher / Stage 2.)
+- **"Yes, please" now confirms** a pending dispatch instead of being merged into
+  it ("…search for AI tips. Yes, please"). `_is_yes` accepts trailing politeness
+  and more affirmatives (sure/ok/absolutely/go for it/…).
+- **Delegation offer no longer glues an unrelated command** — if you answer
+  "want me to put Claude on it?" with something other than yes/no (e.g. "actually
+  open a Codex session"), Halo drops the offer and routes the new utterance
+  fresh, instead of merging it onto the task it offered to delegate.
+- **Identity / repetition** — Halo no longer calls itself "a cloud model on
+  Anthropic's servers" or argues the point three times when teased. The chat
+  persona now holds a stable "I'm Halo, your assistant on this PC" identity and
+  plays along in one line instead of repeating corrections.
+
+### Note
+- `scripts/test_conversation_flow.py` → 44 checks.
+
+---
+
 ## [1.4.3] — 2026-06-17
 
 "Never lose the mic" — stop cutting people off mid-sentence.

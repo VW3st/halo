@@ -1305,6 +1305,62 @@ def _resolve_nav(
     return None
 
 
+# "open / start / spawn a Claude (Codex / cloud) session" — spinning up an
+# agent. Without this, the generic app-launcher tried to find an app literally
+# named "cloud session" and failed with "I couldn't find Session With Claude".
+_OPEN_AGENT_VERB_RE = re.compile(
+    r"\b(?:open|start|spawn|launch|fire up|bring up|boot|create|begin|"
+    r"set up|spin up|give me|get me|fire off|kick off)\b",
+    re.IGNORECASE,
+)
+_AGENT_SESSION_CTX_RE = re.compile(
+    r"\b(?:session|sessions|cli|agent|instance|window|terminal|chat|"
+    r"thread|conversation)\b",
+    re.IGNORECASE,
+)
+# Strong aliases (clear agent names / non-word garbles) — count even without a
+# "session" context word. Weak aliases are real English words ("cloud",
+# "codec") that only count WITH a session/agent context to disambiguate.
+# Strong = clear agent names + rare non-word garbles (fire even without a
+# "session" context word). "cloud"/"codec" are common English words, so they
+# stay weak and only count alongside a session/agent context.
+_AGENT_OPEN_STRONG = {
+    "claude_code": ("claude", "claude code", "claud", "clawde", "clawd", "clode",
+                    "clyde", "clod", "cloth", "clot", "claus", "clawed"),
+    "codex_cli": ("codex", "codex cli", "kodex", "krodex", "kadex", "cadex", "crodex"),
+}
+_AGENT_OPEN_WEAK = {
+    "claude_code": ("cloud",),
+    "codex_cli": ("codec", "codecs"),
+}
+
+
+def _agent_open_intent(text: str) -> list[str]:
+    """'open/start/spawn a Claude/Codex/cloud session' -> ordered agent keys, so
+    spinning up an agent switches into it instead of the app-launcher hunting
+    for an app named 'cloud session'. [] when it's not that intent."""
+    t = (text or "").lower()
+    if not _OPEN_AGENT_VERB_RE.search(t):
+        return []
+    tables = [_AGENT_OPEN_STRONG]
+    if _AGENT_SESSION_CTX_RE.search(t):
+        tables.append(_AGENT_OPEN_WEAK)
+    hits: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for table in tables:
+        for key, aliases in table.items():
+            if key in seen or key not in AGENTS:
+                continue
+            for alias in aliases:
+                m = re.search(r"\b" + re.escape(alias) + r"\b", t)
+                if m:
+                    hits.append((m.start(), key))
+                    seen.add(key)
+                    break
+    hits.sort()
+    return [k for _, k in hits]
+
+
 def _wants_back_to_halo(text: str) -> bool:
     return bool(_BACK_TO_HALO_RE.search(text or ""))
 
@@ -1843,8 +1899,11 @@ def _handle_decision(
 
 
 _YES_RE = re.compile(
-    r"^\s*(?:yes|yeah|yep|correct|right|affirmative|go ahead|do it|"
-    r"send it|start|start it|please do|that'?s right)\s*[.!?,]*\s*$",
+    r"^\s*(?:yes|yeah|yep|yup|sure|ok|okay|okey|correct|right|affirmative|"
+    r"go ahead|do it|send it|start|start it|please do|that'?s right|"
+    r"absolutely|definitely|of course|sounds good|go for it|yes please)"
+    r"(?:[\s,]+(?:please|thanks|thank you|go ahead|do it|now|mate|buddy|sir|man))*"
+    r"\s*[.!?,]*\s*$",
     re.IGNORECASE,
 )
 _NO_RE = re.compile(
@@ -2196,10 +2255,18 @@ def run_conversation() -> None:
                 say("Cancelled.", blocking=True)
                 last_activity = time.monotonic()
                 continue
-            original = pending_action.get("cleaned_text", "")
-            cleaned = _merge_pending_text(original, cleaned)
-            pending_action = None
-            print(f"  pending action revised -> {cleaned!r}")
+            if pending_action.get("_offer"):
+                # A delegation OFFER ("want me to put Claude on it?"). A reply
+                # that isn't yes/no means "never mind that — here's something
+                # else": drop the offer and route the new utterance fresh
+                # instead of gluing it onto the task we offered to delegate.
+                print("  delegation offer superseded -> dropping, routing fresh")
+                pending_action = None
+            else:
+                original = pending_action.get("cleaned_text", "")
+                cleaned = _merge_pending_text(original, cleaned)
+                pending_action = None
+                print(f"  pending action revised -> {cleaned!r}")
 
         # Pending clarification. The user's short answer is not a fresh
         # command; attach it to the original unclear request and let the
@@ -2295,6 +2362,27 @@ def run_conversation() -> None:
             print(f"  pure switch -> {switch_target} ({spoken})")
             bus.emit("route.matched", handler="mode_switch", target=switch_target)
             say(f"Switching to {spoken}.", blocking=True)
+            continue
+
+        # 4b. "Open / spawn a Claude (or Codex) session" — spin up / switch
+        #     into that agent instead of letting the app-launcher fail trying
+        #     to "open" an app named "cloud session". Lazy: entering direct mode
+        #     readies it; the next command dispatches (and spawns) the session.
+        open_agents = _agent_open_intent(cleaned)
+        if open_agents:
+            primary = open_agents[0]
+            direct_agent = _set_direct(primary)
+            direct_session_label = None
+            print(f"  open-agent intent -> {open_agents}")
+            bus.emit("route.matched", handler="open_agent", target=primary)
+            if len(open_agents) >= 2:
+                names = " and ".join(session_name(a) for a in open_agents)
+                say(f"{names} are ready — you're in {session_name(primary)}. "
+                    "What should it do?", blocking=True)
+            else:
+                say(f"{session_name(primary)} session ready. What should it do?",
+                    blocking=True)
+            last_activity = time.monotonic()
             continue
 
         # 5. Back to Halo
@@ -2631,6 +2719,7 @@ def run_conversation() -> None:
                 "confirmation": "",
                 "clarification": "",
                 "target_session": lm_decision.get("target_session", ""),
+                "_offer": True,  # a delegation OFFER, not a revisable command
             }
             offer = "I can't do that part myself — want me to put Claude on it?"
             print(f"  offering to delegate leftover -> {leftover!r}")
