@@ -64,6 +64,8 @@ desktop.ini
 /*.jpg
 /*.jpeg
 /*.gif
+/*.svg
+/*.webp
 
 # User-specific project config (has personal settings like user_name; the
 # real keys live in .env). Generated per machine — like .env, keep it local.
