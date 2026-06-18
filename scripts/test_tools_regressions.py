@@ -112,26 +112,6 @@ def main() -> int:
         "open A and B and C — all three",
         is_pure_tool("open chrome and spotify and notepad"),
     )
-    # Image generation — a LOCAL action (real image model), never a coding
-    # agent (which only draws SVGs). Subject survives "and" + "open it" trailers.
-    from halo.tools import _image_subject
-    failed += check(
-        "'generate an image of a sunset' is a local tool",
-        is_pure_tool("generate an image of a sunset over the ocean"),
-    )
-    failed += check(
-        "image subject keeps 'a cat and a dog', strips 'and open it'",
-        _image_subject("create an image of a cat and a dog and open it")
-        == "a cat and a dog",
-    )
-    failed += check(
-        "'make three slides' is NOT an image request",
-        _image_subject("make three slides") is None,
-    )
-    failed += check(
-        "image generate executes locally (dry-run -> ack, no API call)",
-        execute_system_intent("generate an image of a robot")[0] is True,
-    )
     # Politeness-wrapped tool commands must still resolve locally (not fall
     # through to the LLM, which mis-routed "open" to a session switch).
     failed += check(

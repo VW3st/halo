@@ -10,49 +10,14 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
-## [1.5.8] — 2026-06-18
+## [1.5.9] — 2026-06-18
 
-Image generation now defaults to the Codex CLI — no API key.
-
-### Changed
-- **Default image provider is now `codex`** — "generate an image of X" runs your
-  Codex CLI's built-in `image_gen` tool (`gpt-image-2`) exactly how a human
-  would, on your existing `codex login` (ChatGPT auth). **No separate API key.**
-  (Validated end-to-end: a real 2.2 MB PNG generated + opened.) The OpenRouter /
-  OpenAI API paths from 1.5.7 are now fallbacks (`HALO_IMAGE_PROVIDER`).
-- Getting it working took finding three things the hard way (now baked in):
-  - **`--skip-git-repo-check`** — Codex refuses to run in a non-git dir
-    (`~/Pictures/Halo`) without it.
-  - **Name the destination path in the prompt** — the imagegen skill only writes
-    a file when a destination is named; otherwise it treats the request as a
-    preview and saves nothing.
-  - **`model_reasoning_effort="low"`** + UTF-8 capture — the user's default
-    `xhigh` makes the agent loop crawl, and Codex emits UTF-8 box chars that
-    crash cp1252 capture on Windows.
-
----
-
-## [1.5.7] — 2026-06-17
-
-Real image generation — "generate an image of X" makes an actual image.
-
-### Added
-- **Image generation** (`halo/image_gen.py`) — saying *"generate an image of a
-  sunset"* now calls a real image model and opens the PNG, instead of the coding
-  agents hand-drawing an SVG. It's a **local Halo action** (wired into
-  `tools.py` like "open chrome"), so it's deterministic and never dispatched to
-  Claude/Codex. Whole-utterance match so the subject ("a cat AND a dog") isn't
-  split; trailing "and open it" / "please" stripped; a light prompt template
-  adds quality nudges + a "no text" negative unless you ask for text.
-  - **Default backend: OpenRouter** (the key you already have) via Google's
-    "Nano Banana" (`google/gemini-3.1-flash-image-preview`) — fast, ~$0.002/
-    image, renders text. **Opt-in: OpenAI** `gpt-image-1.5`
-    (`HALO_IMAGE_PROVIDER=openai` + `OPENAI_API_KEY`) for best text-in-image.
-  - Config: `HALO_IMAGE_PROVIDER` / `HALO_IMAGE_MODEL` / `HALO_IMAGE_DIR`
-    (default `~/Pictures/Halo`). Runs in the background (90 s budget) and speaks
-    "Generating an image of X… I'll open it when it's ready," then opens it.
-    Fails open with a spoken apology on content-policy / network errors.
-  - Validated end-to-end against the live OpenRouter API.
+### Removed
+- **Image generation** — removed entirely (the `halo/image_gen.py` module, the
+  `tools.py` wiring, config knobs, and tests added in 1.5.7/1.5.8). The headless
+  `codex exec` path can't actually generate images (the built-in `image_gen`
+  tool is interactive-TUI-only; in `exec` it no-ops and copies a random PNG),
+  and the API paths weren't wanted. To be reimplemented separately.
 
 ---
 

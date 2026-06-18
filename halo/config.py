@@ -76,23 +76,6 @@ OPENROUTER_SITE_URL = cfg.router.openrouter_site_url
 OPENROUTER_APP_NAME = cfg.router.openrouter_app_name
 OPENROUTER_TIMEOUT_SEC = cfg.router.openrouter_timeout_sec
 
-# Image generation (halo/image_gen.py). "generate an image of X" is a LOCAL
-# action — Halo produces a real PNG and opens it, rather than dispatching to a
-# coding agent that only draws SVGs.
-#   * "codex" (DEFAULT) — run the Codex CLI's built-in image_gen tool (gpt-image-2)
-#     exactly how a human would. Uses your existing `codex login` (ChatGPT auth) —
-#     NO separate API key. Needs ChatGPT Plus or higher (image_gen is plan-gated).
-#   * "openrouter" — API path via the OPENROUTER_API_KEY Halo already has
-#     (Google Nano Banana). For users without Codex/Plus.
-#   * "openai" — gpt-image-1.5 via OPENAI_API_KEY.
-IMAGE_PROVIDER = os.getenv("HALO_IMAGE_PROVIDER", "codex").strip().lower()
-IMAGE_MODEL = os.getenv(
-    "HALO_IMAGE_MODEL", "google/gemini-3.1-flash-image-preview"
-).strip()
-IMAGE_OPENAI_MODEL = os.getenv("HALO_IMAGE_OPENAI_MODEL", "gpt-image-1.5").strip()
-IMAGE_SIZE = os.getenv("HALO_IMAGE_SIZE", "1024x1024").strip()
-IMAGE_DIR = os.getenv("HALO_IMAGE_DIR", str(Path.home() / "Pictures" / "Halo"))
-
 CLAUDE_MODEL = "claude-haiku-4-5"
 
 # Turn-taking thresholds (step 3.5 — adaptive).
