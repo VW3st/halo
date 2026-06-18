@@ -76,12 +76,15 @@ from halo.router import (
 from halo.tools import _try_say, execute_system_intent
 from halo.turn import listen_for_barge_in, run_turn
 from halo.userconfig import cfg as user_cfg
-from halo.voice import BARGE_CAPTURE_EXPLICIT as _barge_capture_explicit
+from halo.voice import BARGE_MIN_RMS_EXPLICIT as _barge_min_rms_explicit
+from halo.voice import barge_min_rms as voice_barge_min_rms
 from halo.voice import is_available as voice_available
+from halo.voice import is_barge_capture as voice_is_barge_capture
 from halo.voice import is_quiet as voice_is_quiet
 from halo.voice import is_speaking as voice_is_speaking
 from halo.voice import preload_voice, say
 from halo.voice import set_barge_capture as voice_set_barge_capture
+from halo.voice import set_barge_min_rms as voice_set_barge_min_rms
 from halo.voice import set_quiet as voice_set_quiet
 from halo.voice import stop as voice_stop
 from halo.voice import wait_until_silent as voice_wait_until_silent
@@ -3102,14 +3105,27 @@ def main() -> None:
             say(f"Halo online. Connected: {joined}.{sess_tail}", blocking=False)
     print(f"agents: {', '.join(available_agents()) or '(none connected)'}")
 
-    # Talk-over: if the input device does its own echo cancellation (NVIDIA
-    # Broadcast / RTX Voice / Krisp), enable barge-in capture so the user can
-    # interrupt with a real command while Halo speaks — the hardware AEC keeps
-    # Halo from hearing itself (the recently_spoke guard is the backstop). Don't
-    # override a deliberate HALO_BARGE_IN_CAPTURE=0.
-    if not _barge_capture_explicit and _mic_has_echo_cancellation():
-        voice_set_barge_capture(True)
-        print("  echo-cancelling mic detected -> talk-over (barge-in capture) ON")
+    # Talk-over (barge-in capture) is ON by default — interrupt Halo mid-reply
+    # and it stops + routes what you said. The layered guards in
+    # listen_for_barge_in (loudness + word-overlap + min-words) keep Halo from
+    # interrupting itself even without hardware echo cancellation. If the input
+    # device DOES its own echo cancellation (NVIDIA Broadcast / RTX Voice /
+    # Krisp), relax the loudness floor — AEC already strips Halo's voice, so even
+    # a quiet interruption is genuinely the user. A pinned HALO_BARGE_IN_MIN_RMS
+    # wins over this auto-relax.
+    if not _barge_min_rms_explicit and _mic_has_echo_cancellation():
+        voice_set_barge_min_rms(0.02)
+        print(
+            "  echo-cancelling mic detected -> barge-in loudness floor relaxed "
+            f"to {voice_barge_min_rms():.3f}"
+        )
+    if voice_is_barge_capture():
+        print(
+            f"  talk-over (barge-in capture) ON (loudness floor "
+            f"{voice_barge_min_rms():.3f}). Set HALO_BARGE_IN_CAPTURE=0 to disable."
+        )
+    else:
+        print("  talk-over (barge-in capture) OFF (HALO_BARGE_IN_CAPTURE=0)")
 
     try:
         while True:

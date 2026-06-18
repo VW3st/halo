@@ -153,6 +153,14 @@ fall back to CPU.
   (`vad_threshold = 0.7`), Whisper internal VAD filter
   (`vad_filter=True`). Plus a residual STT hallucination filter for
   Whisper's "Thank you" / "you" / "hello" artifacts on silence.
+  Crank sensitivity in one move with `HALO_HOT_MIC=1`, or tune each knob
+  via `HALO_VAD_THRESHOLD` / `HALO_SPEECH_RMS_FLOOR` /
+  `HALO_ENERGY_ONSET_CHUNKS` / `HALO_MIC_NOISE_GATE_RMS`.
+- **Talk-over (barge-in capture)** — interrupt Halo mid-reply and it stops +
+  routes what you said. ON by default; safe without echo-cancelling hardware
+  thanks to layered echo guards (loudness gate + word-overlap + min-words).
+  Loudness floor `HALO_BARGE_IN_MIN_RMS` (default 0.045, auto-relaxed for AEC
+  mics); disable with `HALO_BARGE_IN_CAPTURE=0`.
 - **Fuzzy-fallback dispatcher** — when Ollama's down AND you said an
   agent name (even Whisper-mangled as "Cloud" / "Codec"), dispatches
   to that agent directly instead of giving up.

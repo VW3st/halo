@@ -178,14 +178,66 @@ def is_barge_in_phrase(text: str) -> bool:
     return bool(BARGE_IN_RE.match((text or "").strip()))
 
 
-def listen_for_barge_in(timeout: float = 20.0) -> str | None:
-    """Listen for a short interrupt phrase while TTS is active.
+def _barge_in_decision(
+    cleaned: str,
+    peak_rms: float,
+    *,
+    capture_on: bool,
+    is_phrase: bool,
+    is_echo: bool,
+    min_words: int,
+    min_rms: float,
+) -> str | None:
+    """Classify a barge-in candidate heard WHILE Halo is speaking. Pure — no
+    audio, no I/O — so the policy is unit-testable in isolation.
 
-    Returns the transcribed interrupt phrase, or None if Halo finishes
-    speaking / timeout elapses without a trusted interrupt. This does NOT
-    route arbitrary user speech; it only accepts `is_barge_in_phrase()`.
+    Returns:
+      "stop"    -> explicit interrupt phrase; stop talking and honor it.
+      "capture" -> substantive interruption; stop talking and route it.
+      None      -> reject (echo / too quiet / too short / capture disabled).
+
+    Layered, INDEPENDENT guards so speaker-bleed echo has to defeat all of them
+    at once (no hardware echo cancellation required):
+      - loudness     : a person at the mic peaks loud; Halo's own voice bleeding
+                       back through the speakers is quiet. `min_rms` separates them.
+      - word-overlap : `is_echo` is True when the text matches what Halo just said.
+      - min-words    : ignore short blips on the high-cost capture path.
+
+    The explicit-phrase path ("stop"/"wait") stays permissive — the user must
+    ALWAYS be able to shut Halo up — so it's blocked only when the candidate is
+    BOTH quiet AND an echo of Halo's own words, i.e. unambiguously self-echo.
     """
+    loud = peak_rms >= min_rms
+    if is_phrase:
+        if is_echo and not loud:
+            return None  # Halo hearing its own quiet "...stop..." — ignore
+        return "stop"
+    if not capture_on:
+        return None
+    if len(cleaned.split()) < min_words:
+        return None
+    if not loud:
+        return None  # too quiet to be a person at the mic — probably bleed
+    if is_echo:
+        return None  # matches what Halo just said — echo, not the user
+    return "capture"
+
+
+def listen_for_barge_in(timeout: float = 20.0) -> str | None:
+    """Listen for an interruption while TTS is active.
+
+    Returns the transcribed interrupt phrase to act on, or None if Halo
+    finishes speaking / times out without a trusted interrupt. Acceptance is
+    decided by `_barge_in_decision` — either the tiny interrupt vocabulary
+    (`is_barge_in_phrase`) or, when barge-in capture is on, a substantive
+    utterance that clears the layered echo guards (loudness + word-overlap +
+    min-words). The mic hears Halo's own voice here (suppress_tts_echo=False),
+    so those guards are what keep Halo from interrupting itself.
+    """
+    from halo.voice import barge_min_rms as _barge_min_rms
+    from halo.voice import is_barge_capture as _barge_capture_on
     from halo.voice import is_speaking as _voice_is_speaking
+    from halo.voice import recently_spoke as _recently_spoke
 
     transcriber = BatchTranscriber()
     state = RecorderState(
@@ -208,26 +260,29 @@ def listen_for_barge_in(timeout: float = 20.0) -> str | None:
                 state.clear_silence_event()
                 text = transcriber.transcribe().strip()
                 if not text:
+                    transcriber.reset()
                     continue
                 cleaned = _strip_wake_prefix(text).rstrip(" .,!?")
-                print(f"  barge-in candidate: {cleaned!r}")
-                if is_barge_in_phrase(cleaned):
+                peak = transcriber.peak_rms()
+                print(f"  barge-in candidate: {cleaned!r} (peak rms {peak:.3f})")
+                decision = _barge_in_decision(
+                    cleaned,
+                    peak,
+                    capture_on=_barge_capture_on(),
+                    is_phrase=is_barge_in_phrase(cleaned),
+                    is_echo=_recently_spoke(cleaned),
+                    min_words=BARGE_IN_CAPTURE_MIN_WORDS,
+                    min_rms=_barge_min_rms(),
+                )
+                if decision == "stop":
                     return cleaned
-                # Capture: a real, substantive interruption (not one of Halo's
-                # own echoed words) stops the reply and gets routed — "capture
-                # what I say even while you're talking". Live flag so an
-                # echo-cancelling mic can enable it at startup.
-                from halo.voice import is_barge_capture as _barge_capture_on
-                if (
-                    _barge_capture_on()
-                    and len(cleaned.split()) >= BARGE_IN_CAPTURE_MIN_WORDS
-                ):
-                    from halo.voice import recently_spoke as _recently_spoke
-                    if _recently_spoke(cleaned):
-                        print(f"  barge-in ignored (echo of Halo): {cleaned!r}")
-                    else:
-                        print(f"  barge-in capture -> {cleaned!r}")
-                        return cleaned
+                if decision == "capture":
+                    print(f"  barge-in capture -> {cleaned!r}")
+                    return cleaned
+                # Rejected. Clear the buffer so the NEXT utterance is measured
+                # on its own loudness, not the running sum since Halo started.
+                print(f"  barge-in rejected (peak {peak:.3f}): {cleaned!r}")
+                transcriber.reset()
     finally:
         try:
             transcriber.stop()

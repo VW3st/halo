@@ -110,6 +110,12 @@ BARGE_IN_CAPTURE_MIN_WORDS = 4   # ignore short blips; real commands are longer
 CHIME_FREQ_HZ = 800
 CHIME_DURATION_MS = 60
 
+# Hot-mic profile: a single switch that biases every sensitivity knob toward
+# "grab my speech sooner, even quiet/far-from-mic" — at the cost of more false
+# triggers from room noise. OFF by default (balanced). Turn on with
+# HALO_HOT_MIC=1. Individual HALO_* overrides below still win over the profile.
+HOT_MIC = os.getenv("HALO_HOT_MIC", "").strip().lower() in ("1", "true", "yes", "on")
+
 # Mic-side noise gate. Audio chunks with RMS below this floor are
 # treated as silence and dropped before they reach silero-VAD / STT.
 # Conservative default (0.005) — well below normal speech levels
@@ -117,8 +123,11 @@ CHIME_DURATION_MS = 60
 # Raise to 0.015-0.020 if your environment is noisy and you still
 # get spurious wake-ups or "Thank you" hallucinations. Disable by
 # setting to 0.0. NVIDIA Broadcast / Krisp / OS-level noise filters
-# remove the need for this entirely.
-MIC_NOISE_GATE_RMS = 0.005
+# remove the need for this entirely. Override with HALO_MIC_NOISE_GATE_RMS;
+# the hot-mic profile drops it so quieter onsets aren't gated out.
+MIC_NOISE_GATE_RMS = float(
+    os.getenv("HALO_MIC_NOISE_GATE_RMS", "0.003" if HOT_MIC else "0.005")
+)
 
 # Conversation mode: stay awake after wake until either an explicit
 # end phrase or N seconds of idle silence (with no active agent jobs).

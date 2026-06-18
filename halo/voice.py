@@ -107,11 +107,14 @@ def set_quiet(on: bool) -> None:
 
 
 # Barge-in CAPTURE: accept a substantive interruption (not just "stop"/"wait")
-# while Halo is speaking. Off unless HALO_BARGE_IN_CAPTURE=1 OR an echo-
-# cancelling mic (NVIDIA Broadcast / RTX Voice / Krisp) is detected at startup,
-# in which case __main__ turns it on (hardware AEC keeps Halo from hearing
-# itself; the recently_spoke() word-overlap guard is the software backstop).
-_BARGE_CAPTURE = os.getenv("HALO_BARGE_IN_CAPTURE", "").strip().lower() in (
+# while Halo is speaking — stop talking and route what you said. ON by default
+# now that listen_for_barge_in() stacks independent guards (loudness gate +
+# word-overlap echo guard + min-words + whisper hallucination filter), so it's
+# safe even without hardware echo cancellation. Force off with
+# HALO_BARGE_IN_CAPTURE=0. With an echo-cancelling mic (NVIDIA Broadcast / RTX
+# Voice / Krisp) __main__ RELAXES the loudness floor (AEC already removes Halo's
+# own voice, so even a quiet interruption is genuinely the user).
+_BARGE_CAPTURE = os.getenv("HALO_BARGE_IN_CAPTURE", "1").strip().lower() in (
     "1", "true", "yes", "on"
 )
 # Whether the env var was explicitly set — auto-detect won't override a
@@ -126,6 +129,35 @@ def is_barge_capture() -> bool:
 def set_barge_capture(on: bool) -> None:
     global _BARGE_CAPTURE
     _BARGE_CAPTURE = bool(on)
+
+
+# Loudness floor (peak RMS, 0..1) a captured interruption must clear to be
+# accepted while Halo is speaking. A person talking into the mic peaks well
+# above this; Halo's own voice bleeding back through the speakers is quieter.
+# This is the primary defense when there's no hardware echo cancellation.
+# Tune with HALO_BARGE_IN_MIN_RMS; __main__ lowers it when an AEC mic is found.
+def _initial_barge_min_rms() -> float:
+    try:
+        return max(0.0, float(os.getenv("HALO_BARGE_IN_MIN_RMS", "0.045")))
+    except (TypeError, ValueError):
+        return 0.045
+
+
+_BARGE_MIN_RMS = _initial_barge_min_rms()
+# Whether the floor was pinned via env — AEC auto-relax won't override it.
+BARGE_MIN_RMS_EXPLICIT = "HALO_BARGE_IN_MIN_RMS" in os.environ
+
+
+def barge_min_rms() -> float:
+    return _BARGE_MIN_RMS
+
+
+def set_barge_min_rms(value: float) -> None:
+    global _BARGE_MIN_RMS
+    try:
+        _BARGE_MIN_RMS = max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
 
 
 # Recent spoken text, for the barge-in echo guard. When the mic captures speech

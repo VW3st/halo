@@ -209,6 +209,14 @@ class BatchTranscriber:
         with self._lock:
             self._chunks.insert(0, audio_int16)
 
+    def reset(self) -> None:
+        """Drop all buffered audio so the next transcribe()/peak_rms() reflect
+        only freshly-fed chunks. Used by the barge-in listener between rejected
+        candidates so the loudness gate measures THIS utterance, not the running
+        sum of everything heard since Halo started speaking."""
+        with self._lock:
+            self._chunks = []
+
     def _snapshot(self) -> np.ndarray:
         with self._lock:
             if not self._chunks:

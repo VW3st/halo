@@ -10,6 +10,49 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.6.0] — 2026-06-18
+
+Bulletproof talk-over + a hot-mic profile.
+
+### Changed
+- **Talk-over (barge-in capture) is now ON by default.** You can interrupt Halo
+  mid-reply and it stops + routes what you said, without needing an echo-
+  cancelling mic. Disable with `HALO_BARGE_IN_CAPTURE=0`. (Was off unless an AEC
+  mic was detected.)
+
+### Added
+- **Layered echo defense for barge-in** (`turn._barge_in_decision`, unit-tested).
+  An interruption heard while Halo is speaking must clear independent guards so
+  speaker-bleed echo has to beat all of them at once:
+  - **Loudness gate** (new, the workhorse without hardware AEC) — a person at the
+    mic peaks loud; Halo's own voice bleeding back through the speakers is quiet.
+    Floor is `HALO_BARGE_IN_MIN_RMS` (default 0.045); an AEC mic auto-relaxes it
+    to 0.02 since the echo is already gone.
+  - **Word-overlap echo guard** (`recently_spoke`) — reject text matching what
+    Halo just said.
+  - **Min-words** — ignore short blips on the capture path.
+  - Plus the existing whisper hallucination + acoustic-confidence filters.
+  The explicit interrupt vocabulary ("stop"/"wait") stays permissive — you can
+  always cut Halo off — and is blocked only when a candidate is BOTH quiet AND an
+  echo of Halo's own words.
+- **`BatchTranscriber.reset()`** — barge-in clears the buffer between rejected
+  candidates so the loudness gate measures the current utterance, not the running
+  sum since Halo started talking.
+- **`HALO_HOT_MIC=1` profile** — one switch that biases sensitivity toward
+  grabbing speech sooner/quieter (VAD threshold 0.35→0.25, energy floor
+  0.018→0.012, onset 6→3 chunks, noise gate 0.005→0.003). Trades more false
+  triggers for faster pickup. Individual `HALO_*` overrides still win.
+- **Per-knob env overrides** — `HALO_VAD_THRESHOLD`, `HALO_SPEECH_RMS_FLOOR`,
+  `HALO_ENERGY_ONSET_CHUNKS`, `HALO_MIC_NOISE_GATE_RMS`, `HALO_BARGE_IN_MIN_RMS`.
+
+### Note
+- Without hardware echo cancellation, talk-over is *robust, not infallible*: a
+  loud speaker whose echo whisper garbles into different words can still defeat
+  both the loudness and word-overlap guards. Use NVIDIA Broadcast / RTX Voice /
+  Krisp for a true guarantee, or raise `HALO_BARGE_IN_MIN_RMS`.
+
+---
+
 ## [1.5.9] — 2026-06-18
 
 ### Removed

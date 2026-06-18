@@ -25,6 +25,7 @@ from halo.config import (
     CHIME_DURATION_MS,
     CHIME_FREQ_HZ,
     DEBUG,
+    HOT_MIC,
     MIC_NOISE_GATE_RMS,
     RECORDINGS_DIR,
     SAMPLE_RATE,
@@ -36,15 +37,23 @@ VAD_CHUNK = 512
 # so 0.5 missed real speech entirely ("no speech detected"). Run-ons that
 # 0.3 used to cause are now bounded by TURN_MAX_SEC, so the looser value is
 # safe — and the RMS-energy fallback below catches speech silero misses.
-VAD_THRESHOLD = 0.35
+# Lower = more sensitive (grabs quieter speech sooner, more noise false-fires).
+# Override with HALO_VAD_THRESHOLD; the hot-mic profile drops it to 0.25.
+VAD_THRESHOLD = float(os.getenv("HALO_VAD_THRESHOLD", "0.25" if HOT_MIC else "0.35"))
 SPEECH_PAD_MS = 200
 
 # RMS-energy fallback so a quiet mic that under-scores on silero still
 # registers speech. If `ENERGY_ONSET_CHUNKS` consecutive chunks clear
 # SPEECH_RMS_FLOOR we treat it as a speech onset; after speech, that many
-# sub-gate chunks marks the end. ~32 ms per chunk.
-SPEECH_RMS_FLOOR = 0.018
-ENERGY_ONSET_CHUNKS = 6   # ~200 ms of sustained energy = onset
+# sub-gate chunks marks the end. ~32 ms per chunk. Both override-able; the
+# hot-mic profile lowers the floor and shortens the onset run for snappier
+# pickup (HALO_SPEECH_RMS_FLOOR / HALO_ENERGY_ONSET_CHUNKS).
+SPEECH_RMS_FLOOR = float(
+    os.getenv("HALO_SPEECH_RMS_FLOOR", "0.012" if HOT_MIC else "0.018")
+)
+ENERGY_ONSET_CHUNKS = int(
+    os.getenv("HALO_ENERGY_ONSET_CHUNKS", "3" if HOT_MIC else "6")
+)   # ~200 ms (or ~100 ms hot) of sustained energy = onset
 
 # Tell the user "your mic is picking up audio" when RMS rises above this.
 # Rate-limited print, purely diagnostic. Bumped from 0.01 to 0.05 so we
