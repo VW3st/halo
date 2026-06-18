@@ -28,6 +28,8 @@ import base64
 import json
 import os
 import re
+import shutil
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -72,6 +74,85 @@ def _out_path() -> Path:
     out_dir = Path(IMAGE_DIR).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir / f"halo-image-{int(time.time())}.png"
+
+
+_CODEX_TIMEOUT_SEC = 240.0
+
+
+def _png_mtimes(dirs: list[Path]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for d in dirs:
+        try:
+            for p in d.glob("*.png"):
+                out[str(p)] = p.stat().st_mtime
+        except Exception:
+            pass
+    return out
+
+
+def _generate_codex(subject: str) -> str:
+    """Run the Codex CLI's built-in image_gen tool (gpt-image-2) exactly how a
+    human would — `codex login` (ChatGPT auth), NO separate API key. Snapshots
+    PNGs before/after so we can find whatever Codex produced and return it."""
+    out_dir = Path(IMAGE_DIR).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest = out_dir / f"halo-image-{int(time.time())}.png"
+    watch = [out_dir, Path.home() / ".codex" / "generated_images"]
+    before = _png_mtimes(watch)
+
+    # NAME the destination — the imagegen skill's save-path rule is "if the user
+    # names a destination, move/copy the output there"; without one it treats
+    # the request as a preview and writes NO file. reasoning_effort=low keeps the
+    # agent loop fast (the user's default xhigh makes it crawl).
+    prompt = (
+        f"Generate an image of: {subject}. Use your built-in image_gen tool, "
+        f"then save the final PNG to exactly this path: {dest}"
+    )
+    cmd = [
+        "codex", "exec",
+        "--sandbox", "workspace-write",
+        "--skip-git-repo-check",  # the image dir isn't a git repo
+        "-c", 'approval_policy="never"',
+        "-c", 'model_reasoning_effort="low"',
+        "-C", str(out_dir),
+        prompt,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",  # Codex emits UTF-8 box chars; cp1252 would crash
+            timeout=_CODEX_TIMEOUT_SEC,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "Codex CLI not found — install it (codex login) or set "
+            "HALO_IMAGE_PROVIDER=openrouter."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Codex image generation timed out.") from exc
+
+    # Preferred: Codex wrote the file to the path we named.
+    if dest.exists() and dest.stat().st_size > 0:
+        return str(dest)
+    # Fallback: it saved under $CODEX_HOME/generated_images instead — grab the
+    # freshest new PNG and copy it to our dir.
+    after = _png_mtimes(watch)
+    fresh = [p for p, m in after.items() if p not in before or m > before[p] + 0.5]
+    if fresh:
+        src = max(fresh, key=lambda p: after[p])
+        try:
+            if Path(src).resolve() != dest.resolve():
+                shutil.copy(src, dest)
+                return str(dest)
+        except Exception:
+            pass
+        return src
+    tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[-280:]
+    raise RuntimeError("Codex produced no image. " + tail)
 
 
 def _generate_openrouter(prompt: str, model: str) -> bytes:
@@ -134,20 +215,26 @@ def _generate_openai(prompt: str, model: str, size: str) -> bytes:
 
 
 def generate_image(
-    prompt: str,
+    subject: str,
     *,
     provider: str | None = None,
     model: str | None = None,
     size: str | None = None,
 ) -> str:
-    """Generate a real image from `prompt`, save it as a PNG, return the path.
+    """Generate a real image of `subject`, save it as a PNG, return the path.
 
-    Raises RuntimeError with a short, speech-friendly message on failure
-    (missing key, content policy, network) so the caller can fail open.
+    Default provider is "codex" (the Codex CLI's built-in image_gen tool — no
+    API key, your ChatGPT login). "openrouter" / "openai" are API fallbacks.
+    Raises RuntimeError with a short, speech-friendly message on failure so the
+    caller can fail open.
     """
-    if not (prompt or "").strip():
-        raise RuntimeError("empty prompt")
-    provider = (provider or IMAGE_PROVIDER or "openrouter").strip().lower()
+    if not (subject or "").strip():
+        raise RuntimeError("empty subject")
+    provider = (provider or IMAGE_PROVIDER or "codex").strip().lower()
+    if provider == "codex":
+        return _generate_codex(subject)
+    # API backends build a fuller prompt and save the returned bytes themselves.
+    prompt = build_prompt(subject)
     try:
         if provider == "openai":
             data = _generate_openai(

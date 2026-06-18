@@ -10,6 +10,28 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.5.8] — 2026-06-18
+
+Image generation now defaults to the Codex CLI — no API key.
+
+### Changed
+- **Default image provider is now `codex`** — "generate an image of X" runs your
+  Codex CLI's built-in `image_gen` tool (`gpt-image-2`) exactly how a human
+  would, on your existing `codex login` (ChatGPT auth). **No separate API key.**
+  (Validated end-to-end: a real 2.2 MB PNG generated + opened.) The OpenRouter /
+  OpenAI API paths from 1.5.7 are now fallbacks (`HALO_IMAGE_PROVIDER`).
+- Getting it working took finding three things the hard way (now baked in):
+  - **`--skip-git-repo-check`** — Codex refuses to run in a non-git dir
+    (`~/Pictures/Halo`) without it.
+  - **Name the destination path in the prompt** — the imagegen skill only writes
+    a file when a destination is named; otherwise it treats the request as a
+    preview and saves nothing.
+  - **`model_reasoning_effort="low"`** + UTF-8 capture — the user's default
+    `xhigh` makes the agent loop crawl, and Codex emits UTF-8 box chars that
+    crash cp1252 capture on Windows.
+
+---
+
 ## [1.5.7] — 2026-06-17
 
 Real image generation — "generate an image of X" makes an actual image.

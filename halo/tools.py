@@ -304,7 +304,7 @@ def _image_worker(subject: str) -> None:
     from halo import image_gen, voice
     try:
         bus.emit("image.start", subject=subject)
-        path = image_gen.generate_image(image_gen.build_prompt(subject))
+        path = image_gen.generate_image(subject)
         print(f"  [image] saved: {path}")
         bus.emit("image.done", subject=subject, path=path)
         try:
