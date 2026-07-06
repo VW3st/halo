@@ -44,9 +44,11 @@ def test_session_name_per_cwd():
     _reset_module_state()
     n1 = agents.session_name("claude_code", "D:\\Halo")
     n2 = agents.session_name("claude_code", "D:\\website")
-    # Should be different (likely — name pool is random; check inequality of keys)
-    assert n1 in agents._MYTHOLOGY_NAMES
-    assert n2 in agents._MYTHOLOGY_NAMES
+    # Names are now "<model> in <project>" (mythology codenames are gone) —
+    # the project folder must appear so the user knows WHICH session it is.
+    assert n1.endswith("in Halo"), f"unexpected session name {n1!r}"
+    assert n2.endswith("in website"), f"unexpected session name {n2!r}"
+    assert n1 != n2
     # Same cwd returns same name twice.
     assert_eq(agents.session_name("claude_code", "D:\\Halo"), n1)
     # Two separate state entries:

@@ -1,9 +1,9 @@
 """Turn orchestrator — adaptive turn-taking (step 3.5).
 
-After wake fires we open a recording stream, seed Moonshine with the
-~1 s of audio captured BEFORE wake detection (so "Hey Jarvis open
-calculator" said in one breath doesn't lose the command), and start
-streaming partials.
+After wake fires we open a recording stream, seed the transcriber
+(faster-whisper) with the ~1 s of audio captured BEFORE wake detection
+(so "Hey Jarvis open calculator" said in one breath doesn't lose the
+command), and run the adaptive turn loop.
 
 Silence handling is adaptive based on the transcript shape:
 
@@ -24,6 +24,7 @@ modes so the user knows we're still listening.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 
@@ -53,6 +54,7 @@ from halo.record import (
 from halo.router import check_turn_complete, understand_and_route
 from halo.stt import BatchTranscriber
 from halo.tools import is_pure_tool
+from halo.utterance import classify_utterance
 from halo.wake import get_pre_wake_audio
 
 # --- end-of-turn override phrases ---------------------------------------
@@ -84,9 +86,9 @@ BARGE_IN_RE = re.compile(
     re.IGNORECASE,
 )
 
-# The pre-wake audio seed includes "Hey Jarvis", so every Moonshine
-# transcript starts with the wake word. Strip it — otherwise the
-# wake-word audio eats Moonshine's first decoding window and the real
+# The pre-wake audio seed includes "Hey Jarvis", so every transcript
+# starts with the wake word. Strip it — otherwise the wake-word audio
+# eats the transcriber's first decoding window and the real
 # command lands in its weaker tail. Also handles common mishearings
 # like "hey jervis" / "hey jarves".
 WAKE_PREFIX_RE = re.compile(
@@ -105,11 +107,27 @@ _TRAILING_CONNECTORS = {
     "and", "or", "but", "with", "also", "plus", "because", "so", "then",
     "the", "a", "my", "to", "for", "in", "on", "at", "of",
 }
+# Copulas / auxiliaries as the LAST word usually mean "more is coming" ("the next
+# thing is ___", "we're going ___") — but the user typically finishes soon after,
+# so give a MODERATE "thinking" pause (3.2s), not the long "composing" one (4.5s).
+# Without this, "...the next thing is" got the snappy 0.9s timeout and was cut off.
+_TRAILING_CONTINUATIONS = {
+    "is", "are", "was", "were", "be", "been", "being", "going", "gonna", "about",
+}
 _THINKING_MARKERS = (
     "um", "uh", "hmm", "wait", "actually", "let me", "give me", "hold on",
 )
 _LIST_CONNECTORS_IN_TEXT = (" and ", " with ", " also ", " plus ", " then ")
 _COMPLEX_WORD_COUNT = 10
+
+# An INCOMPLETE phrase ("...the next thing is") means the user is mid-sentence,
+# pausing to formulate. Wait the generous composing budget before giving up, not
+# the old snappy 2s — being cut off on a thinking pause is the turn-taking
+# complaint we keep hearing. Snappy COMPLETE commands are unaffected (they commit
+# immediately). Tune with HALO_INCOMPLETE_WAIT_SEC.
+_INCOMPLETE_WAIT_SEC = float(
+    os.getenv("HALO_INCOMPLETE_WAIT_SEC", str(MODE_SILENCE_SEC["thinking"]))
+)
 
 
 def detect_mode(transcript: str) -> tuple[str, float]:
@@ -124,6 +142,11 @@ def detect_mode(transcript: str) -> tuple[str, float]:
     # Trailing connector / function word -> almost certainly composing.
     if last_word in _TRAILING_CONNECTORS:
         return "composing", MODE_SILENCE_SEC["composing"]
+
+    # Trailing copula/auxiliary ("...the next thing is") -> a moderate thinking
+    # pause: more is likely coming, but the user usually finishes soon.
+    if last_word in _TRAILING_CONTINUATIONS:
+        return "thinking", MODE_SILENCE_SEC["thinking"]
 
     # Thinking marker in the last 5 words -> bias toward longer wait.
     last_5 = " ".join(words[-5:])
@@ -169,6 +192,23 @@ def _strip_trailing_dangling(text: str) -> str:
 
 def _has_hold(text: str) -> bool:
     return bool(HOLD_RE.search(text))
+
+
+def _user_resumed(state, grace_sec: float = 0.15) -> bool:
+    """True if the user started talking again while we were transcribing /
+    deciding — the pending commit must be ABORTED and the turn continued.
+
+    THE commit race: silence fires at 0.6 s, Whisper takes 0.5-1.5 s, and the
+    turn used to commit the moment Stage 1 said COMPLETE — even if the user had
+    already resumed mid-transcription. Their continuation became a separate
+    turn that collided with Halo's reply ("it cut me off and didn't catch the
+    rest"). The tiny grace window also catches a resume that's in flight.
+    `state` only needs wait_for_speech/clear_speech_event (stubbed in tests).
+    """
+    if state.wait_for_speech(timeout=grace_sec):
+        state.clear_speech_event()
+        return True
+    return False
 
 
 def is_barge_in_phrase(text: str) -> bool:
@@ -361,6 +401,7 @@ def run_turn(
     skip_routing: bool = False,
     max_wait_first_speech_sec: float | None = None,
     seed_pre_wake: bool = True,
+    seed_audio=None,
 ) -> dict | None:
     """Run one wake-triggered turn.
 
@@ -384,6 +425,16 @@ def run_turn(
         else TURN_MAX_WAIT_FOR_FIRST_SPEECH_SEC
     )
     transcriber = BatchTranscriber()
+
+    # Gap-capture seed: speech recorded BETWEEN turns (while Halo was routing,
+    # thinking, or finishing its reply) — see record.GapCapture. Seeded before
+    # the pre-wake buffer below so the transcriber's chronological order stays
+    # [pre-wake, gap, live] (seed() PREPENDS).
+    if seed_audio is not None and getattr(seed_audio, "size", 0) > 0:
+        transcriber.seed(seed_audio)
+        print(f"  seeded {seed_audio.size / SAMPLE_RATE:.1f}s of speech heard "
+              "while I was busy")
+        bus.emit("turn.gap_seeded", seconds=round(seed_audio.size / SAMPLE_RATE, 2))
 
     # Seed only the first turn after wake with the audio captured just before
     # wake fired, so "halo open calculator" said in one breath is not lost.
@@ -411,9 +462,36 @@ def run_turn(
     hold_until = 0.0
 
     def _commit(text: str) -> dict:
-        """Pick between Stage 2 routing and a raw passthrough dict."""
+        """Pick between Stage 2 routing and a raw passthrough dict.
+
+        Tags every committed utterance with `utterance_class` (command / filler /
+        noise) PLUS the raw mic onset signals (`onset_signals` / `peak_rms`) so the
+        orchestrator can re-classify WITH the content address signal and drop
+        counting, thinking-aloud, rumble, AND background side-talk. This commit
+        can't see `direct_agent`, so it never emits BACKGROUND itself.
+        """
+        try:
+            peak = transcriber.peak_rms()
+        except Exception:
+            peak = 0.0
+        try:
+            sig = state.onset_signals()
+        except Exception:
+            sig = {}
         if not skip_routing:
-            return _route(text)
+            decision = _route(text)
+            decision.setdefault(
+                "utterance_class",
+                classify_utterance(
+                    decision.get("cleaned_text") or text, peak_rms=peak,
+                    vad_fired=sig.get("vad_fired"),
+                    energy_only_onset=sig.get("energy_only_onset", False),
+                ),
+            )
+            decision["onset_signals"] = sig
+            decision["peak_rms"] = peak
+            decision["stt_quality"] = getattr(transcriber, "last_quality", None)
+            return decision
         stripped = _strip_wake_prefix(text).rstrip(" .,!?")
         return {
             "status": "raw",
@@ -423,6 +501,14 @@ def run_turn(
             "agent": "none",
             "confirmation": "",
             "clarification": "",
+            "utterance_class": classify_utterance(
+                stripped, peak_rms=peak,
+                vad_fired=sig.get("vad_fired"),
+                energy_only_onset=sig.get("energy_only_onset", False),
+            ),
+            "onset_signals": sig,
+            "peak_rms": peak,
+            "stt_quality": getattr(transcriber, "last_quality", None),
         }
 
     try:
@@ -543,6 +629,13 @@ def run_turn(
                       f"{'COMPLETE' if is_complete else 'INCOMPLETE'}")
 
                 if is_complete:
+                    # Commit-race guard: if the user resumed talking during
+                    # STT / the mode wait / stage 1, do NOT commit half their
+                    # thought — keep listening and re-decide at the next pause.
+                    if _user_resumed(state):
+                        print("  you kept talking -> holding the commit")
+                        bus.emit("turn.commit_aborted", text=text)
+                        continue
                     return _commit(text)
 
                 incomplete_extensions += 1
@@ -550,12 +643,17 @@ def run_turn(
                     print("  max extensions reached -> committing")
                     return _commit(text)
 
-                print(f"  stage 1 incomplete -> extending {TURN_EXTENSION_SEC}s")
-                if not _wait_with_backchannel(state, TURN_EXTENSION_SEC, "thinking", deadline):
-                    print("  user did not continue -> committing")
-                    # Abandoned mid-sentence — peel a dangling conjunction/
-                    # article so we don't route "...build a landing page and".
-                    return _commit(_strip_trailing_dangling(text))
+                print(f"  stage 1 incomplete -> waiting {_INCOMPLETE_WAIT_SEC:.1f}s "
+                      f"(you trailed off mid-sentence)")
+                if not _wait_with_backchannel(state, _INCOMPLETE_WAIT_SEC, "composing", deadline):
+                    print("  user paused on an unfinished thought -> holding for continuation")
+                    # Trailed off mid-sentence. Peel a dangling conjunction/article,
+                    # and FLAG it so the orchestrator holds it for the continuation
+                    # instead of acting on half a sentence (the "don't break if I
+                    # pause" merge).
+                    held = _commit(_strip_trailing_dangling(text))
+                    held["incomplete"] = True
+                    return held
                 state.clear_speech_event()
 
             # Hard-timeout fall-through.

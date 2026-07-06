@@ -28,6 +28,7 @@ Each turn's decision drives one of:
 from __future__ import annotations
 
 import json
+import os
 import re
 import signal
 import threading
@@ -54,6 +55,7 @@ from halo.agents import (
     summarize_for_speech,
 )
 from halo.config import (
+    BACKGROUND_RMS,
     CONVERSATION_IDLE_ENGAGED_SEC,
     CONVERSATION_IDLE_SEC,
     FOLLOWUP_GATE_ENABLED,
@@ -65,10 +67,13 @@ from halo.discovery import DiscoveryThread, is_available as discovery_available
 from halo.followup_gate import passes as followup_gate_passes
 from halo.record import preload_models as preload_audio_models
 from halo.registry import SessionRegistry
+from halo.skills import SkillRegistry
 from halo.router import (
     SessionContext,
     chat_reply,
     chat_reply_stream,
+    chat_reply_with_tools,
+    check_turn_complete,
     preload_router,
     summarize_reply,
     understand_and_route,
@@ -76,6 +81,9 @@ from halo.router import (
 from halo.tools import _try_say, execute_system_intent
 from halo.turn import listen_for_barge_in, run_turn
 from halo.userconfig import cfg as user_cfg
+from halo import floor
+from halo import hotkey
+from halo import utterance as _utterance
 from halo.voice import BARGE_MIN_RMS_EXPLICIT as _barge_min_rms_explicit
 from halo.voice import barge_min_rms as voice_barge_min_rms
 from halo.voice import is_available as voice_available
@@ -95,6 +103,31 @@ from halo.web import start_server as start_web_server
 # multi-session mode (v1.2). Stays empty in single-session mode, in which
 # case the orchestrator behaves exactly like v1.1.
 REGISTRY = SessionRegistry()
+
+# Claude/Codex skill registry (Phase 2). Populated at startup; lets a spoken
+# task route to a matching skill ("make instagram captions" -> ai-captions).
+_SKILLS = SkillRegistry()
+_SKILLS_ENABLED = os.getenv("HALO_SKILLS", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+# Phase 6 — set by the global dictation hotkey thread; polled by main()'s wake loop.
+_DICTATION_HOTKEY = threading.Event()
+# Phase 7 — let the brain call MCP tools directly (weather/files/web) before
+# answering, not only the spawned Claude. Gated on cfg.mcp.brain_tools.
+_BRAIN_TOOLS = os.getenv("HALO_MCP_BRAIN_TOOLS", "").strip().lower() in (
+    "1", "true", "yes", "on"
+) or bool(getattr(getattr(user_cfg, "mcp", None), "brain_tools", False))
+# BG — the mic-grounded "third detection": classify side-talk / TV as BACKGROUND
+# and ignore it (vs FILLER/NOISE). Gated under _TURN_FLOOR too. HALO_BG_FILTER=0 off.
+_BACKGROUND_FILTER = os.getenv("HALO_BG_FILTER", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+# ASK — when a switch lands on a project whose agent is only DISCOVERED (World B,
+# Halo can send but not hear replies), ask: use it (send-only) or start Halo's own
+# readable session. HALO_ASK_SESSION_REPLY=0 restores the silent desktop-send.
+_ASK_SESSION_REPLY = os.getenv("HALO_ASK_SESSION_REPLY", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 _DISCOVERY: DiscoveryThread | None = None
 _desktop_last_sent: dict[str, str] = {}
 _desktop_last_error: str = ""
@@ -321,19 +354,31 @@ def _init_memory() -> None:
         _MEMORY = None
 
 
-def _brain_history(current: str = "") -> str:
+def _brain_history(current: str = "", with_time: bool = False) -> str:
     """The memory block fed to the router + chat brain each turn: persistent
-    memory (facts + recent/relevant turns) when available, else the live brief."""
+    memory (facts + recent/relevant turns) when available, else the live brief.
+    `with_time` prepends real-time grounding (now + when the user first started)
+    so the chat brain answers time/duration questions instead of hallucinating."""
+    parts: list[str] = []
     if _MEMORY is not None:
+        if with_time:
+            try:
+                tc = _MEMORY.time_context()
+                if tc:
+                    parts.append(tc)
+            except Exception:
+                pass
         try:
             block = _MEMORY.render_for_brain(
                 current, max_turns=user_cfg.memory.max_turns,
                 max_facts=user_cfg.memory.max_facts,
             )
             if block:
-                return block
+                parts.append(block)
         except Exception:
             pass
+    if parts:
+        return "\n\n".join(parts)
     return _active_brief.render_history() if _active_brief is not None else ""
 
 
@@ -708,6 +753,237 @@ def _chitchat_reply(text: str) -> str | None:
     return None
 
 
+# Lag fix — a purely conversational utterance (no task verb, no agent named) is
+# chitchat: answer it with ONE streaming brain call instead of paying a Stage-2
+# routing round-trip FIRST and a chat call SECOND. Halves the "ms before it
+# talks". Conservative — anything with an action verb or agent name still routes
+# the normal way, so commands are never mistaken for chat. HALO_FAST_CHAT=0 off.
+_TASK_VERB_RE = re.compile(
+    r"\b(build|make|create|write|code|develop|implement|fix|debug|repair|"
+    r"refactor|rewrite|run|execute|deploy|ship|open|launch|start|stop|kill|"
+    r"restart|close|add|remove|delete|update|modify|edit|install|set\s?up|"
+    r"generate|dictate|search|schedule|send|email|download|upload|push|commit|"
+    r"merge|test|switch|spawn)\b",
+    re.IGNORECASE,
+)
+_FAST_CHAT = os.getenv("HALO_FAST_CHAT", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+# Continuation merge: hold a trailed-off fragment and glue it to your next
+# utterance so pausing mid-sentence doesn't break the command. HALO_MERGE=0 off.
+_MERGE = os.getenv("HALO_MERGE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# Gap capture: keep listening BETWEEN turns (while Halo routes / thinks /
+# finishes its reply) and seed the next turn with what you said, so nothing
+# is lost to dead air. HALO_GAP_CAPTURE=0 turns it off.
+_GAP_CAPTURE = os.getenv("HALO_GAP_CAPTURE", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+_gap_capture = None  # lazy record.GapCapture singleton
+
+
+def _gap() -> "object | None":
+    """The GapCapture singleton (created on first use), or None when disabled."""
+    global _gap_capture
+    if not _GAP_CAPTURE:
+        return None
+    if _gap_capture is None:
+        from halo.record import GapCapture
+        _gap_capture = GapCapture()
+    return _gap_capture
+
+
+def _gap_stop() -> None:
+    """Stop the between-turns capture stream (conversation over / turn open)."""
+    if _gap_capture is not None:
+        _gap_capture.stop()
+
+
+# Semantic repair: when Whisper was UNSURE of a transcript, run it (plus the
+# recent conversation) through the brain to fix mis-recognized words before
+# routing — "make sure the translation makes sense, not just random words".
+# Confident transcripts never pay the latency. HALO_STT_REPAIR=0 turns it off.
+_STT_REPAIR = os.getenv("HALO_STT_REPAIR", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+_STT_REPAIR_TIMEOUT_SEC = float(os.getenv("HALO_STT_REPAIR_TIMEOUT_SEC", "3.0"))
+
+
+def _repair_transcript_timeboxed(text: str, context: str) -> str:
+    """Time-boxed LLM repair (same pattern as dictation autocorrect).
+    Fail-open: raw text on error or timeout so a turn never stalls."""
+    box: dict[str, str | None] = {"v": None}
+
+    def _work() -> None:
+        try:
+            from halo.router import repair_transcript
+            box["v"] = repair_transcript(text, context)
+        except Exception:
+            box["v"] = None
+
+    th = threading.Thread(target=_work, daemon=True)
+    th.start()
+    th.join(timeout=_STT_REPAIR_TIMEOUT_SEC)
+    return box["v"] or text
+# How long a trailed-off fragment is held waiting for its continuation. Generous
+# so a slow thinker's pause doesn't silently lose the fragment. HALO_MERGE_WINDOW_SEC.
+_MERGE_WINDOW_SEC = float(os.getenv("HALO_MERGE_WINDOW_SEC", "20.0"))
+
+
+def _looks_conversational(text: str) -> bool:
+    """True when an utterance carries NO actionable signal (no task verb, no
+    agent named) — safe to answer as chat (one streaming call), not routed."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _AGENT_NAME_RE.search(t):
+        return False
+    if _TASK_VERB_RE.search(t):
+        return False
+    return True
+
+
+# Compose-then-send: in direct dialogue, accumulate what you say to the agent and
+# only fire it off on a send word OR a clear pause — so you can speak in full
+# paragraphs instead of having every sentence shipped. HALO_COMPOSE_SEND=0 reverts
+# to send-every-sentence.
+_COMPOSE_SEND = os.getenv("HALO_COMPOSE_SEND", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+_COMPOSE_FLUSH_SEC = 2.5  # silence after composing that auto-sends the buffer
+# Sends ONLY when the whole utterance ENDS with a send phrase, so a send word
+# used mid-sentence ("...want to go to the next bit") never ships early. Bare
+# "go" is stricter still — only standalone or comma-set-off ("build the page, go")
+# — because it's the most common word to say while just talking.
+_SEND_NOW_RE = re.compile(
+    r"(?:^|[\s,])(?:send it|send that|send this|send|go ahead|that'?s it|"
+    r"that'?s all|that'?s everything|that'?s the message|i'?m done|fire it off|"
+    r"ship it)\s*[.!?]*\s*$"
+    r"|(?:^|,\s*)go\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _wants_send_now(text: str) -> tuple[bool, str]:
+    """(send_now, residual). If `text` ends with a send phrase, returns
+    (True, the text before it — possibly ''); otherwise (False, text)."""
+    t = (text or "").strip()
+    if not t:
+        return False, ""
+    m = _SEND_NOW_RE.search(t)
+    if m:
+        return True, t[: m.start()].rstrip(" ,.!?").strip()
+    return False, t
+
+
+# --- "Ask me each time" for session replies (ASK) --------------------------
+# Navigating to a project whose agent is only DISCOVERED (World B, its own
+# terminal) means Halo can type to it but can't hear replies. So it offers: use
+# that one (send-only) or start its own readable session. The chosen "start my
+# own" cwd is encoded into direct_session_label via this sentinel, so every
+# existing `direct_session_label = None` reset clears it for free.
+_OWN_PREFIX = "|own|"
+
+
+def _own_cwd(label: str | None) -> str | None:
+    """If `label` is an own-session sentinel, return the project cwd, else None."""
+    if label and label.startswith(_OWN_PREFIX):
+        return label[len(_OWN_PREFIX):]
+    return None
+
+
+def _is_discovered_only(session_label: str | None) -> bool:
+    """True when this label is a DISCOVERED session (World B) with NO live
+    Halo-owned (World A) session in the same cwd — so a send there is deaf."""
+    if not session_label or _own_cwd(session_label):
+        return False
+    session = REGISTRY.by_label(session_label)
+    if session is None or not (session.cwd or "").strip():
+        return False
+    try:
+        from halo.agents import session_key as _skey, session_status_detail
+        return not session_status_detail().get(_skey(session.agent_key, session.cwd), False)
+    except Exception:
+        return False
+
+
+def _session_reply_offer(session) -> dict:
+    """A pending offer: use the discovered session (send-only) or spawn Halo's own."""
+    return {
+        "_session_reply_offer": True,
+        "agent_key": session.agent_key,
+        "session_label": session.label,
+        "cwd": session.cwd,
+    }
+
+
+def _resolve_session_reply_offer(offer: dict, want_own: bool) -> tuple[str, str | None, str]:
+    """Map the offer + choice to (agent, direct_session_label, spoken_phrase)."""
+    agent_key = offer["agent_key"]
+    if want_own:
+        REGISTRY.set_active(None)  # bypass the desktop-send path
+        return agent_key, _OWN_PREFIX + (offer["cwd"] or ""), (
+            f"Starting my own {AGENTS[agent_key].spoken_name} session there. "
+            "You'll hear the replies. What should it do?"
+        )
+    REGISTRY.set_active(offer["session_label"])
+    where = Path(offer["cwd"]).name if offer.get("cwd") else "it"
+    return agent_key, offer["session_label"], (
+        f"Okay, using the one already running in {where}. "
+        "I'll send but won't hear its replies. What should I send?"
+    )
+
+
+_OWN_SESSION_RE = re.compile(
+    r"\b(?:start|spawn|open|launch|run|fire up|bring up)\b.*\bown\b"
+    r"|\byour own\b|\bmy own\b|\bnew (?:one|session)\b|\breadable\b"
+    r"|\b(?:hear|get) (?:the )?repl(?:y|ies)\b",
+    re.IGNORECASE,
+)
+_EXISTING_SESSION_RE = re.compile(
+    r"\bexisting\b|\balready (?:open|running)\b|\bsend[- ]?only\b"
+    r"|\b(?:use|keep|stick with|stay (?:on|with)) (?:the )?(?:one|existing|current|running)\b"
+    r"|\bthe one (?:that(?:'s| is) )?(?:already )?(?:open|running|there)\b",
+    re.IGNORECASE,
+)
+
+
+def _session_reply_choice(text: str) -> str | None:
+    """'own' | 'existing' | None for a reply to the use-existing-vs-spawn offer."""
+    t = (text or "").strip()
+    if _OWN_SESSION_RE.search(t):
+        return "own"
+    if _EXISTING_SESSION_RE.search(t):
+        return "existing"
+    if _is_yes(t):       # bare yes -> own (readable, the helpful default)
+        return "own"
+    if _is_no(t):        # bare no -> existing (send-only)
+        return "existing"
+    return None
+
+
+def _flush_direct_buffer(agent_key, buffer, session_label, brief) -> bool:
+    """Send the accumulated direct-mode message to the agent. True if sent."""
+    text = " ".join(s.strip() for s in buffer if s.strip()).strip()
+    if not text:
+        return False
+    print(f"  direct send -> {agent_key}: {text!r}")
+    bus.emit("route.matched", handler="direct", target=agent_key)
+    desktop_phrase = _send_to_direct_desktop_session(agent_key, text, session_label)
+    if desktop_phrase is not None:
+        print(f"  desktop-session send -> {desktop_phrase!r}")
+        say(desktop_phrase, blocking=True)
+        return True
+    own = _own_cwd(session_label)
+    phrase = _start_agent_and_ack(
+        agent_key, text,
+        cwd=Path(own) if own else _cwd_for_dispatch(""), brief=brief,
+    )
+    if phrase:
+        say(phrase, blocking=True)
+    return True
+
+
 def _project_hint() -> str:
     """A short human phrase for what the user has been working on, from durable
     memory — for a contextual wake greeting. "" when nothing's stored."""
@@ -728,6 +1004,35 @@ def _project_hint() -> str:
     return ""
 
 
+def _last_interaction_phrase() -> str:
+    """A short 'it's been <relative>' for the wake greeting when there was a real
+    gap since the last interaction — wall-clock, from persistent memory, so it
+    survives restarts (unlike the monotonic re-wake cooldown). '' for short gaps."""
+    if _MEMORY is None:
+        return ""
+    try:
+        last = _MEMORY.last_seen()
+        if not last:
+            return ""
+        gap = time.time() - last
+        if gap < 1800:  # < 30 min — not worth remarking on
+            return ""
+        days = gap / 86400
+        if days < 0.25:
+            return "Been a few hours."
+        if days < 1.4:
+            return "Been since earlier."
+        if days < 2.4:
+            return "Been since yesterday."
+        if days < 8:
+            return f"Been {int(round(days))} days."
+        if days < 40:
+            return "Been a while."
+        return "Been a good while."
+    except Exception:
+        return ""
+
+
 def _wake_greeting() -> str:
     """The line Halo speaks on wake. Memory-aware + varied; a rapid re-wake gets
     a short ack instead of a full 'welcome back' (cooldown)."""
@@ -743,12 +1048,13 @@ def _wake_greeting() -> str:
         ["Hey", "Welcome back", "Hey there", "Good to see you", "Back at it"]
     )
     greet = f"{opener}, {name}" if name else opener
+    gap = _last_interaction_phrase()
+    gap = (gap + " ") if gap else ""
     hint = _project_hint()
     if hint:
-        return f"{greet}. Last time we were on {hint}. What's next?"
-    return random.choice(
-        [f"{greet}. What can I do?", f"{greet}. What's the plan?",
-         f"{greet}. What do you need?"]
+        return f"{greet}. {gap}Last time we were on {hint}. What's next?"
+    return f"{greet}. {gap}" + random.choice(
+        ["What can I do?", "What's the plan?", "What do you need?"]
     )
 
 
@@ -771,6 +1077,21 @@ def _mic_has_echo_cancellation() -> bool:
         return False
 
 
+def _converse_backend(text: str, history: str, on_sentence) -> str:
+    """Route a conversational reply through the MCP tool loop when brain-tools are
+    on and the client has tools; otherwise the plain streaming chat. One swap so
+    chitchat, questions, and fast-chat all gain tools behind the flag."""
+    if _BRAIN_TOOLS:
+        try:
+            from halo.mcp_client import get_brain_client
+            client = get_brain_client()
+            if client is not None and client.available:
+                return chat_reply_with_tools(text, history=history, on_sentence=on_sentence)
+        except Exception:
+            pass
+    return chat_reply_stream(text, history=history, on_sentence=on_sentence)
+
+
 def _converse(text: str, brief: "_ConversationBrief | None" = None) -> str:
     """Stream a conversational reply and SPEAK it sentence-by-sentence as it
     generates, so the first words come out ~0.4 s in instead of waiting ~1.3 s
@@ -780,7 +1101,7 @@ def _converse(text: str, brief: "_ConversationBrief | None" = None) -> str:
     text = (text or "").strip()
     if not text:
         return ""
-    history = _brain_history(text)
+    history = _brain_history(text, with_time=True)
     spoken = {"full": ""}
 
     def _on_sentence(sentence: str) -> None:
@@ -793,7 +1114,7 @@ def _converse(text: str, brief: "_ConversationBrief | None" = None) -> str:
         spoken["full"] = (spoken["full"] + " " + sentence).strip()
 
     try:
-        full = (chat_reply_stream(text, history=history, on_sentence=_on_sentence) or "").strip()
+        full = (_converse_backend(text, history, _on_sentence) or "").strip()
     except Exception:
         full = ""
     full = full or spoken["full"]
@@ -804,6 +1125,78 @@ def _converse(text: str, brief: "_ConversationBrief | None" = None) -> str:
     if brief is not None:
         brief.add_halo(full)
     return ""  # already spoken via _on_sentence
+
+
+# Turn-floor: drop counting/thinking-aloud/rumble instead of routing it, and let
+# Halo reclaim its turn after a promised beat ("give me ten seconds"). The "AI
+# never gets a turn" fix. Set HALO_TURN_FLOOR=0 to disable (legacy behavior).
+_TURN_FLOOR = os.getenv("HALO_TURN_FLOOR", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+
+
+def _reclaim_floor(brief: "_ConversationBrief | None") -> None:
+    """Halo promised a beat and the time elapsed — take the turn back instead of
+    waiting on the user. If a dispatched job is what the beat was for, its own
+    completion/keepalive speaks; otherwise continue the conversational thread."""
+    reason = floor.consume()
+    bus.emit("floor.reclaimed", reason=reason)
+    if active_jobs():
+        return
+    print(f"  floor reclaim -> continuing (promised: {reason!r})")
+    _converse(
+        "You asked the user for a moment and they gave it to you. Continue "
+        "exactly what you were about to say — pick up the thread, don't restate "
+        "the request or thank them.",
+        brief,
+    )
+
+
+def _run_hotkey_dictation() -> None:
+    """Run dictation triggered by the global hotkey while Halo is idle. The wake
+    mic is already closed by the time we get here (the caller guarantees it), so
+    only one input stream is ever live. Mirrors the wake->turn dictation handler."""
+    from halo.dictation import run_dictation
+    bus.emit("hotkey.dictation.start")
+    floor.clear()  # don't carry a stale owed-turn into a fresh idle dictation
+    say(
+        "Dictation on. Click where you want the words and start talking. "
+        "Say stop when you're done.",
+        blocking=True,
+    )
+    summary = run_dictation()
+    if summary:
+        say(summary, blocking=True)
+    bus.emit("hotkey.dictation.stop")
+
+
+def _classify_with_address(text: str, decision: dict, direct_agent: str | None) -> str:
+    """Re-run classify_utterance WITH the content address signal. ONLY clear side
+    conversation (the gate's 'side_conversation' reason) is background-eligible —
+    a 'no_signal' utterance is the user talking to HALO (e.g. 'when did we start'),
+    NOT side-talk, so it must never be dropped as BACKGROUND. Falls back to the
+    turn-time class on any error."""
+    addressed = None
+    try:
+        allow, reason = followup_gate_passes(text, direct_agent)
+        if allow:
+            addressed = True
+        elif reason == "side_conversation":
+            addressed = False  # clear side-talk -> background-eligible
+        # else (no_signal / no agent named): leave None -> never BACKGROUND
+    except Exception:
+        addressed = None
+    sig = decision.get("onset_signals") or {}
+    try:
+        return _utterance.classify_utterance(
+            text, peak_rms=decision.get("peak_rms"),
+            vad_fired=sig.get("vad_fired"),
+            energy_only_onset=sig.get("energy_only_onset", False),
+            addressed=addressed,
+            background_rms=BACKGROUND_RMS,
+        )
+    except Exception:
+        return decision.get("utterance_class", _utterance.COMMAND)
 
 
 # Did the user actually NAME a coding agent? Drives the "Confirm before
@@ -1588,6 +1981,35 @@ def _strip_new_session_phrase(text: str) -> str:
     return remainder if len(remainder) >= 2 else ""
 
 
+_SKILLS_QUERY_RE = re.compile(
+    r"\b(?:what|which|list|show|tell me about|do you have any|got any)\b[^.?!]{0,24}\bskills?\b"
+    r"|\bskills?\b[^.?!]{0,16}\b(?:do you have|are available|can you use|are there)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_skills_query(text: str) -> bool:
+    return bool(_SKILLS_QUERY_RE.search(text or ""))
+
+
+def _skills_summary_phrase() -> str:
+    """Spoken answer to 'what skills do you have?'."""
+    skills = _SKILLS.all()
+    if not skills:
+        return "I don't see any Claude or Codex skills installed yet."
+    n_claude = len([s for s in skills if s.agent_key == "claude_code"])
+    n_codex = len([s for s in skills if s.agent_key == "codex_cli"])
+    parts = []
+    if n_claude:
+        parts.append(f"{n_claude} for Claude")
+    if n_codex:
+        parts.append(f"{n_codex} for Codex")
+    head = " and ".join(parts) if parts else str(len(skills))
+    highlights = [s.name for s in skills if s.source in ("user", "project")][:4]
+    tail = (" Like " + ", ".join(highlights) + ".") if highlights else ""
+    return f"I have {head} skills.{tail}"
+
+
 def _is_status_query(text: str) -> bool:
     """Status query only intercepts when there's actually something to
     report. 'What's happening?' with no jobs running/completed is just
@@ -1839,6 +2261,16 @@ def _start_agent_and_ack(
         # dispatch a blank prompt to an agent. Claude / Codex both
         # error on empty input.
         return ""
+    # Skill routing: if the task matches a known skill for THIS agent, tell the
+    # agent to use it. Conservative match against the raw task (before the brief
+    # is wrapped in). "make instagram captions" -> Claude's ai-captions skill.
+    if _SKILLS_ENABLED:
+        hit = _SKILLS.match(prompt, agent_key=agent_key)
+        if hit is not None:
+            sk, score = hit
+            bus.emit("skill.matched", name=sk.name, agent=agent_key, score=score)
+            print(f"  skill match -> {sk.name} (score {score:.0f})")
+            prompt = f"Use your '{sk.name}' skill for this.\n\n{prompt}"
     if brief is not None:
         prompt = brief.render_for_agent(prompt)
 
@@ -2285,6 +2717,16 @@ def run_conversation() -> None:
     engaged = False
     pending_action: dict | None = None
     pending_clarification: str | None = None
+    # Continuation merge: a trailed-off fragment ("the next thing is") is held
+    # here and prepended to your next utterance, so pausing mid-sentence doesn't
+    # break the command (or send half a thought to the agent). Dropped if you
+    # don't continue within _MERGE_WINDOW_SEC.
+    pending_fragment: str | None = None
+    pending_fragment_at = 0.0
+    # Compose-then-send: in direct mode, what you say to the agent accumulates
+    # here and only ships on a send word or a clear pause.
+    direct_buffer: list[str] = []
+    direct_buffer_at = 0.0
     # Persist conversation memory ACROSS sleep/wake within one Halo run, so
     # Halo remembers earlier turns instead of forgetting every time it sleeps.
     # Reset only on an explicit "new session". Also exposed module-level so
@@ -2304,6 +2746,13 @@ def run_conversation() -> None:
         _nav_visit(direct_agent, direct_session_label)
         # Speak any background-job results that landed since last turn.
         _drain_completed_jobs()
+        # Reclaim the floor: if Halo promised a beat ("give me ten seconds") and
+        # the time has elapsed, take its turn back rather than waiting on you.
+        if _TURN_FLOOR and floor.reclaim_due():
+            _reclaim_floor(brief)
+        # Left direct mode with a half-composed message -> drop it.
+        if direct_agent is None and direct_buffer:
+            direct_buffer = []
 
         # Don't open the mic while Halo is still speaking back — it'd
         # pick up echo, fire false "no speech detected" turns, and eat
@@ -2313,6 +2762,9 @@ def run_conversation() -> None:
         # user last spoke (which may have been before a 10s agent reply).
         barge_in_text: str | None = None
         if voice_is_speaking():
+            # The barge-in listener opens its own stream — release the
+            # between-turns capture first so we never run two mic streams.
+            _gap_stop()
             barge_in_text = listen_for_barge_in(timeout=20.0)
             if barge_in_text:
                 print(f"  barge-in accepted -> {barge_in_text!r}")
@@ -2344,12 +2796,19 @@ def run_conversation() -> None:
                     print("  direct mode idle -> exiting direct mode")
                     direct_agent = _set_direct(None)
                 print(f"\nconversation idle for {idle_limit:.0f}s -> sleeping")
+                floor.clear()
                 say("Going back to sleep.", blocking=True)
                 return
 
         # Poll faster (2 s) while agents are running so completions land
         # quickly; normal 5 s otherwise.
-        first_wait = 2.0 if active_jobs() else None
+        # Flush a composed direct-mode message sooner after you stop talking.
+        if _COMPOSE_SEND and direct_agent is not None and direct_buffer:
+            first_wait = _COMPOSE_FLUSH_SEC
+        elif active_jobs():
+            first_wait = 2.0
+        else:
+            first_wait = None
 
         # Always skip Stage 2 inside run_turn — every routing decision
         # is made HERE, in priority order, so we only spend the LLM
@@ -2365,22 +2824,74 @@ def run_conversation() -> None:
                 "clarification": "",
             }
         else:
+            # Between-turns capture: hand anything you said while Halo was
+            # busy (routing / replying) to this turn, and release the mic so
+            # run_turn can open its own stream.
+            gap = _gap()
+            gap_seed = None
+            if gap is not None:
+                gap.stop()
+                gap_seed = gap.take()
+            # Answer-aware STT gate: when Halo just asked you something, a
+            # bare "Yes." / "No." / "Okay." is a real answer — the STT
+            # hallucination blocklist must not swallow it.
+            from halo.stt import set_expect_answer
+            set_expect_answer(
+                pending_action is not None
+                or pending_clarification is not None
+                or _agent_question_pending is not None
+            )
             decision = run_turn(
                 skip_routing=True,
                 max_wait_first_speech_sec=first_wait,
                 seed_pre_wake=first_turn_after_wake,
+                seed_audio=gap_seed,
             )
             first_turn_after_wake = False
+        # Turn closed — reopen the between-turns ear while we process/reply.
+        gap = _gap()
+        if gap is not None:
+            gap.start()
         if decision is None:
+            # Compose-then-send: a clear pause = you're done dictating to the
+            # agent -> flush what you've composed.
+            if _COMPOSE_SEND and direct_agent is not None and direct_buffer:
+                print(f"  pause -> sending composed message ({len(direct_buffer)} part(s))")
+                _flush_direct_buffer(direct_agent, direct_buffer, direct_session_label, brief)
+                direct_buffer = []
             continue
 
         cleaned = (decision.get("cleaned_text") or "").strip()
         cleaned = _strip_leading_greeting(cleaned)
+        # Continuation merge: glue a held trailed-off fragment onto this utterance
+        # so "the next thing is" + "build me a dashboard" becomes one command.
+        if pending_fragment:
+            if cleaned and (time.monotonic() - pending_fragment_at) <= _MERGE_WINDOW_SEC:
+                cleaned = f"{pending_fragment} {cleaned}".strip()
+                print(f"  merged held fragment -> {cleaned!r}")
+            pending_fragment = None
         # Raw transcript keeps trailing punctuation ("That's it?") that
         # cleaned_text strips — the end-phrase guard uses it to tell a casual
         # question apart from a real "we're done" command.
         raw_transcript = (decision.get("transcript") or cleaned)
         print(f"  heard: {cleaned!r}")
+
+        # Semantic repair — only when Whisper itself flagged the decode as
+        # low-confidence (decision["stt_quality"], duration-weighted
+        # avg-logprob). The brain fixes clearly mis-recognized words using
+        # the conversation context; on timeout/error the raw text stands.
+        if _STT_REPAIR and cleaned:
+            from halo.router import needs_repair
+            _q = decision.get("stt_quality")
+            if needs_repair(cleaned, _q):
+                _fixed = _repair_transcript_timeboxed(cleaned, brief.render_history())
+                if _fixed and _fixed.strip() and _fixed != cleaned:
+                    print(f"  repaired (logprob {_q:.2f}) -> {_fixed!r}")
+                    bus.emit(
+                        "stt.repaired", before=cleaned, after=_fixed,
+                        quality=round(_q, 2) if _q is not None else None,
+                    )
+                    cleaned = _fixed.strip()
 
         # Empty after wake/greeting strip = Whisper transcribed silence,
         # room noise, or a phantom wake. Do NOT flip `engaged` (that pins
@@ -2410,6 +2921,51 @@ def run_conversation() -> None:
                 answer_armed = True
                 print(f"  answer routing armed -> {qa}")
 
+        # Turn-floor: drop counting / thinking-aloud / rumble so it is NOT routed
+        # as a command — unless we're expecting it as an answer (agent question or
+        # a pending confirmation/clarification) or it's a deliberate barge-in.
+        utterance_class = decision.get("utterance_class", _utterance.COMMAND)
+        if _BACKGROUND_FILTER:
+            utterance_class = _classify_with_address(cleaned, decision, direct_agent)
+        expecting_answer = (
+            answer_armed
+            or pending_action is not None
+            or pending_clarification is not None
+        )
+        if _TURN_FLOOR and not barge_in_text and not expecting_answer:
+            if utterance_class in (_utterance.FILLER, _utterance.NOISE):
+                owed = floor.owes_turn()
+                print(
+                    f"  utterance class={utterance_class} -> not a command, dropping"
+                    + (" (Halo owes a turn)" if owed else "")
+                )
+                bus.emit("utterance.dropped", text=cleaned, cls=utterance_class, owed=owed)
+                brief.drop_last_user()  # don't pollute agent context with filler
+                continue
+            if utterance_class == _utterance.BACKGROUND:
+                owed = floor.owes_turn()
+                print(
+                    "  utterance class=background -> side speech, ignoring"
+                    + (" (Halo owes a turn)" if owed else "")
+                )
+                bus.emit("utterance.background", text=cleaned, owed=owed)
+                brief.drop_last_user()  # side-talk must not enter agent/brain context
+                # NOTE: do NOT consume/clear the floor — a TV must not satisfy an owed turn.
+                continue
+
+        # Continuation hold: you trailed off mid-sentence ("the next thing is").
+        # Hold it for your continuation instead of acting on half a thought — it
+        # merges with your next utterance (above), or is dropped if you don't go
+        # on. Runs before the agent handlers, so a half-sentence isn't sent to the
+        # agent either. Only conversational fragments; real commands still go.
+        if _MERGE and decision.get("incomplete") and _looks_conversational(cleaned):
+            print(f"  holding unfinished thought: {cleaned!r}")
+            bus.emit("turn.fragment_held", text=cleaned)
+            pending_fragment = cleaned
+            pending_fragment_at = time.monotonic()
+            brief.drop_last_user()
+            continue
+
         # Dictation trigger wins over EVERYTHING — including a pending
         # confirmation/clarification — so a mis-heard "dictate" can never
         # spiral into the LLM (it would otherwise get merged into the
@@ -2421,12 +2977,18 @@ def run_conversation() -> None:
             pending_action = None
             pending_clarification = None
             from halo.dictation import run_dictation
+            # Dictation runs its own recorder — release the between-turns
+            # capture, and drain it afterwards so the dictated speech isn't
+            # ALSO seeded into the next command turn.
+            _gap_stop()
             say(
                 "Dictation on. Click where you want the words and start "
                 "talking. Say stop when you're done.",
                 blocking=True,
             )
             summary = run_dictation()
+            if _gap_capture is not None:
+                _gap_capture.take()  # discard — it was dictation, not a command
             if summary:
                 say(summary, blocking=True)
             last_activity = time.monotonic()
@@ -2470,6 +3032,24 @@ def run_conversation() -> None:
         # Pending yes/no confirmation. This is what makes a spoken
         # "ready to start?" a real dialogue turn instead of dispatching
         # immediately on a small-router guess.
+        # Session-reply offer ("use the one running" vs "start my own"): resolve
+        # it BEFORE the generic yes/no so the marker isn't swallowed.
+        if pending_action is not None and pending_action.get("_session_reply_offer"):
+            choice = _session_reply_choice(cleaned)
+            if choice is not None:
+                offer = pending_action
+                pending_action = None
+                _agent, _label, _phrase = _resolve_session_reply_offer(offer, choice == "own")
+                direct_agent = _set_direct(_agent)
+                direct_session_label = _label
+                bus.emit("route.matched", handler="session_reply_choice",
+                         choice=choice, target=_agent)
+                say(_phrase, blocking=True)
+                last_activity = time.monotonic()
+                continue
+            print("  session-reply offer unclear -> dropping, routing fresh")
+            pending_action = None
+
         if pending_action is not None:
             if _is_yes(cleaned):
                 lm_decision = pending_action
@@ -2543,6 +3123,7 @@ def run_conversation() -> None:
             pending_action = None
             pending_clarification = None
             brief.clear()
+            floor.clear()  # drop any promised-but-unmet turn on a fresh start
             _session_mru.clear()  # nothing to "go back" to after a fresh start
             try:
                 REGISTRY.set_active(None)  # else next dispatch reuses old cwd
@@ -2700,6 +3281,15 @@ def run_conversation() -> None:
             last_activity = time.monotonic()
             continue
 
+        # 6. Skills query — "what skills do you have?"
+        if _SKILLS_ENABLED and _is_skills_query(cleaned):
+            phrase = _skills_summary_phrase()
+            print(f"  skills query -> {phrase}")
+            bus.emit("route.matched", handler="skills_query")
+            say(phrase, blocking=True)
+            last_activity = time.monotonic()
+            continue
+
         # 6. Status / replay
         if _is_status_query(cleaned):
             summary = status_summary()
@@ -2757,6 +3347,19 @@ def run_conversation() -> None:
         if switch_phrase:
             print(f"  local session switch -> {switch_phrase!r}")
             bus.emit("route.matched", handler="session_switch")
+            # Discovered-only target -> offer use-existing (send-only) vs own (readable).
+            if (switch_agent and _ASK_SESSION_REPLY and pending_action is None
+                    and _is_discovered_only(REGISTRY.active_label())):
+                _sess = REGISTRY.active()
+                pending_action = _session_reply_offer(_sess)
+                say(
+                    f"{_session_spoken(_sess)} is already running. Use the one "
+                    "already running — I can send but won't hear its replies — or "
+                    "start my own so you'll hear the replies?",
+                    blocking=True,
+                )
+                last_activity = time.monotonic()
+                continue
             say(switch_phrase, blocking=True)
             if switch_agent:
                 direct_agent = _set_direct(switch_agent)
@@ -2866,6 +3469,29 @@ def run_conversation() -> None:
                     continue
                 print(f"  [direct-dialogue gate: {reason}]")
 
+            # Compose-then-send: accumulate what you say; only ship it on a send
+            # word at the END of the phrase ("...send it" / "...go") or a clear
+            # pause (handled at the top of the loop). Speak in full paragraphs.
+            if _COMPOSE_SEND:
+                send_now, residual = _wants_send_now(cleaned)
+                if residual:
+                    direct_buffer.append(residual)
+                    direct_buffer_at = time.monotonic()
+                if send_now:
+                    if direct_buffer:
+                        _flush_direct_buffer(
+                            direct_agent, direct_buffer, direct_session_label, brief
+                        )
+                        direct_buffer = []
+                    else:
+                        say("Nothing to send yet.", blocking=True)
+                else:
+                    print(f"  composing ({len(direct_buffer)} part(s)): {cleaned!r}")
+                    bus.emit("direct.buffered", text=cleaned, count=len(direct_buffer))
+                last_activity = time.monotonic()
+                continue
+
+            # Legacy (HALO_COMPOSE_SEND=0): ship each utterance immediately.
             print(f"  direct-dialogue -> {direct_agent}")
             bus.emit("route.matched", handler="direct", target=direct_agent)
             desktop_phrase = _send_to_direct_desktop_session(
@@ -2876,9 +3502,24 @@ def run_conversation() -> None:
                 say(desktop_phrase, blocking=True)
                 last_activity = time.monotonic()
                 continue
-            phrase = _start_agent_and_ack(direct_agent, cleaned, cwd=_cwd_for_dispatch(""), brief=brief)
+            _own = _own_cwd(direct_session_label)
+            phrase = _start_agent_and_ack(
+                direct_agent, cleaned,
+                cwd=Path(_own) if _own else _cwd_for_dispatch(""), brief=brief,
+            )
             if phrase:
                 say(phrase, blocking=True)
+            last_activity = time.monotonic()
+            continue
+
+        # 8.5. Fast chat — a purely conversational utterance answered directly by
+        # the brain (ONE streaming call) instead of Stage-2 routing THEN a chat
+        # call. Only COMPLETE thoughts that carry no task verb / agent name, so
+        # commands and trailing fragments still route the normal way.
+        if _FAST_CHAT and cleaned and _looks_conversational(cleaned):
+            print(f"  fast chat (skipped Stage 2): {cleaned!r}")
+            bus.emit("route.matched", handler="fast_chat")
+            _converse(cleaned, brief)
             last_activity = time.monotonic()
             continue
 
@@ -2915,6 +3556,18 @@ def run_conversation() -> None:
                 if lm_decision.get("session_action") == "switch":
                     active_session = REGISTRY.active()
                     if active_session is not None:
+                        if (_ASK_SESSION_REPLY and pending_action is None
+                                and _is_discovered_only(active_session.label)):
+                            pending_action = _session_reply_offer(active_session)
+                            say(
+                                f"{_session_spoken(active_session)} is already "
+                                "running. Use the one already running — I can send "
+                                "but won't hear its replies — or start my own so "
+                                "you'll hear the replies?",
+                                blocking=True,
+                            )
+                            last_activity = time.monotonic()
+                            continue
                         direct_agent = _set_direct(active_session.agent_key)
                         direct_session_label = REGISTRY.active_label()
                         print(
@@ -3105,6 +3758,18 @@ def main() -> None:
             say(f"Halo online. Connected: {joined}.{sess_tail}", blocking=False)
     print(f"agents: {', '.join(available_agents()) or '(none connected)'}")
 
+    # Discover Claude/Codex skills so a spoken task can route to one.
+    if _SKILLS_ENABLED:
+        try:
+            _SKILLS.refresh()
+        except Exception as exc:
+            print(f"skills: discovery failed ({exc})")
+        else:
+            n_claude = len(_SKILLS.for_agent("claude_code"))
+            n_codex = len(_SKILLS.for_agent("codex_cli"))
+            print(f"skills: {_SKILLS.count()} discovered "
+                  f"({n_claude} Claude, {n_codex} Codex)")
+
     # Talk-over (barge-in capture) is ON by default — interrupt Halo mid-reply
     # and it stops + routes what you said. The layered guards in
     # listen_for_barge_in (loudness + word-overlap + min-words) keep Halo from
@@ -3127,9 +3792,33 @@ def main() -> None:
     else:
         print("  talk-over (barge-in capture) OFF (HALO_BARGE_IN_CAPTURE=0)")
 
+    # Phase 6 — global dictation hotkey: idle (no wake word) entry to dictation.
+    _hotkey_listener = None
+    _hk_spec = (user_cfg.dictation.hotkey or "").strip()
+    if _hk_spec:
+        def _on_dictation_hotkey() -> None:
+            _DICTATION_HOTKEY.set()
+            bus.emit("hotkey.pressed", action="dictation")
+        _hk = hotkey.HotkeyListener(_hk_spec, _on_dictation_hotkey)
+        if _hk.start():
+            _hotkey_listener = _hk
+            print(f"  dictation hotkey: press {_hk.bound_spec} to dictate "
+                  f"(Halo idle, no wake word)")
+
     try:
         while True:
-            wake_score = listen_for_wake()
+            # Global hotkey fired while idle -> run dictation with the mic free.
+            if _DICTATION_HOTKEY.is_set():
+                _DICTATION_HOTKEY.clear()
+                _run_hotkey_dictation()
+                continue
+            wake_score = listen_for_wake(interrupt=_DICTATION_HOTKEY)
+            if _DICTATION_HOTKEY.is_set():  # hotkey fired DURING listen_for_wake
+                _DICTATION_HOTKEY.clear()
+                _run_hotkey_dictation()
+                continue
+            if wake_score < 0:              # interrupted, not a real wake
+                continue
             # Second-stage gate: confirm the wake word with STT before opening
             # a conversation, so a DNN false-fire on ordinary speech doesn't
             # wake Halo (issue #1). The fire score is a prior — a strong fire is
@@ -3140,13 +3829,27 @@ def main() -> None:
             print("\nwake word detected -- entering conversation\n")
             bus.emit("convo.entered")
             say(_wake_greeting(), blocking=True)
-            run_conversation()
+            try:
+                run_conversation()
+            finally:
+                # Never leak the between-turns capture stream into
+                # wake-listening (the wake listener owns the mic there).
+                _gap_stop()
             bus.emit("convo.exited")
             print("conversation ended -- back to wake-listening\n")
     except KeyboardInterrupt:
         print("\nstopped")
         voice_stop()
     finally:
+        if _hotkey_listener is not None:
+            _hotkey_listener.stop()
+        try:
+            from halo.mcp_client import get_brain_client
+            _bc = get_brain_client()
+            if _bc is not None:
+                _bc.stop()
+        except Exception:
+            pass
         if _DISCOVERY is not None:
             _DISCOVERY.stop()
 

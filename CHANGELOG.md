@@ -10,6 +10,111 @@ versioning is SemVer-ish (still pre-1.0, expect breaking changes).
 
 ---
 
+## [1.7.0] — 2026-07-06
+
+**The seamless-conversation release.** Halo finally behaves like a partner in a
+spoken conversation: it gets a turn when you promise it one, ignores your
+counting and side-talk, never loses what you said while it was busy, doesn't
+cut you off mid-thought, and understands accented speech far better. Plus:
+dictation on a hotkey, skills routing, MCP tools for the brain itself, and
+real time-awareness.
+
+### Added — turn-taking ("give me 10 seconds" finally works)
+- **Conversational floor** (`halo/floor.py`) — when Halo says "give me ten
+  seconds" it now *owes you a turn*: a reclaim timer arms for the promised
+  duration and Halo comes back on its own instead of waiting for you forever.
+  Past references ("we started a few minutes ago") never arm it. `HALO_TURN_FLOOR=0` off.
+- **Mic-grounded utterance classifier** (`halo/utterance.py`) — every committed
+  utterance is classified COMMAND / FILLER / NOISE / BACKGROUND using the words
+  AND the mic signal (peak RMS, whether silero-VAD actually fired). Counting
+  ("one, two, three…"), thinking-aloud, rumble, and side-talk to another person
+  are dropped instead of routed as commands. `HALO_BG_FILTER=0` off.
+- **Continuation merge** — trail off mid-sentence ("the next thing is…") and
+  Halo holds the fragment and glues it to your next utterance (20 s window,
+  `HALO_MERGE_WINDOW_SEC`). `HALO_MERGE=0` off.
+- **Compose-then-send** — in direct dialogue, what you say accumulates and only
+  ships to the agent when the phrase ENDS with a send word ("send it", "go",
+  "that's it") or on a clear pause — no more premature half-messages.
+  `HALO_COMPOSE_SEND=0` off.
+
+### Added — hearing you properly (the "cuts me off / misses words" fixes)
+- **Commit-race guard** — if you resume talking while Halo is transcribing, it
+  aborts the pending commit and keeps listening instead of splitting your
+  thought in two. (This was the #1 cut-off cause.)
+- **Gap capture** (`record.GapCapture`) — the mic no longer goes dead between
+  turns. Speech during Halo's routing/thinking/reply time is buffered
+  (TTS-echo suppressed) and seeded into the next turn: "seeded 2.3s of speech
+  heard while I was busy". `HALO_GAP_CAPTURE=0` off.
+- **Semantic repair** — when Whisper reports low confidence, the transcript +
+  recent conversation goes through the brain with a strict "fix mis-heard
+  words, never change meaning" prompt (3 s budget, fail-open to raw).
+  Confident transcripts skip it — zero added latency. `HALO_STT_REPAIR=0` off,
+  gate via `HALO_STT_REPAIR_LOGPROB` (default -0.5).
+- **One VAD threshold everywhere** — Whisper's internal VAD filter ran at its
+  stock 0.5 and silently deleted quiet speech the recorder (0.35) had
+  captured; both now share `config.VAD_THRESHOLD`. Words stop vanishing
+  mid-sentence.
+- **Answer-aware hallucination gate** — a bare "Yes." / "No." / "Okay." right
+  after Halo asks you a question is a real answer now, not a discarded
+  artifact.
+- **Speech-window gain normalization** — quiet mics are boosted by the loudest
+  100 ms *speech* window instead of a single peak sample, so one click can't
+  leave your words starved.
+
+### Changed
+- **STT model: `large-v3-turbo`** (was English-only `distil-large-v3`) —
+  multilingual-trained, measurably better on accented English at near-distil
+  speed. One-time ~1.6 GB download; auto-falls back to distil if it can't
+  load. Override with `HALO_STT_MODEL`.
+- **Session names are real** — "Claude Code in website" instead of mythology
+  codenames, so you always know which model/project you're talking to.
+- **Kokoro loads lazily** when ElevenLabs is primary (faster startup); it
+  remains the automatic fallback if cloud TTS fails.
+- ~430 lines of dead router prompt code removed.
+
+### Added — features
+- **Dictation hotkey** (`halo/hotkey.py`) — **Ctrl+Alt+D** starts
+  dictate-anywhere from anywhere, even while Halo is idle in wake-listening.
+  Configurable via `[dictation] hotkey` / `HALO_DICTATION_HOTKEY`.
+- **Skills registry** (`halo/skills.py`) — discovers Claude/Codex skills at
+  startup (31 found on this machine), announces the count, and routes matching
+  phrases ("make a poster for AIP") to the right skill. "What skills do you
+  have?" lists them. `HALO_SKILLS=0` off.
+- **MCP tools for the brain** (`halo/mcp_client.py`) — opt-in stdio MCP client
+  + tool-calling loop so the brain itself can answer tool-requiring questions
+  without spawning a coding agent. `[mcp] brain_tools = true` to enable.
+- **Time awareness** — the brain gets real timestamps and durations ("when did
+  we start?", "how long have we been working on this?") instead of
+  hallucinating times. Memory rows carry first/last-seen context.
+- **Ask-before-replying to discovered sessions** — when a reply would go to a
+  terminal Halo didn't spawn (send-only), it offers a choice instead of firing
+  blind. `HALO_ASK_SESSION_REPLY=0` off.
+- **User-adjustable prompts** (`halo/prompts.py`) — every baked prompt
+  (router, summarizer, STT correct/repair) can be overridden from
+  `~/.halo/prompts/*.txt`. `halo prompts --init` scaffolds them.
+- **Fast chat path** — conversational turns skip Stage-2 routing and stream
+  the reply directly (~0.4 s to first word). `HALO_FAST_CHAT=0` off.
+
+### Fixed
+- **Startup hang on wedged Windows WMI** — `import torch` calls
+  `platform._wmi_query`, which blocks forever if the Winmgmt service is stuck.
+  Guarded in `halo/__init__.py` before any heavy import ("won't start after
+  the banner" is gone).
+- **Crash on first dropped utterance** — `bus.emit(..., kind=...)` collided
+  with the event-name parameter and killed the app.
+- **False floor-reclaim from Halo's own time replies** ("just a few minutes
+  ago" parsed as a promise) → hallucinated continuations.
+- **Real questions dropped as background** — "when did we start?" was
+  classified side-talk because no-signal was conflated with side-conversation.
+- **Quiet speech dropped as noise** — silero-confirmed speech is never
+  discarded for being quiet (far-mic setups).
+
+29 unit-test suites pass (`scripts/test_*.py`), including new coverage for the
+floor, classifier, background filter, gap capture, commit race, repair gate,
+hotkey parsing, MCP client, skills matching, and time context.
+
+---
+
 ## [1.6.0] — 2026-06-18
 
 Bulletproof talk-over + a hot-mic profile.

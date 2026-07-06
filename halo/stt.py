@@ -1,10 +1,15 @@
-"""Batch speech-to-text via faster-whisper + distil-large-v3.
+"""Batch speech-to-text via faster-whisper + large-v3-turbo.
 
 Moonshine streaming was fast but its transcription accuracy on the
 user's voice/mic was unworkable ("Chrome" -> "Cut" / "card" / "crack").
-faster-whisper with distil-large-v3 cuts WER in half (~6-8% vs ~12-15%)
-at the cost of being batch-only — but Stage 1 is rules-only now, so we
-don't actually need partials during speech. The trade is worth it.
+faster-whisper batch decoding cuts WER in half at the cost of being
+batch-only — but Stage 1 is rules-only now, so we don't actually need
+partials during speech. The trade is worth it.
+
+Default model is large-v3-turbo: near-distil speed but multilingual-trained,
+which is measurably better on accented English than the English-only
+distil-large-v3 we used before ("translation is poor" complaint). Override
+with HALO_STT_MODEL; distil-large-v3 remains the automatic fallback.
 
 Flow per turn:
   - BatchTranscriber buffers every audio chunk via .feed()
@@ -23,7 +28,7 @@ from typing import Optional
 import numpy as np
 
 from halo import bus
-from halo.config import SAMPLE_RATE
+from halo.config import SAMPLE_RATE, VAD_THRESHOLD
 
 
 def _add_nvidia_dll_dirs() -> None:
@@ -54,10 +59,26 @@ _add_nvidia_dll_dirs()
 # Late import so the PATH/DLL fix above takes effect first.
 from faster_whisper import WhisperModel  # noqa: E402
 
-# Distil-Whisper large-v3: English-only, ~6x faster than full large-v3,
-# similar WER on clean speech. int8_float16 on RTX 3060 uses ~800 MB
-# VRAM (fits alongside Ollama 1.5b + Windows).
-_MODEL_NAME = "distil-large-v3"
+# large-v3-turbo: 4-layer decoder like distil (~6x faster than full
+# large-v3) but multilingual-trained — noticeably better on accented
+# English. int8_float16 on RTX 3060 uses ~1.5 GB VRAM (fits alongside
+# Ollama 1.5b + Windows). distil-large-v3 stays as the fallback if the
+# requested model can't load. Override with HALO_STT_MODEL.
+_MODEL_NAME = os.getenv("HALO_STT_MODEL", "").strip() or "large-v3-turbo"
+_FALLBACK_MODEL = "distil-large-v3"
+
+# Parameters for Whisper's INTERNAL silero VAD pass (vad_filter). Must track
+# the recorder's threshold (config.VAD_THRESHOLD): we lowered the recorder to
+# 0.25-0.35 because silero's stock 0.5 missed this mic's quiet speech entirely —
+# but vad_filter's default is that same 0.5, so it silently DELETED quiet
+# stretches of already-captured speech before decoding ("words go missing
+# mid-sentence"). One threshold, applied in both places.
+_VAD_FILTER_PARAMS = dict(
+    threshold=VAD_THRESHOLD,
+    min_speech_duration_ms=100,   # don't drop a clipped short word (default 250)
+    min_silence_duration_ms=500,  # split on real pauses, not the 2s default
+    speech_pad_ms=400,
+)
 
 # Vocabulary bias for command turns (accent accommodation). Nouns only —
 # deliberately NO verbs like "dictate"/"stop" so we don't nudge Whisper into
@@ -116,11 +137,25 @@ def _is_hallucination(text: str) -> bool:
     return cleaned in _HALLUCINATION_PHRASES
 
 
-def _passes_confidence(segments: list, text: str) -> bool:
-    """False when the model's own acoustic stats say this was probably
-    non-speech. Duration-weighted so one short noisy segment can't swing
-    the verdict. Returns True when there's no usable timing info (don't
-    second-guess the model without evidence)."""
+# Context flag set by the orchestrator: when Halo just asked the user a
+# question (pending confirmation / clarification / an agent question), a bare
+# "Yes." / "No." / "Okay." is a REAL answer, not a silence artifact — the
+# blocklist above must not swallow it. The acoustic-confidence gate still runs.
+_expect_answer = False
+
+
+def set_expect_answer(on: bool) -> None:
+    """Orchestrator hint: an answer to a direct question is expected on the
+    next turn, so short decision words bypass the hallucination blocklist."""
+    global _expect_answer
+    _expect_answer = bool(on)
+
+
+def _acoustic_stats(segments: list) -> tuple[float, float]:
+    """(avg_logprob, no_speech_prob) duration-weighted across segments, so one
+    short noisy segment can't swing the verdict. Falls back to a plain mean
+    when there's no usable per-segment timing (some decode configs zero
+    start/end)."""
     total = sum(max(0.0, s.end - s.start) for s in segments)
     if total > 0.0:
         logprob = sum(
@@ -130,11 +165,17 @@ def _passes_confidence(segments: list, text: str) -> bool:
             getattr(s, "no_speech_prob", 0.0) * max(0.0, s.end - s.start) for s in segments
         ) / total
     else:
-        # No usable per-segment timing (some decode configs zero start/end).
-        # Fall back to a plain mean so the gate still works.
         n = len(segments)
         logprob = sum(getattr(s, "avg_logprob", 0.0) for s in segments) / n
         nospeech = sum(getattr(s, "no_speech_prob", 0.0) for s in segments) / n
+    return logprob, nospeech
+
+
+def _passes_confidence(segments: list, text: str) -> bool:
+    """False when the model's own acoustic stats say this was probably
+    non-speech. Returns True when there's no usable evidence (don't
+    second-guess the model without it)."""
+    logprob, nospeech = _acoustic_stats(segments)
     if logprob < _MIN_AVG_LOGPROB and nospeech > _MAX_NO_SPEECH_PROB:
         print(f"  [stt] rejected low-confidence (logprob {logprob:.2f}, "
               f"no_speech {nospeech:.2f}): {text!r}")
@@ -144,6 +185,21 @@ def _passes_confidence(segments: list, text: str) -> bool:
         )
         return False
     return True
+
+def _windowed_peak_rms(f: np.ndarray, window_sec: float = 0.1) -> float:
+    """Loudest `window_sec` RMS window in float32 audio (0..1). Windowed (not
+    whole-buffer) so a short real word still scores high while steady
+    background hiss averages out low."""
+    if f.size == 0:
+        return 0.0
+    win = int(SAMPLE_RATE * window_sec) or 1
+    peak = 0.0
+    for i in range(0, f.size, win):
+        seg = f[i : i + win]
+        if seg.size:
+            peak = max(peak, float(np.sqrt(np.mean(seg ** 2))))
+    return peak
+
 
 _model: Optional[WhisperModel] = None
 _load_lock = threading.Lock()
@@ -158,13 +214,26 @@ def preload_model() -> None:
         if _model is not None:
             return
         print(f"loading faster-whisper {_MODEL_NAME} (first run downloads ~1.5 GB)...")
-        try:
-            _model = WhisperModel(_MODEL_NAME, device="cuda", compute_type=_CUDA_COMPUTE)
-            _backend = f"cuda {_CUDA_COMPUTE}"
-        except Exception as exc:
-            print(f"  cuda failed ({exc}); falling back to cpu")
-            _model = WhisperModel(_MODEL_NAME, device="cpu", compute_type=_CPU_COMPUTE)
-            _backend = f"cpu {_CPU_COMPUTE}"
+        # Try the requested model on GPU, then the fallback model on GPU,
+        # then both on CPU — a bad HALO_STT_MODEL or a missing download must
+        # degrade accuracy, never kill startup.
+        candidates = [_MODEL_NAME]
+        if _FALLBACK_MODEL not in candidates:
+            candidates.append(_FALLBACK_MODEL)
+        last_exc: Exception | None = None
+        for device, compute in (("cuda", _CUDA_COMPUTE), ("cpu", _CPU_COMPUTE)):
+            for name in candidates:
+                try:
+                    _model = WhisperModel(name, device=device, compute_type=compute)
+                    _backend = f"{device} {compute} ({name})"
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    print(f"  {name} on {device} failed ({exc}); trying next")
+            if _model is not None:
+                break
+        if _model is None:
+            raise RuntimeError(f"no whisper model could load: {last_exc}")
         print(f"  faster-whisper loaded: backend={_backend}")
 
         # Warm CUDA kernels with 0.5 s of silence. The first inference
@@ -195,6 +264,10 @@ class BatchTranscriber:
         preload_model()
         self._chunks: list[np.ndarray] = []
         self._lock = threading.Lock()
+        # Decode confidence of the LAST transcribe() call (duration-weighted
+        # avg_logprob), None until a decode produced text. Read by turn.py to
+        # gate the semantic-repair pass.
+        self.last_quality: float | None = None
 
     def feed(self, audio_int16: np.ndarray) -> None:
         """Append one chunk of int16 PCM audio. Safe to call from the
@@ -239,14 +312,21 @@ class BatchTranscriber:
             return ""
         audio_f32 = audio_i16.astype(np.float32) / 32768.0
         # Gain-normalize quiet mics before Whisper. Devices like NVIDIA
-        # Broadcast output a low level (~0.05 peak), which starves the decoder
-        # and produces garbled transcripts ("stop"->"top", "sleep"->"slip").
-        # Scale up so the peak sits near a level Whisper transcribes reliably;
-        # capped at 12x and only for genuinely-quiet-but-present speech so
-        # near-silence isn't blown up into hallucinated words.
-        peak = float(np.max(np.abs(audio_f32))) if audio_f32.size else 0.0
-        if 0.004 < peak < 0.32:
-            audio_f32 = np.clip(audio_f32 * min(0.38 / peak, 12.0), -1.0, 1.0)
+        # Broadcast output a low level, which starves the decoder and produces
+        # garbled transcripts ("stop"->"top", "sleep"->"slip"). Keyed to the
+        # loudest 100 ms SPEECH window, not the absolute peak — a single click
+        # or pop used to defeat the boost and leave the actual words starved.
+        # Capped at 12x and only for genuinely-quiet-but-present speech so
+        # near-silence isn't blown up into hallucinated words; the absolute-peak
+        # cap keeps the boosted audio out of hard clipping.
+        rms_peak = _windowed_peak_rms(audio_f32)
+        if 0.004 < rms_peak < 0.15:
+            abs_peak = float(np.max(np.abs(audio_f32)))
+            gain = min(0.15 / rms_peak, 12.0)
+            if abs_peak > 0.0:
+                gain = min(gain, 0.95 / abs_peak)
+            if gain > 1.0:
+                audio_f32 = audio_f32 * gain
         assert _model is not None
         segments, _info = _model.transcribe(
             audio_f32,
@@ -263,8 +343,10 @@ class BatchTranscriber:
             # "Thanks for watching" hallucinations on quiet or noisy
             # turns — those artifacts only appear when Whisper gets fed
             # near-silence to decode. With vad_filter on, Whisper sees
-            # only the actual speech.
+            # only the actual speech. Explicit parameters — the defaults
+            # (threshold 0.5) deleted quiet speech the recorder captured.
             vad_filter=True,
+            vad_parameters=dict(_VAD_FILTER_PARAMS),
             without_timestamps=True,
             condition_on_previous_text=False,  # avoid hallucinated continuations
         )
@@ -272,6 +354,10 @@ class BatchTranscriber:
         text = " ".join(seg.text.strip() for seg in seg_list).strip()
         if not text:
             return ""
+        # Expose the decode confidence (duration-weighted avg logprob) so the
+        # orchestrator can send LOW-confidence transcripts through the LLM
+        # semantic-repair pass. ~-0.1..-0.3 = confident; < -0.5 = shaky.
+        self.last_quality = _acoustic_stats(seg_list)[0] if seg_list else None
         if raw:
             # Dictation: type exactly what was said, gates bypassed.
             return text
@@ -287,7 +373,10 @@ class BatchTranscriber:
         # the terminal during long silent waits ("discarded hallucination
         # 'Hello.'" x 30). The bus event below still fires for the
         # dashboard, just no stdout noise.
-        if _is_hallucination(text):
+        # BYPASSED while the orchestrator expects an answer to a direct
+        # question — a real "Yes." / "No." / "Okay." must reach it (the
+        # blocklist was silently swallowing confirmation answers).
+        if _is_hallucination(text) and not _expect_answer:
             return ""
         return text
 
@@ -303,14 +392,7 @@ class BatchTranscriber:
         audio_i16 = self._snapshot()
         if audio_i16.size == 0:
             return 0.0
-        f = audio_i16.astype(np.float32) / 32768.0
-        win = int(SAMPLE_RATE * 0.1) or 1
-        peak = 0.0
-        for i in range(0, f.size, win):
-            seg = f[i : i + win]
-            if seg.size:
-                peak = max(peak, float(np.sqrt(np.mean(seg ** 2))))
-        return peak
+        return _windowed_peak_rms(audio_i16.astype(np.float32) / 32768.0)
 
     def stop(self) -> str:
         """Symmetric API with the old streaming transcriber. Returns final text."""

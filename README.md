@@ -4,12 +4,135 @@ Voice front-end for agentic coding tools. Say a wake word, talk to
 Claude Code or Codex CLI in plain English, and hear the result back.
 Halo is the audio layer; the agents do the work.
 
-Status: **v1.3 — conversational, machine-adaptive, dictate-anywhere.** Halo now holds real spoken conversations (streaming replies + cross-session memory), does simple things itself instead of always spawning an agent, **dictates into any text field** on Windows, can **calibrate its wake word to your mic** in 30 seconds, and ships a **React dashboard** that's mobile-responsive. Builds on v1.2 (multi-session mode), v1.1.1 (follow-up gate), v1.1 (custom wake word, persistent Claude sessions, live feed, noise suppression). Live web dashboard at `http://127.0.0.1:7070`.
+Status: **v1.7 — seamless conversation.** Halo now behaves like a partner in a
+spoken conversation: it takes its turn back when it promises one ("give me ten
+seconds"), ignores your counting and side-talk, **never loses what you say
+while it's busy**, doesn't cut you off mid-thought, and understands accented
+speech far better (large-v3-turbo + context-aware transcript repair). Plus
+dictation on a global hotkey (**Ctrl+Alt+D**), skills routing, MCP tools for
+the brain itself, and real time-awareness. Builds on v1.6 (bulletproof
+talk-over), v1.3 (conversation + dictate-anywhere), v1.2 (multi-session), v1.1
+(custom wake word). Live web dashboard at `http://127.0.0.1:7070`.
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full history. Licensed MIT
 ([LICENSE](./LICENSE)).
 
-### What's new in v1.3
+### What's new in v1.7
+
+- **It gets a turn, you get yours** — say *"give me ten seconds"* and count;
+  Halo waits and then comes back on its own. Counting, thinking-aloud, and
+  talking to someone else in the room are classified against the actual mic
+  signal and dropped instead of dispatched as commands.
+- **Nothing you say is lost** — the mic keeps listening *between* turns (while
+  Halo routes, thinks, or replies) and feeds that speech into the next turn.
+  If you resume talking while it's transcribing, it holds the commit instead
+  of cutting you off.
+- **Better ears** — STT upgraded to `large-v3-turbo` (much better on accents),
+  quiet-mic gain fixed, and a low-confidence transcript is repaired by the
+  brain using the conversation context ("make sure it makes sense, not just
+  random words").
+- **Compose, then send** — in direct dialogue your words accumulate and only
+  ship on *"send it"* / *"go"* / *"that's it"* or a clear pause. No more
+  half-sentences fired at the agent.
+- **Dictation hotkey** — **Ctrl+Alt+D** starts dictate-anywhere even while
+  Halo is asleep in wake-listening.
+- **Skills, MCP, time** — Claude/Codex skills discovered at startup and routed
+  by phrase ("make a poster for AIP"); the brain can call MCP tools itself
+  (opt-in); and it knows real dates/durations, so "how long have we been
+  working on this?" gets a true answer.
+
+### The map — how you use it and why it's great
+
+```mermaid
+mindmap
+  root((Halo))
+    Talk
+      say "halo" to wake
+      talk over it any time - it stops and listens
+      trail off mid-thought - it waits and merges
+      say "give me 10 seconds" - it comes back on its own
+    Dispatch work
+      "Claude, build a login page"
+      "ask Codex to run the tests"
+      follow-ups go straight to the agent
+      compose freely - ships on "send it" or a pause
+      "back to halo" to exit
+    Sessions
+      "what sessions do I have?"
+      "switch to website"
+      "in AIP, ask Claude to add dark mode"
+      "tell all of them to run their tests"
+    Do it locally
+      "open chrome" - instant, no LLM
+      "what time is it" - the brain answers itself
+      skills: "make a poster for AIP"
+      MCP tools for the brain - opt-in
+    Dictate anywhere
+      say "dictate" or press Ctrl+Alt+D
+      types at your cursor in any app
+      "send it" presses Enter and returns
+    It remembers
+      conversation survives sleep and restarts
+      "remember that I prefer dark mode"
+      real time awareness - no hallucinated dates
+    Free or pro
+      100 percent local by default - no keys
+      opt-in ElevenLabs voice + OpenRouter brain
+      cloud failure falls back to local
+    Watch it live
+      dashboard at 127.0.0.1:7070
+      every stage, transcript, session, event log
+```
+
+### Cheat sheet — everything you can say (and press)
+
+One keyboard shortcut, everything else is your voice:
+
+| Shortcut | Effect |
+|---|---|
+| **Ctrl+Alt+D** | Start dictate-anywhere from anywhere (even while Halo sleeps). Configurable: `[dictation] hotkey`. |
+
+| You say | What happens |
+|---|---|
+| **Wake & sleep** | |
+| *"halo"* | wake up, start a conversation |
+| *"goodbye"* / *"go to sleep"* / *"over and out"* | end the conversation |
+| *"new task"* / *"start over"* / *"fresh session"* | reset agent sessions |
+| **Give agents work** | |
+| *"Claude, build a login page"* | dispatch to Claude (no LLM round-trip) |
+| *"ask Codex to run the tests"* / *"tell Claude to fix it"* | verbal dispatch |
+| *"now also add tests"* | follow-up straight to the active agent |
+| *"send it"* / *"go"* / *"that's it"* | ship the message you've been composing |
+| *"back to halo"* / *"talk to me"* | leave the agent, back to Halo |
+| **While Halo talks** | |
+| *"stop"* / *"wait"* / *"hold on"* | Halo shuts up immediately |
+| just start talking | talk-over: it stops and routes what you said |
+| **Pace the conversation** | |
+| *"give me ten seconds"* / *"hold on"* | Halo waits, then takes its turn back |
+| trail off mid-sentence… | Halo holds the fragment and merges your continuation |
+| **Sessions & navigation** | |
+| *"what sessions do I have?"* / *"where am I?"* | spoken session list / active one |
+| *"switch to website"* / *"work on the AIP one"* | change active session |
+| *"in website, ask Claude to add dark mode"* | one-shot dispatch elsewhere |
+| *"go back"* / *"the other one"* | return to the previous session |
+| *"tell all of them to run their tests"* | fanout to every session |
+| **Status & results** | |
+| *"what's happening?"* / *"are you done?"* | job status, no LLM |
+| *"what did Claude say?"* | replay the last result |
+| *"open landing.html"* | open what the agent just built |
+| **Local & utility** | |
+| *"open chrome"* / *"launch calculator"* | instant local tools |
+| *"dictate"* | dictate-anywhere (see table above for the hotkey) |
+| *"say thanks for watching"* | Halo speaks it verbatim |
+| *"remember that I prefer dark mode"* | stored as a durable fact |
+| *"what skills do you have?"* | list discovered Claude/Codex skills |
+| *"when did we start?"* / *"how long has this taken?"* | real time-aware answers |
+
+Dictation-mode phrases (*"new line"*, *"send it"*, *"stop"*) are in
+[Dictation](#dictation); multi-session phrasing in
+[Multi-session mode](#multi-session-mode).
+
+### v1.3 highlights
 
 - **Real conversation, not just dispatch** — chit-chat and casual questions get an actual spoken reply from the brain (streaming, so it starts talking in ~0.4 s), and Halo **remembers the conversation across sleep/wake** so "what did we just do?" works. It does simple things itself (open apps, answer, "say this out loud") and **confirms before ever handing work to Claude** — it won't silently spawn an agent unless you name it.
 - **Dictate-anywhere (Windows)** — say *"dictate"*, click into any text field (browser, editor, terminal), and your speech is typed where the cursor is, with real-time accent-aware cleanup. Say *"send it"* to submit and drop back into conversation. See [Dictation](#dictation).
@@ -90,7 +213,7 @@ authenticate against their own services.
 | Wake word    | [openWakeWord](https://github.com/dscripka/openWakeWord) + custom `halo.onnx` (trained via [bbarrick/wakeword_trainer](https://github.com/bbarrick/wakeword_trainer)) | Single-word "halo" wake (188 positives × 22 voices + 524 negatives via ElevenLabs TTS, F1 = 0.80). silero-VAD gate on top via `vad_threshold=0.7`. Falls back to builtin `hey_jarvis` if `halo.onnx` is missing. |
 | Mic          | [sounddevice](https://python-sounddevice.readthedocs.io/) | 16 kHz mono int16 |
 | VAD          | [silero-vad v5](https://github.com/snakers4/silero-vad)   | 600 ms base silence, mode-adaptive extensions |
-| STT          | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + distil-large-v3 | int8_float16 on CUDA, ~500 ms per utterance |
+| STT          | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + large-v3-turbo | int8_float16 on CUDA, ~500 ms per utterance; multilingual-trained (better on accents); auto-falls back to distil-large-v3; `HALO_STT_MODEL` to override |
 | Router       | [Ollama](https://ollama.com) + `qwen2.5:1.5b-instruct`    | Stage 2 LLM, fires only when no local handler matches |
 | TTS          | [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) ONNX (fp16) | `af_heart` voice, sanitized for Markdown |
 | Agents       | [Claude Code](https://github.com/anthropics/claude-code) + [Codex CLI](https://github.com/openai/codex) subprocesses | Persistent sessions; voice-mode flags (`--permission-mode bypassPermissions` / `approval_policy="never"`) so no manual approvals |
@@ -155,7 +278,7 @@ fall back to CPU.
   Whisper's "Thank you" / "you" / "hello" artifacts on silence.
   Crank sensitivity in one move with `HALO_HOT_MIC=1`, or tune each knob
   via `HALO_VAD_THRESHOLD` / `HALO_SPEECH_RMS_FLOOR` /
-  `HALO_ENERGY_ONSET_CHUNKS` / `HALO_MIC_NOISE_GATE_RMS`.
+  `HALO_ENERGY_ONSET_CHUNKS` / `HALO_MIC_NOISE_GATE`.
 - **Talk-over (barge-in capture)** — interrupt Halo mid-reply and it stops +
   routes what you said. ON by default; safe without echo-cancelling hardware
   thanks to layered echo guards (loudness gate + word-overlap + min-words).
@@ -208,7 +331,8 @@ Halo runs in silent (text-only) mode.
 The other models download themselves on first use:
 - openWakeWord pretrained ONNX (~few MB)
 - silero-vad model (~2 MB)
-- faster-whisper distil-large-v3 (~1.5 GB, from HuggingFace)
+- faster-whisper large-v3-turbo (~1.6 GB, from HuggingFace; falls back to
+  distil-large-v3 if it can't load — override with `HALO_STT_MODEL`)
 
 ### 3. Ollama + routing model
 
@@ -322,10 +446,12 @@ Mix and match — e.g. local brain + ElevenLabs voice, or cloud brain + Kokoro.
 
 ## Dictation
 
-System-wide dictate-anywhere (Windows). Say **"dictate"**, click into any
-text field (browser, editor, terminal — anywhere the caret blinks), and speak;
-your words are typed at the cursor via `SendInput` Unicode injection, with
-real-time accent-aware cleanup. Controls (spoken):
+System-wide dictate-anywhere (Windows). Say **"dictate"** — or press
+**Ctrl+Alt+D** from anywhere, even while Halo is idle in wake-listening
+(configurable via `[dictation] hotkey` / `HALO_DICTATION_HOTKEY`) — click into
+any text field (browser, editor, terminal — anywhere the caret blinks), and
+speak; your words are typed at the cursor via `SendInput` Unicode injection,
+with real-time accent-aware cleanup. Controls (spoken):
 
 | Say | Effect |
 |---|---|
@@ -599,13 +725,13 @@ Disable entirely with `FOLLOWUP_GATE_ENABLED = False` in
 `halo/config.py` if you want the old v1.1.0 behaviour (every direct-mode
 utterance reaches the agent).
 
-### Mythology names
+### Session names
 
-When a new session starts for an agent, Halo assigns it a random
-Roman-mythology name (Mars, Mercury, Juno, Vesta, Apollo, ...). The
-name persists across follow-ups and resets on "new task". This makes
-it clear which agent is talking when both are working: *"Mercury says
-done. Neptune had a problem with the auth tests."*
+Sessions are named for what they actually are — **model + project** —
+so you always know who's talking: *"Claude Code in website says done.
+Codex in AIP had a problem with the auth tests."* (Replaces the old
+random mythology codenames.) Names persist across follow-ups and reset
+on "new task".
 
 ### Persistent sessions
 
@@ -732,6 +858,14 @@ halo/
   stt.py          faster-whisper BatchTranscriber (CUDA + DLL fixup)
   router.py       Stage 1 rules + Stage 2 LLM (Ollama/OpenRouter + JSON schema) + chat + streaming
   turn.py         per-turn orchestration (record/transcribe; routing in __main__)
+  floor.py        conversational floor — promise detection + reclaim timer (v1.7)
+  utterance.py    mic-grounded utterance classifier: command/filler/noise/background (v1.7)
+  hotkey.py       global dictation hotkey (Ctrl+Alt+D, Win32 RegisterHotKey) (v1.7)
+  skills.py       Claude/Codex skill discovery + phrase matching (v1.7)
+  mcp_client.py   stdio MCP client + tool loop for the brain (opt-in) (v1.7)
+  prompts.py      user-adjustable prompt overrides from ~/.halo/prompts/ (v1.7)
+  memory.py       persistent SQLite memory: turns, facts, time context
+  sessions.py     persistent agent subprocess sessions
   tools.py        cross-platform local tools (browser, calc, notepad, "say", ...)
   dictation.py    dictate-anywhere loop: capture -> sanitize -> type at cursor (v1.3)
   desktop_control.py  Win32 SendInput Unicode injection + focus helpers (v1.3)
@@ -762,12 +896,9 @@ models/                          dev-mode location (this dir, project root)
 scripts/
   bench_router.py             Stage 1 + Stage 2 latency benchmark
   fw_smoke.py                 faster-whisper accuracy smoke test
-  moonshine_smoke.py          legacy Moonshine STT smoke (kept for comparison)
-  test_detect_mode.py         adaptive turn-taking unit tests
-  test_streaming.py           sentence buffer + Claude stream-json extractor
-  test_vocative.py            vocative dispatch unit tests
-  test_voice_mode.py          TTS sanitizer + mode-switch tests
-  test_fixes_round.py         regression suite for recent bug fixes
+  test_*.py                   ~30 unit suites (turn-taking, floor, classifier,
+                              gap capture, commit race, STT repair, barge-in,
+                              skills, MCP, hotkey, sessions, memory, ...)
 ```
 
 ---
@@ -830,12 +961,15 @@ the Stage 2 router prompt about the new agent if you want voice routing
 12. ✅ Streaming Claude output → live TTS sentence-by-sentence
 13. ✅ Local web dashboard with live pipeline / transcript / jobs / log
 14. ✅ Packaged for `pip install` (v1.0)
-15. Publish to PyPI (`pip install halo-voice` direct, no `git+`)
-16. Custom `hey_halo` wake model (needs voice samples)
-17. Streaming Codex (Codex CLI doesn't expose stream-json yet; tracking)
-18. Premium TTS provider abstraction (ElevenLabs etc., opt-in)
-19. Agent registry from external TOML — `halo init` to scaffold new agents
-20. Project registry — `halo project add/use <name>` for multi-project flows
+15. ✅ Premium provider abstraction — ElevenLabs TTS + OpenRouter brain, opt-in (v1.3)
+16. ✅ Talk-over / barge-in capture with layered echo defense (v1.6)
+17. ✅ Turn-taking: floor + promise/reclaim, utterance classifier, merge, compose-then-send (v1.7)
+18. ✅ Seamless capture: gap capture between turns, commit-race guard, semantic repair (v1.7)
+19. ✅ Skills registry + dictation hotkey + MCP tools for the brain + time awareness (v1.7)
+20. Structural refactor of `run_conversation()` into a handler table (in progress — `ROADMAP.md` Phase 3)
+21. Self-improvement loop (outcome signals tune thresholds) — `ROADMAP.md` Phase 8
+22. Publish to PyPI (`pip install halo-voice` direct, no `git+`) — `ROADMAP.md` Phase 9
+23. Streaming Codex (Codex CLI doesn't expose stream-json yet; tracking)
 
 ---
 
@@ -851,3 +985,5 @@ the Stage 2 router prompt about the new agent if you want voice routing
 | Halo speaks Claude's Markdown literally | Should be sanitized — check `_clean_for_speech` in `halo/voice.py` |
 | `Input must be provided` from Claude | Wake-strip left an empty prompt; current code guards this — file an issue if it recurs |
 | Ctrl-C doesn't stop Halo | Fixed — wake stream now polls with 250 ms timeout so SIGINT propagates |
+| Won't start — hangs right after the banner | A wedged Windows WMI service blocks `import torch`. Guarded since v1.7 (`halo/__init__.py`); if it still hangs, restart the "Windows Management Instrumentation" service |
+| It cuts you off / misses words | Fixed in v1.7 (commit-race guard, gap capture, shared VAD threshold). Still rough? Get closer to the mic, or `HALO_HOT_MIC=1` |

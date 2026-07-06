@@ -11,10 +11,22 @@ from pathlib import Path
 
 from halo.userconfig import cfg
 
-# Flip to False once we're past the build-and-debug phase.
-DEBUG = True
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _resolve_debug() -> bool:
+    """Debug writes timestamped WAV dumps to recordings/ and verbose logs.
+    Default ON in a dev checkout (pyproject.toml at the repo root), OFF for
+    pip-installed users. Override with HALO_DEBUG=1/0."""
+    env = os.getenv("HALO_DEBUG", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    return (PROJECT_ROOT / "pyproject.toml").exists()
+
+
+DEBUG = _resolve_debug()
 
 
 def _resolve_models_dir() -> Path:
@@ -58,7 +70,7 @@ SAMPLE_RATE = 16_000
 
 # Router backend for command interpretation. Stage 2 of the routing brain.
 # - "ollama": local, free, default. Requires `ollama pull qwen2.5:1.5b-instruct` once.
-# - "claude": Anthropic API. Requires ANTHROPIC_API_KEY env var. (Not wired.)
+# - "openrouter": cloud, paid. Requires an OpenRouter API key (see .env).
 ROUTER_BACKEND = cfg.router.provider
 
 OLLAMA_HOST = cfg.router.ollama_host
@@ -75,8 +87,6 @@ OPENROUTER_API_KEY_ENV = cfg.router.openrouter_api_key_env
 OPENROUTER_SITE_URL = cfg.router.openrouter_site_url
 OPENROUTER_APP_NAME = cfg.router.openrouter_app_name
 OPENROUTER_TIMEOUT_SEC = cfg.router.openrouter_timeout_sec
-
-CLAUDE_MODEL = "claude-haiku-4-5"
 
 # Turn-taking thresholds (step 3.5 — adaptive).
 # Tight 600 ms base silence at the VAD layer; the orchestrator then
@@ -116,18 +126,28 @@ CHIME_DURATION_MS = 60
 # HALO_HOT_MIC=1. Individual HALO_* overrides below still win over the profile.
 HOT_MIC = os.getenv("HALO_HOT_MIC", "").strip().lower() in ("1", "true", "yes", "on")
 
-# Mic-side noise gate. Audio chunks with RMS below this floor are
-# treated as silence and dropped before they reach silero-VAD / STT.
-# Conservative default (0.005) — well below normal speech levels
-# (typically 0.05+) so it only filters true ambient room noise.
-# Raise to 0.015-0.020 if your environment is noisy and you still
-# get spurious wake-ups or "Thank you" hallucinations. Disable by
-# setting to 0.0. NVIDIA Broadcast / Krisp / OS-level noise filters
-# remove the need for this entirely. Override with HALO_MIC_NOISE_GATE_RMS;
-# the hot-mic profile drops it so quieter onsets aren't gated out.
-MIC_NOISE_GATE_RMS = float(
-    os.getenv("HALO_MIC_NOISE_GATE_RMS", "0.003" if HOT_MIC else "0.005")
-)
+# silero-vad speech threshold, shared by the recorder AND the STT-internal VAD
+# filter (stt.py) so they NEVER disagree about what counts as speech. 0.35: silero
+# often under-scores a raw, AGC-less USB mic, so the stock 0.5 missed real speech
+# entirely. Lower = more sensitive. Override with HALO_VAD_THRESHOLD; the hot-mic
+# profile drops it to 0.25.
+VAD_THRESHOLD = float(os.getenv("HALO_VAD_THRESHOLD", "0.25" if HOT_MIC else "0.35"))
+
+# Mic-side noise gate. Audio chunks with RMS below this floor are treated as
+# silence and dropped before they reach silero-VAD / STT. SINGLE SOURCE OF TRUTH
+# is cfg.mic.noise_gate_rms (set via [mic] noise_gate_rms in halo-config.toml or
+# env HALO_MIC_NOISE_GATE). Conservative default 0.005 — well below normal speech
+# (typically 0.05+) so it only filters ambient room noise. Raise to 0.015-0.020
+# in a noisy room; 0.0 disables. The hot-mic profile clamps it down so quieter
+# onsets aren't gated out.
+_base_noise_gate = float(getattr(cfg.mic, "noise_gate_rms", 0.005))
+MIC_NOISE_GATE_RMS = min(_base_noise_gate, 0.003) if HOT_MIC else _base_noise_gate
+
+# Loudness band (peak RMS) separating background talk (TV / far speaker) from the
+# near speaker, for the BACKGROUND utterance filter (mic "third detection"). A
+# not-addressed utterance below this is treated as side-talk. Below the user's
+# real-speech floor (~0.05-0.09 on NVIDIA Broadcast), above the background floor.
+BACKGROUND_RMS = float(os.getenv("HALO_BACKGROUND_RMS", "0.035"))
 
 # Conversation mode: stay awake after wake until either an explicit
 # end phrase or N seconds of idle silence (with no active agent jobs).

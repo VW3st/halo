@@ -69,7 +69,7 @@ LIVE_SCORE_FLOOR = 0.03
 LIVE_SCORE_INTERVAL = 0.3
 
 # Last ~PRE_WAKE_BUFFER_SEC of mic audio is kept around so the turn
-# orchestrator can seed Moonshine with whatever the user said in the
+# orchestrator can seed the transcriber with whatever the user said in the
 # same breath as the wake word ("Hey Jarvis open calculator").
 PRE_WAKE_BUFFER_SEC = 1.0
 _pre_wake_audio: np.ndarray | None = None
@@ -122,7 +122,7 @@ def _describe_input_device() -> str:
         return f"<unknown: {exc}>"
 
 
-def listen_for_wake() -> float:
+def listen_for_wake(interrupt: "threading.Event | None" = None) -> float:
     """Block until the wake word is detected. Returns the DNN score at the
     moment it fired (used by the caller's STT verification as a confidence
     prior — a strong fire is trusted more readily).
@@ -130,6 +130,10 @@ def listen_for_wake() -> float:
     While waiting, keeps the last ~PRE_WAKE_BUFFER_SEC of audio in a
     ring buffer so callers can recover whatever the user said in the
     same breath as the wake word (e.g. "Hey Jarvis open calculator").
+
+    If `interrupt` (a threading.Event) is set while waiting, returns the sentinel
+    -1.0 (not a real fire) so the caller can release the mic for another action
+    (e.g. hotkey-triggered dictation).
     """
     model = _get_model()
     model.reset()
@@ -252,7 +256,8 @@ def listen_for_wake() -> float:
             print(f"mic: {_describe_input_device()}")
             print(f"listening for wake word {_active_wake_key!r} (threshold={THRESHOLD})...")
             while not detected.wait(timeout=0.25):
-                pass
+                if interrupt is not None and interrupt.is_set():
+                    return -1.0  # interrupted (e.g. dictation hotkey) — not a real fire
     finally:
         stop.set()
         try:

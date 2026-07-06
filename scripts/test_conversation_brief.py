@@ -20,7 +20,11 @@ def check(label: str, ok: bool, detail: str = "") -> int:
 
 def main() -> int:
     failed = 0
-    brief = _ConversationBrief(max_turns=3)
+    # Default window (30 turns) — the brief stores chitchat too now (it feeds
+    # render_history for the chat brain) and filters it at RENDER time, so a
+    # tiny window would let chitchat evict real constraints. Production uses
+    # the default; this tests the render_for_agent filtering.
+    brief = _ConversationBrief()
     brief.add_user("I want a quiet dashboard, not a marketing page")
     brief.add_user("Use compact panels and keep it readable on mobile")
     brief.add_user("Can you hear me?")

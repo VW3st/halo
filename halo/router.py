@@ -1,14 +1,13 @@
-"""Routing brain — two stages over the local Ollama instance.
+"""Routing brain — two stages.
 
-Stage 1: fast classifier — "has the user finished their thought?"
-         Plain-text COMPLETE/INCOMPLETE response, called on every silence
-         during a turn. Latency target: <200 ms.
+Stage 1: turn-completion — "has the user finished their thought?" Now
+         PURE RULES (check_turn_complete), ~0 ms. The old LLM classifier cost
+         2-4s from KV-cache thrash and was removed.
 
-Stage 2: full understanding + routing. Called once when Stage 1 (or a
-         terminator phrase, or the hard timeout) ends the turn.
-         JSON-schema-constrained output via Ollama's structured-output
-         feature, so we never have to defend against malformed JSON.
-         Latency target: <500 ms.
+Stage 2: full understanding + routing (understand_and_route). One
+         JSON-schema-constrained call to the configured brain (local Ollama
+         or cloud OpenRouter) when the turn ends. Structured output means we
+         never have to defend against malformed JSON.
 
 v1.2 adds **session context injection**: when Halo has discovered other
 running Claude/Codex sessions on the machine, every Stage 2 call gets a
@@ -32,6 +31,7 @@ from typing import Any, Optional
 import ollama
 
 from halo import bus
+from halo import prompts
 from halo.config import (
     OLLAMA_HOST,
     OLLAMA_MODEL,
@@ -83,439 +83,13 @@ _SHORT_COMPLETE_WORDS = {
 _HARD_TERMINATOR_RE = re.compile(r"[?!](?:\s|$)|[.](?:\s+\S|\s*$)")
 
 # ---------------------------------------------------------------------------
-# Stage 1 — turn completion classifier
-# ---------------------------------------------------------------------------
-
-STAGE1_PROMPT = """\
-Classify the transcript as COMPLETE or INCOMPLETE.
-
-COMPLETE = a finished request, question, statement, or single command.
-INCOMPLETE = a fragment, trailing thought, or ends mid-phrase.
-
-Hard rules (always INCOMPLETE):
-- ends with a conjunction or preposition (and/or/but/with/to/for/of/the/a)
-- ends with a filler/thinking word (um/uh/like/let me/actually/wait)
-- trails off mid-noun-phrase (e.g. "build me a")
-
-When uncertain, pick INCOMPLETE.
-
-Examples:
-"open the browser" -> COMPLETE
-"build me a login page and" -> INCOMPLETE
-"cancel" -> COMPLETE
-"I want to refactor the" -> INCOMPLETE
-"um actually" -> INCOMPLETE
-
-Reply with one word: COMPLETE or INCOMPLETE.
-"""
-
-# ---------------------------------------------------------------------------
 # Stage 2 — understanding + routing
 # ---------------------------------------------------------------------------
-
-_STAGE2_PROMPT_OLD = """\
-# IDENTITY
-You are Halo, a voice control orchestrator for AI coding agents. You receive raw transcribed voice commands from a developer and convert them into structured instructions for downstream agents (Claude Code, Codex CLI).
-
-# YOUR JOB
-Three responsibilities, in this order:
-1. CLEAN the transcript (fix STT errors, remove filler, add punctuation, normalize technical terms)
-2. UNDERSTAND the intent (what does the user actually want?)
-3. ROUTE to the correct agent OR flag for clarification
-
-You do NOT execute anything. You produce a structured plan that the orchestrator executes.
-
-# CONTEXT YOU HAVE
-- The user is a software developer at their workstation
-- They are talking to you via microphone after saying "Hey Halo"
-- Their voice was transcribed by Whisper, so expect homophone errors and missing punctuation
-- They may use technical jargon (frameworks, languages, tools)
-- They expect fast, terse responses -- no fluff
-
-# STT CORRECTION DICTIONARY
-Common Whisper/Moonshine mistakes to silently fix:
-- "claud" / "clod" / "clawed" -> "Claude"
-- "claud code" / "code clawed" -> "Claude Code"
-- "codecs" / "codex" -> "Codex"
-- "next jess" / "next js" -> "Next.js"
-- "react" pronunciation variants -> "React"
-- "type script" -> "TypeScript"
-- "java script" -> "JavaScript"
-- "get hub" -> "GitHub"
-- "super base" -> "Supabase"
-- "post grass" -> "Postgres"
-- "ollama" / "o llama" -> "Ollama"
-- "card" / "com" / "krome" / "grom" / "crome" -> "Chrome"  (when context is "open <X>")
-- "calc" / "cut" / "kelker" -> "calculator"  (when context is "open <X>")
-- "node pad" / "no pad" / "notedad" -> "notepad"
-- "powershell" variants ("power shell", "pow shell") -> "PowerShell"
-- File and component names spoken phonetically -> normalize to PascalCase or camelCase based on context
-
-# FILLER TO REMOVE
-um, uh, er, ah, like (when used as filler), you know, basically, sort of, kind of, I mean, so (when used to start), right (when trailing), okay (when trailing), false starts, repeated words
-
-# INTENT CATEGORIES
-- "code" : write, edit, refactor, build, debug, test, deploy, run, install, generate code
-- "question" : ask Halo something it can answer without an agent (general knowledge, status, capability)
-- "system" : control Halo itself (stop, cancel, sleep, louder, quieter, repeat, switch agent)
-- "cancel" : abort the current action
-
-# AGENT ROUTING RULES
-- Default coding tasks -> "claude_code"
-- User explicitly names "Codex" / "codex CLI" / "OpenAI codex" -> "codex_cli"
-- User explicitly names "Claude" / "Claude Code" / "Anthropic" -> "claude_code"
-- User asks Halo a direct question (capability, status, time) -> "none"
-- System commands -> "none"
-- Ambiguous between agents -> ask for clarification
-
-# AGENT-NAME PRESERVATION (CRITICAL)
-If the user mentions an agent by name, that agent MUST appear in the
-output's `agent` field AND in the `cleaned_text` AND in the `confirmation`.
-NEVER substitute Codex for Claude or vice versa, even if the task
-"feels" like one the other usually handles. The user picked. Honor it.
-
-Examples of agent-swap mistakes you MUST NOT make:
-- "ask Codex to build a landing page" -> agent MUST be "codex_cli", not "claude_code"
-- "have Claude run the tests" -> agent MUST be "claude_code", not "codex_cli"
-- "tell Codex about the auth bug" -> agent MUST be "codex_cli"
-
-# STATUS VALUES
-- "ready" : transcript is clear, complete, and routable -- proceed to confirmation
-- "unclear" : transcript is ambiguous, missing critical info -- must ask one short clarifying question
-- "chitchat" : not a real command (greeting, accidental wake, irrelevant talk) -- ignore and return to listening
-- "cancel" : user wants to abort
-
-# CONFIRMATION RULES
-The confirmation field is spoken aloud back to the user before execution.
-- Maximum 12 words
-- Plain conversational English
-- State the action, not the implementation
-- Do not invent details the user did not specify
-- Good: "Building a login page, ready to start?"
-- Good: "Refactoring the auth module, ready to start?"
-- Bad: "I will create a new file at src/pages/login.tsx using the App Router pattern..."
-- Bad: "Building a login page with Supabase auth, ready to start?" (the
-  user did not say Supabase — adding it is hallucination)
-
-# CLARIFICATION RULES
-- Maximum 10 words
-- ONE question only, the most important one
-- Good: "Which project, the dashboard or the landing page?"
-- Bad: "Could you provide more details about what you'd like me to do?"
-
-# SESSION-AWARE ROUTING (v1.2)
-Halo may have discovered other Claude/Codex sessions running on the
-machine. When a CURRENT CONTEXT block is prepended to the user's
-transcript, you have these extra responsibilities:
-
-  - Set `target_session` to direct the dispatch:
-      * a label from discovered_sessions  → dispatch to that one
-      * "active"                          → use the active_session
-      * "focused"                         → use the user's focused terminal
-      * "all"                             → fan out to every discovered session
-      * ""                                → default routing (active session)
-  - Set `session_action` for meta-operations:
-      * "switch"          — user wants to change the active session.
-                            Put the target label in `target_session`.
-                            confirmation should be e.g. "Switched to halo."
-      * "list_sessions"   — user asked what's running ("what sessions",
-                            "what's open", "what do I have"). agent="none",
-                            intent="question".
-      * "where_am_i"      — user asked which project is active. agent="none",
-                            intent="question".
-      * ""                — none, behave as a normal dispatch.
-
-Important matching rules:
-  - Spoken labels are noisy. "the website one" should resolve to a
-    discovered_sessions entry whose label is "website" (substring or
-    token match). Use the closest label.
-  - If no CURRENT CONTEXT block is present (single-session mode), leave
-    `target_session` = "" and `session_action` = "". Behave exactly as
-    in v1.1.
-  - "send X to all" / "ask everyone to Y" → target_session="all",
-    session_action="", normal dispatch to every session.
-  - "in <label>, do X" / "ask the <label> one to Y" → cross-session
-    one-shot. target_session=<label>, session_action="", dispatch
-    happens there without changing the active session.
-
-# OUTPUT SCHEMA
-You MUST return valid JSON matching this exact structure:
-{
-  "status": "ready" | "unclear" | "chitchat" | "cancel",
-  "cleaned_text": "string -- the original command cleaned and normalized",
-  "intent": "code" | "question" | "system" | "cancel",
-  "agent": "claude_code" | "codex_cli" | "none",
-  "confirmation": "string -- spoken back before execution (only if status=ready)",
-  "clarification": "string -- question to ask user (only if status=unclear)",
-  "target_session": "string -- label / 'active' / 'focused' / 'all' / ''",
-  "session_action": "" | "switch" | "list_sessions" | "where_am_i"
-}
-
-Fields that don't apply for the given status should be empty string "".
-
-# EXAMPLES
-
-Input: "hey um build me a login page with claud code"
-Output:
-{
-  "status": "ready",
-  "cleaned_text": "Build me a login page with Claude Code",
-  "intent": "code",
-  "agent": "claude_code",
-  "confirmation": "Building a login page, ready to start?",
-  "clarification": ""
-}
-
-# IMPORTANT: do NOT add libraries, frameworks, or technical details
-# the user did not say. The example above does NOT add "with Supabase"
-# or "with React" or any other choice — it preserves only what was said.
-
-Input: "ask Codex to build a landing page for this project"
-Output:
-{
-  "status": "ready",
-  "cleaned_text": "Build a landing page for this project",
-  "intent": "code",
-  "agent": "codex_cli",
-  "confirmation": "Building a landing page, ready to start?",
-  "clarification": ""
-}
-
-Input: "fix the bug"
-Output:
-{
-  "status": "unclear",
-  "cleaned_text": "Fix the bug",
-  "intent": "code",
-  "agent": "claude_code",
-  "confirmation": "",
-  "clarification": "Which bug, and in which file?"
-}
-
-Input: "what time is it"
-Output:
-{
-  "status": "ready",
-  "cleaned_text": "What time is it",
-  "intent": "question",
-  "agent": "none",
-  "confirmation": "Answering directly.",
-  "clarification": ""
-}
-
-Input: "stop"
-Output:
-{
-  "status": "cancel",
-  "cleaned_text": "Stop",
-  "intent": "cancel",
-  "agent": "none",
-  "confirmation": "Cancelled.",
-  "clarification": ""
-}
-
-Input: "hey what's up"
-Output:
-{
-  "status": "chitchat",
-  "cleaned_text": "Hey what's up",
-  "intent": "question",
-  "agent": "none",
-  "confirmation": "",
-  "clarification": ""
-}
-
-Input: "how are you"
-Output:
-{
-  "status": "chitchat",
-  "cleaned_text": "How are you",
-  "intent": "question",
-  "agent": "none",
-  "confirmation": "",
-  "clarification": ""
-}
-
-Input: "patches 2 plus 2 times 10"
-Output:
-{
-  "status": "unclear",
-  "cleaned_text": "Patches 2 plus 2 times 10",
-  "intent": "code",
-  "agent": "none",
-  "confirmation": "",
-  "clarification": "I didn't catch that, can you repeat?"
-}
-
-Input: "open calculator"
-Output:
-{
-  "status": "ready",
-  "cleaned_text": "Open calculator",
-  "intent": "system",
-  "agent": "none",
-  "confirmation": "Opening calculator.",
-  "clarification": ""
-}
-
-Input: "open the browser"
-Output:
-{
-  "status": "ready",
-  "cleaned_text": "Open the browser",
-  "intent": "system",
-  "agent": "none",
-  "confirmation": "Opening the browser.",
-  "clarification": ""
-}
-
-# NOTE: "open <app>" / "launch <thing>" requests are always status=ready,
-# intent=system, agent=none. They are real commands, NOT chitchat. The
-# orchestrator will execute them locally.
-
-# CRITICAL: the `confirmation` field is a META acknowledgement of what
-# Halo is about to do (e.g. "Building a login page, ready to start?",
-# "Answering directly.", "Cancelled."). It is NEVER the actual answer
-# to a question. It is NEVER conversational reply text. If status is
-# "chitchat" the confirmation MUST be the empty string.
-
-# CRITICAL CONSTRAINTS
-- Return ONLY the JSON object. No markdown fences, no commentary, no preamble.
-- Never invent file paths, framework choices, libraries, databases, or
-  implementation details the user did not state. If the user says "build a
-  landing page" they did NOT say "with Supabase" or "with Tailwind". Add
-  nothing.
-- NEVER invent app or tool names. If the user trails off ("open the...") or
-  the STT garbled the app name beyond recognition, set status="unclear" and
-  ask which app. Do not guess "Chrome" or "calculator" just because they're
-  common.
-- NEVER swap the agent the user named. "Codex" stays "codex_cli". "Claude"
-  stays "claude_code". This is the most common router failure mode.
-- When in doubt about clarity, choose "unclear" and ask.
-- Never refuse a command. If something seems risky, set status="unclear" and ask for confirmation.
-- Speed matters. Generate the JSON in one pass, do not reason aloud.
-
-# ANTI-HALLUCINATION EXAMPLE
-
-Input: "open the calculator and then open something else, you know"
-Output:
-{
-  "status": "unclear",
-  "cleaned_text": "Open the calculator and then open something else",
-  "intent": "system",
-  "agent": "none",
-  "confirmation": "",
-  "clarification": "Which app should I open after calculator?",
-  "target_session": "",
-  "session_action": ""
-}
-
-# SESSION-AWARE EXAMPLES (only fire when CURRENT CONTEXT block is present)
-
-Context block:
-  active_session: halo
-  discovered_sessions:
-    - label: halo       agent: claude_code  cwd: D:/Halo
-    - label: website    agent: claude_code  cwd: D:/website-redesign
-    - label: aip        agent: claude_code  cwd: D:/AIP-Claude
-
-Input: "switch to website"
-Output:
-{
-  "status": "ready",
-  "cleaned_text": "Switch to website",
-  "intent": "system",
-  "agent": "none",
-  "confirmation": "Switched to website.",
-  "clarification": "",
-  "target_session": "website",
-  "session_action": "switch"
-}
-
-Input: "work on the AIP one now"
-Output:
-{
-  "status": "ready",
-  "cleaned_text": "Work on AIP",
-  "intent": "system",
-  "agent": "none",
-  "confirmation": "Switched to aip.",
-  "clarification": "",
-  "target_session": "aip",
-  "session_action": "switch"
-}
-
-Input: "what sessions do I have"
-Output:
-{
-  "status": "ready",
-  "cleaned_text": "What sessions do I have",
-  "intent": "question",
-  "agent": "none",
-  "confirmation": "",
-  "clarification": "",
-  "target_session": "",
-  "session_action": "list_sessions"
-}
-
-Input: "where am I"
-Output:
-{
-  "status": "ready",
-  "cleaned_text": "Where am I",
-  "intent": "question",
-  "agent": "none",
-  "confirmation": "",
-  "clarification": "",
-  "target_session": "",
-  "session_action": "where_am_i"
-}
-
-Input: "in website, ask Claude to add dark mode"
-Output:
-{
-  "status": "ready",
-  "cleaned_text": "Add dark mode",
-  "intent": "code",
-  "agent": "claude_code",
-  "confirmation": "Adding dark mode in website.",
-  "clarification": "",
-  "target_session": "website",
-  "session_action": ""
-}
-
-Input: "tell all of them to run their tests"
-Output:
-{
-  "status": "ready",
-  "cleaned_text": "Run the tests",
-  "intent": "code",
-  "agent": "claude_code",
-  "confirmation": "Running tests on all sessions.",
-  "clarification": "",
-  "target_session": "all",
-  "session_action": ""
-}
-
-Input: "add a docstring"     (active_session: halo, no per-turn override)
-Output:
-{
-  "status": "ready",
-  "cleaned_text": "Add a docstring",
-  "intent": "code",
-  "agent": "claude_code",
-  "confirmation": "Adding a docstring.",
-  "clarification": "",
-  "target_session": "active",
-  "session_action": ""
-}
-"""
-
-# Lean Stage-2 prompt. The old ~400-line prompt (kept above as
-# _STAGE2_PROMPT_OLD for reference) was re-prefilled UNCACHED on every call,
-# which on a 1.5B was the dominant cause of the 5-9s latency. This trimmed
-# version + a 4-field schema cuts prefill and constrained-decode dramatically.
-# The session-routing block is appended ONLY when sessions are discovered.
+# Lean Stage-2 prompt. An older ~400-line prompt was re-prefilled UNCACHED on
+# every call, which on a 1.5B was the dominant cause of the 5-9s latency. This
+# trimmed version + a 4-field schema cuts prefill and constrained-decode
+# dramatically. The session-routing block is appended ONLY when sessions are
+# discovered.
 STAGE2_PROMPT = """You are Halo, a voice router for AI coding agents (Claude Code, Codex CLI). Turn ONE transcribed voice command into a small JSON object. Output JSON only, no prose.
 
 Fix speech-to-text errors: claud/clod/clawed->Claude, codecs->Codex, get hub->GitHub, type script->TypeScript, java script->JavaScript, next js->Next.js, super base->Supabase, post grass->Postgres, o llama->Ollama. Drop filler (um, uh, like, you know). If the transcript OPENS with a stray greeting (hello, hey, hi, okay) from a misheard wake word, IGNORE it and route the real command after it.
@@ -680,14 +254,15 @@ def _get_client() -> ollama.Client:
     return _client
 
 
-def _chat_json(
+def _chat_json_for(
+    provider: str,
     *,
     messages: list[dict[str, str]],
     schema: dict[str, Any],
     max_tokens: int,
-    temperature: float = 0.2,
+    temperature: float,
 ) -> dict[str, Any]:
-    provider = (ROUTER_BACKEND or "ollama").strip().lower()
+    """One structured-output call to a SPECIFIC provider."""
     if provider == "openrouter":
         return _chat_json_openrouter(
             messages=messages,
@@ -707,35 +282,57 @@ def _chat_json(
     return json.loads(response["message"]["content"])
 
 
-def _chat_json_openrouter(
+def _fallback_provider(primary: str) -> str | None:
+    """The other brain provider to try if `primary` fails — cloud<->local. Keeps
+    Halo working when a paid key is wrong or a local daemon is down instead of
+    degrading straight to an 'unclear' fallback. None when the alternate can't
+    work (e.g. ollama->openrouter with no API key configured)."""
+    if primary == "openrouter":
+        return "ollama"  # local; may be down, but worth a try before giving up
+    if primary == "ollama":
+        if os.environ.get(OPENROUTER_API_KEY_ENV, "").strip() and OPENROUTER_MODEL:
+            return "openrouter"
+        return None
+    return None
+
+
+def _chat_json(
     *,
     messages: list[dict[str, str]],
     schema: dict[str, Any],
     max_tokens: int,
-    temperature: float,
+    temperature: float = 0.2,
 ) -> dict[str, Any]:
+    primary = (ROUTER_BACKEND or "ollama").strip().lower()
+    try:
+        return _chat_json_for(
+            primary, messages=messages, schema=schema,
+            max_tokens=max_tokens, temperature=temperature,
+        )
+    except Exception as exc:
+        fb = _fallback_provider(primary)
+        if not fb:
+            raise
+        print(f"  router: {primary} failed ({type(exc).__name__}); "
+              f"falling back to {fb}")
+        bus.emit("router.fallback", primary=primary, fallback=fb, error=str(exc))
+        try:
+            return _chat_json_for(
+                fb, messages=messages, schema=schema,
+                max_tokens=max_tokens, temperature=temperature,
+            )
+        except Exception:
+            raise exc  # both providers failed -> surface the original error
+
+
+def _openrouter_request(body: dict[str, Any]) -> dict[str, Any]:
+    """POST a chat/completions `body` to OpenRouter and return the parsed JSON
+    payload. Shared header/auth/base-url prep for BOTH the structured-output path
+    and the tool-call path (Phase 7), killing the copy-pasted request building."""
     api_key = os.environ.get(OPENROUTER_API_KEY_ENV, "").strip()
     if not api_key:
         raise RuntimeError(f"OpenRouter API key missing ({OPENROUTER_API_KEY_ENV})")
-    model = (OPENROUTER_MODEL or "").strip()
-    if not model:
-        raise RuntimeError("OpenRouter model missing (HALO_OPENROUTER_MODEL)")
     base_url = (OPENROUTER_BASE_URL or "https://openrouter.ai/api/v1").rstrip("/")
-    body = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "reasoning": {"enabled": False, "exclude": True},
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "halo_response",
-                "strict": True,
-                "schema": schema,
-            },
-        },
-    }
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -752,10 +349,34 @@ def _chat_json_openrouter(
     )
     try:
         with urllib.request.urlopen(req, timeout=float(OPENROUTER_TIMEOUT_SEC)) as r:
-            payload = json.loads(r.read().decode("utf-8"))
+            return json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")[:300]
         raise RuntimeError(f"OpenRouter HTTP {exc.code}: {detail}") from exc
+
+
+def _chat_json_openrouter(
+    *,
+    messages: list[dict[str, str]],
+    schema: dict[str, Any],
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
+    model = (OPENROUTER_MODEL or "").strip()
+    if not model:
+        raise RuntimeError("OpenRouter model missing (HALO_OPENROUTER_MODEL)")
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "reasoning": {"enabled": False, "exclude": True},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "halo_response", "strict": True, "schema": schema},
+        },
+    }
+    payload = _openrouter_request(body)
     content = payload["choices"][0]["message"]["content"]
     if isinstance(content, list):
         content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
@@ -1158,6 +779,37 @@ _CORRECT_PROMPT = (
     'Reply as JSON: {"corrected": "<the corrected text>"}.\n\nText: '
 )
 
+_REPAIR_PROMPT = (
+    "You repair a voice-assistant transcript captured by speech-to-text from "
+    "a speaker with a strong non-native accent, so some words are garbled or "
+    "mis-recognized. Using the recent conversation for context, replace ONLY "
+    "the words that are clearly mis-transcriptions so the sentence makes "
+    "sense as something the speaker would say next. Keep the speaker's "
+    "wording, word order, and meaning. Do NOT answer the request, rephrase, "
+    "summarize, translate, or add or remove content. If the text already "
+    "makes sense, return it unchanged. "
+    'Reply as JSON: {"corrected": "<the fixed transcript>"}.'
+)
+
+
+# --- user-adjustable prompt overrides --------------------------------------
+# The literals above are the baked DEFAULTS. Captured here for `halo prompts
+# --init`, then each is replaced by a ~/.halo/prompts/<name>.txt override if the
+# user created one. Routing schema/validation stay in code — only wording is
+# tunable. Behavior is unchanged unless an override file exists.
+PROMPT_DEFAULTS: dict[str, str] = {
+    "stage2_router": STAGE2_PROMPT,
+    "stage2_session": STAGE2_SESSION_BLOCK,
+    "summarize": SUMMARIZE_PROMPT,
+    "stt_correct": _CORRECT_PROMPT,
+    "stt_repair": _REPAIR_PROMPT,
+}
+STAGE2_PROMPT = prompts.get("stage2_router", STAGE2_PROMPT)
+STAGE2_SESSION_BLOCK = prompts.get("stage2_session", STAGE2_SESSION_BLOCK)
+SUMMARIZE_PROMPT = prompts.get("summarize", SUMMARIZE_PROMPT)
+_CORRECT_PROMPT = prompts.get("stt_correct", _CORRECT_PROMPT)
+_REPAIR_PROMPT = prompts.get("stt_repair", _REPAIR_PROMPT)
+
 
 _CHAT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -1198,7 +850,7 @@ def _now_context() -> str:
         return ""
 
 
-def _chat_base_prompt(history: str = "") -> tuple[str, str]:
+def _chat_base_prompt(history: str = "", tools_available: bool = False) -> tuple[str, str]:
     """Shared chat system prompt (persona + current time + recent history),
     WITHOUT any output-format instruction. Returns (system_prompt, user_name)."""
     name, character = _chat_persona()
@@ -1228,6 +880,13 @@ def _chat_base_prompt(history: str = "") -> tuple[str, str]:
         "User: yep -> Cool. What's next?\n"
         "User: what are they doing -> Not sure who you mean — which one are you asking about?\n"
     )
+    if tools_available:
+        system += (
+            "\nYou have TOOLS for live data (weather, files, web). Call a tool ONLY "
+            "when you genuinely need fresh or external info to answer; for small talk "
+            "or things you already know, just answer. After a tool returns, reply in "
+            "ONE short spoken sentence.\n"
+        )
     system += _now_context()
     if name:
         system += (
@@ -1363,6 +1022,137 @@ def chat_reply_stream(text: str, history: str = "", on_sentence=None) -> str:
         return full
 
 
+# --- Phase 7: brain MCP tool-calling loop ----------------------------------
+# Lets the router brain call standard MCP tools (weather/files/web) directly,
+# without spawning a coding agent. The MCP client + the gating flag live in
+# __main__/mcp_client; this is the provider-agnostic loop. Fail-open to plain chat.
+
+
+def _chat_tools_openrouter(messages, tools, max_tokens) -> dict:
+    """Non-streaming OpenRouter call WITH tools; returns the assistant message."""
+    model = (OPENROUTER_CHAT_MODEL or OPENROUTER_MODEL or "").strip()
+    if not model:
+        raise RuntimeError("OpenRouter model missing")
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.4,
+        "max_tokens": max_tokens,
+        "reasoning": {"enabled": False, "exclude": True},
+        "tools": tools,
+        "tool_choice": "auto",
+    }
+    return _openrouter_request(body)["choices"][0]["message"]
+
+
+def _chat_tools_ollama(messages, tools, max_tokens) -> dict:
+    """Non-streaming Ollama call WITH tools; returns the assistant message."""
+    resp = _get_client().chat(
+        model=OLLAMA_MODEL,
+        messages=messages,
+        tools=tools,
+        options={"temperature": 0.4, "num_predict": max_tokens},
+        keep_alive=_KEEP_ALIVE,
+    )
+    return dict(resp["message"])
+
+
+def _tool_calls_from(message: dict) -> list[dict]:
+    """Normalize tool_calls across OpenRouter (OpenAI shape) and Ollama."""
+    out = []
+    for c in (message.get("tool_calls") or []):
+        fn = c.get("function") or {}
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except Exception:
+                args = {}
+        out.append({"id": c.get("id") or fn.get("name", ""), "name": fn.get("name", ""), "args": args or {}})
+    return out
+
+
+def _message_text(message: dict) -> str:
+    content = message.get("content") or ""
+    if isinstance(content, list):
+        content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return (content or "").strip()
+
+
+def _chat_with_tools(messages, *, tools, execute, on_sentence, max_hops) -> str:
+    """Provider-agnostic tool-use loop. The model may request tool calls; we run
+    them via execute(name, args) and feed results back, up to max_hops, then
+    stream the final text answer via on_sentence. Returns the full answer."""
+    provider = (ROUTER_BACKEND or "ollama").strip().lower()
+    call_provider = _chat_tools_openrouter if provider == "openrouter" else _chat_tools_ollama
+    convo = list(messages)
+    for _hop in range(max(1, max_hops)):
+        message = call_provider(convo, tools, 220)
+        tool_calls = _tool_calls_from(message)
+        if not tool_calls:
+            text = _message_text(message)
+            if on_sentence and text:
+                rem = _flush_sentences(text, on_sentence).strip()
+                if rem:
+                    on_sentence(rem)
+            return text
+        convo.append({
+            "role": "assistant",
+            "content": message.get("content") or "",
+            "tool_calls": message.get("tool_calls"),
+        })
+        for call in tool_calls:
+            try:
+                result = execute(call["name"], call["args"])
+            except Exception as exc:
+                result = f"[tool error] {exc}"
+            print(f"  brain tool: {call['name']}({call['args']}) -> {str(result)[:80]!r}")
+            bus.emit("brain.tool", name=call["name"], args=call["args"])
+            convo.append({
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "name": call["name"],
+                "content": str(result),
+            })
+    raise RuntimeError(f"tool hop cap ({max_hops}) reached")
+
+
+def chat_reply_with_tools(text: str, history: str = "", on_sentence=None) -> str:
+    """Tool-augmented chat reply — the brain may call MCP tools before answering.
+    FAIL-OPEN: any error (no client, provider error, hop cap) falls back to the
+    plain streaming chat so the turn never dies. Wired in __main__._converse."""
+    msg = (text or "").strip()
+    if not msg:
+        return ""
+    try:
+        from halo.mcp_client import get_brain_client
+
+        client = get_brain_client()
+        if client is None or not client.available:
+            return chat_reply_stream(text, history=history, on_sentence=on_sentence)
+        tools = client.openai_tools()
+        from halo.userconfig import cfg as _cfg
+
+        max_hops = int(getattr(getattr(_cfg, "mcp", None), "brain_max_tool_hops", 4))
+        system, _name = _chat_base_prompt(history, tools_available=True)
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": msg},
+        ]
+        t0 = time.monotonic()
+        bus.emit("thinking.start", stage="chat_tools", chars=len(msg))
+        full = _chat_with_tools(
+            messages, tools=tools, execute=client.call,
+            on_sentence=on_sentence, max_hops=max_hops,
+        )
+        bus.emit("thinking.end", stage="chat_tools",
+                 ms=int((time.monotonic() - t0) * 1000), chars_out=len(full))
+        return full
+    except Exception as exc:
+        print(f"  [chat tools] failed ({exc}) — falling back to plain chat")
+        return chat_reply_stream(text, history=history, on_sentence=on_sentence)
+
+
 def _chat_stream_ollama(messages: list[dict[str, str]], on_sentence) -> str:
     parts: list[str] = []
     buf = ""
@@ -1471,5 +1261,63 @@ def correct_text(text: str) -> str:
         return raw
     # Reject editorializing: a correction shouldn't balloon the length.
     if len(out) > max(40, int(len(raw) * 2.5)):
+        return raw
+    return out
+
+
+# --- semantic repair (mic "translation" pass) -------------------------------
+# When Whisper itself was UNSURE of a transcript (low avg-logprob), the words
+# that came out may be phonetic neighbours of what was said. This pass gives
+# the brain the transcript + the recent conversation and asks it to fix ONLY
+# clear mis-recognitions — "interpret what the user actually meant", never
+# rewrite. Confident transcripts skip it entirely, so good turns pay zero
+# latency. Tune the gate with HALO_STT_REPAIR_LOGPROB (default -0.5; whisper
+# is ~-0.1..-0.3 when sure of the words).
+
+_REPAIR_MIN_WORDS = 3
+_REPAIR_LOGPROB = float(os.getenv("HALO_STT_REPAIR_LOGPROB", "-0.5"))
+
+
+def needs_repair(text: str, quality: float | None) -> bool:
+    """Pure gate: True only for a real-length transcript Whisper was unsure
+    of. Short commands are excluded — repairing "open chrome" risks more than
+    it fixes, and control phrases must stay byte-exact."""
+    if quality is None:
+        return False
+    if len((text or "").split()) < _REPAIR_MIN_WORDS:
+        return False
+    return quality < _REPAIR_LOGPROB
+
+
+def repair_transcript(text: str, context: str = "") -> str:
+    """Fix mis-recognized words in a low-confidence transcript using the
+    recent conversation as context. FAIL-OPEN like correct_text: returns the
+    input on any model error, empty output, or a ballooned rewrite. The
+    caller owns the wall-clock timeout."""
+    raw = (text or "").strip()
+    if not raw:
+        return text
+    ctx = (context or "").strip()
+    if len(ctx) > 800:
+        ctx = ctx[-800:]
+    content = _REPAIR_PROMPT
+    if ctx:
+        content += "\n\n" + ctx
+    content += "\n\nTranscript: " + raw
+    try:
+        data = _chat_json(
+            messages=[{"role": "user", "content": content}],
+            schema=_CORRECT_SCHEMA,
+            max_tokens=max(48, min(400, len(raw))),
+            temperature=0.0,
+        )
+        out = (data.get("corrected") or "").strip()
+    except Exception as exc:
+        print(f"  [stt repair] model unreachable ({exc}) — using raw")
+        return raw
+    if not out:
+        return raw
+    # Reject editorializing: a repair shouldn't balloon the length.
+    if len(out) > max(40, int(len(raw) * 2.0)):
         return raw
     return out

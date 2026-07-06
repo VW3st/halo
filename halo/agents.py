@@ -538,20 +538,31 @@ def _ensure_default_mcp_config() -> Optional[Path]:
         return None
 
 
-def _mcp_args() -> list[str]:
-    """`--mcp-config <path>` (+ optional --strict-mcp-config) when [mcp] is
-    enabled and a config file exists; otherwise empty (MCP off)."""
+def resolve_mcp_config_path() -> Optional[Path]:
+    """The mcp.json path Halo should use: an explicit [mcp] config_path if set,
+    else the bundled default (written on first use). None when [mcp] is disabled
+    or the path can't be resolved. Shared by the spawned-agent MCP args AND the
+    brain's MCP client (mcp_client.py) so both read the same config."""
     mcp = getattr(user_cfg, "mcp", None)
     if mcp is None or not getattr(mcp, "enabled", False):
-        return []
+        return None
     raw = (getattr(mcp, "config_path", "") or "").strip()
     path = Path(raw) if raw else _ensure_default_mcp_config()
     if path is None or not Path(path).is_file():
         if raw:
             print(f"  [mcp] config_path not found: {raw!r} — MCP not loaded")
+        return None
+    return Path(path)
+
+
+def _mcp_args() -> list[str]:
+    """`--mcp-config <path>` (+ optional --strict-mcp-config) when [mcp] is
+    enabled and a config file exists; otherwise empty (MCP off)."""
+    path = resolve_mcp_config_path()
+    if path is None:
         return []
     args = ["--mcp-config", str(path)]
-    if getattr(mcp, "strict", False):
+    if getattr(getattr(user_cfg, "mcp", None), "strict", False):
         args.append("--strict-mcp-config")
     return args
 

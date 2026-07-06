@@ -57,6 +57,40 @@ def _tokens(text: str) -> set[str]:
     return {w for w in _WORD_RE.findall((text or "").lower()) if w not in _STOPWORDS and len(w) > 1}
 
 
+def _relative_time(then: float, now: float | None = None) -> str:
+    """Human relative phrasing of how long ago `then` (epoch secs) was: 'just now',
+    '5 minutes ago', 'about an hour ago', 'yesterday', '3 days ago', 'last month'.
+    Pure + unit-tested so the brain's time reasoning never hallucinates."""
+    now = time.time() if now is None else now
+    s = max(0.0, now - then)
+    if s < 45:
+        return "just now"
+    if s < 90:
+        return "a minute ago"
+    mins = s / 60
+    if mins < 45:
+        return f"{int(round(mins))} minutes ago"
+    hours = s / 3600
+    if hours < 1.6:
+        return "about an hour ago"
+    if hours < 22:
+        return f"{int(round(hours))} hours ago"
+    days = s / 86400
+    if days < 1.6:
+        return "yesterday"
+    if days < 7:
+        return f"{int(round(days))} days ago"
+    if days < 11:
+        return "last week"
+    if days < 45:
+        return f"{int(round(days / 7))} weeks ago"
+    if days < 75:
+        return "last month"
+    if days < 345:
+        return f"{int(round(days / 30))} months ago"
+    return f"{int(round(days / 365))} year(s) ago"
+
+
 # Salient first-person statements worth keeping as durable facts, with the
 # category they map to. Auto-extraction is deliberately conservative — the
 # explicit "remember ..." command (see extract_fact) is the primary path.
@@ -182,6 +216,35 @@ class Memory:
             (limit,),
         )
         return cur.fetchall()
+
+    def first_seen(self) -> float | None:
+        """Epoch secs of the EARLIEST recorded turn — when the user first started
+        using Halo (≈ project start for a single-project user)."""
+        row = self._conn.execute("SELECT MIN(ts) FROM turns").fetchone()
+        return row[0] if row and row[0] else None
+
+    def last_seen(self) -> float | None:
+        """Epoch secs of the most recent recorded turn. At wake (before this
+        session records anything) this is the PREVIOUS interaction."""
+        row = self._conn.execute("SELECT MAX(ts) FROM turns").fetchone()
+        return row[0] if row and row[0] else None
+
+    def time_context(self, now: float | None = None) -> str:
+        """Temporal grounding for the brain: the real current date/time plus when
+        the user first started using Halo — so it answers 'when did we start' /
+        'how long have we been at this' correctly instead of hallucinating."""
+        import datetime
+
+        now = time.time() if now is None else now
+        stamp = datetime.datetime.fromtimestamp(now).astimezone()
+        parts = [f"Current real date and time: {stamp.strftime('%A, %B %d, %Y, %I:%M %p')} {stamp.tzname() or ''}.".strip()]
+        first = self.first_seen()
+        if first and (now - first) > 3600:
+            parts.append(
+                f"The user first started using Halo {_relative_time(first, now)} "
+                f"(on {datetime.datetime.fromtimestamp(first).strftime('%B %d, %Y')})."
+            )
+        return " ".join(parts)
 
     def render_for_brain(self, current: str = "", max_turns: int = 14, max_facts: int = 8) -> str:
         """Compact MEMORY block: durable facts + recent turns + any older turns

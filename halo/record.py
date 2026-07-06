@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import wave
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -30,16 +31,14 @@ from halo.config import (
     RECORDINGS_DIR,
     SAMPLE_RATE,
 )
+from halo.config import VAD_THRESHOLD as _VAD_THRESHOLD
 
 # silero-vad v5 requires exactly 512 samples per chunk at 16 kHz (~32 ms).
 VAD_CHUNK = 512
-# 0.35: silero often under-scores a raw, AGC-less USB mic (Blue Snowball)
-# so 0.5 missed real speech entirely ("no speech detected"). Run-ons that
-# 0.3 used to cause are now bounded by TURN_MAX_SEC, so the looser value is
-# safe — and the RMS-energy fallback below catches speech silero misses.
-# Lower = more sensitive (grabs quieter speech sooner, more noise false-fires).
-# Override with HALO_VAD_THRESHOLD; the hot-mic profile drops it to 0.25.
-VAD_THRESHOLD = float(os.getenv("HALO_VAD_THRESHOLD", "0.25" if HOT_MIC else "0.35"))
+# Speech threshold now lives in config.VAD_THRESHOLD (shared with stt.py's
+# internal VAD filter so recorder and transcriber never disagree). Re-exported
+# here for callers that historically imported it from record.
+VAD_THRESHOLD = _VAD_THRESHOLD
 SPEECH_PAD_MS = 200
 
 # RMS-energy fallback so a quiet mic that under-scores on silero still
@@ -81,7 +80,7 @@ def _get_vad_model():
 
 
 def preload_models() -> None:
-    """Force VAD + Moonshine models to load now instead of on the first turn.
+    """Force VAD + Whisper models to load now instead of on the first turn.
 
     Loading inside the audio callback caused "input overflow" warnings
     and dropped the first ~200 ms of speech.
@@ -122,6 +121,11 @@ class RecorderState:
         self._speech_event = threading.Event()
         self._silence_event = threading.Event()
         self.had_speech = False
+        # Mic-grounded onset provenance (read by turn._commit for the BACKGROUND
+        # classifier): did silero VAD ever fire, or only the RMS-energy fallback?
+        self.vad_fired = False
+        self.energy_only_onset = False
+        self.peak_onset_rms = 0.0
         self._last_rms_print = 0.0
         # Realtime audio path: the PortAudio callback ONLY enqueues raw
         # chunks; all inference (silero VAD) runs on a consumer thread.
@@ -178,6 +182,7 @@ class RecorderState:
             if rms > MIC_RMS_FLOOR and now - self._last_rms_print > MIC_RMS_PRINT_INTERVAL_SEC:
                 self._last_rms_print = now
                 print(f"  mic level: {rms:.3f}")
+            self.peak_onset_rms = max(self.peak_onset_rms, rms)
 
             # Noise gate: below the floor = silence. Also drives the
             # RMS-energy END fallback once speech has started.
@@ -196,6 +201,8 @@ class RecorderState:
                 self._silence_run = 0
                 if self._energy_run >= ENERGY_ONSET_CHUNKS and not self.had_speech:
                     self.had_speech = True
+                    if not self.vad_fired:
+                        self.energy_only_onset = True
                     self._silence_event.clear()
                     self._speech_event.set()
             else:
@@ -206,6 +213,8 @@ class RecorderState:
                 continue
             if "start" in result:
                 self.had_speech = True
+                self.vad_fired = True
+                self.energy_only_onset = False  # silero agreed -> real speech, not rumble
                 self._silence_run = 0
                 self._silence_event.clear()
                 self._speech_event.set()
@@ -228,6 +237,14 @@ class RecorderState:
             self._worker.join(timeout=1.5)
             self._worker = None
 
+    def onset_signals(self) -> dict:
+        """Snapshot of this turn's mic onset provenance for the classifier."""
+        return {
+            "vad_fired": self.vad_fired,
+            "energy_only_onset": self.energy_only_onset,
+            "peak_onset_rms": self.peak_onset_rms,
+        }
+
     def snapshot(self) -> np.ndarray:
         with self._lock:
             if not self._chunks:
@@ -245,6 +262,102 @@ class RecorderState:
 
     def clear_silence_event(self) -> None:
         self._silence_event.clear()
+
+
+def _windowed_peak_rms_i16(audio: np.ndarray, window_sec: float = 0.1) -> float:
+    """Loudest `window_sec` RMS window in int16 PCM audio (0..1). Windowed so
+    a short real word scores high while steady room hiss averages out low."""
+    if audio.size == 0:
+        return 0.0
+    f = audio.astype(np.float32) / 32768.0
+    win = int(SAMPLE_RATE * window_sec) or 1
+    peak = 0.0
+    for i in range(0, f.size, win):
+        seg = f[i : i + win]
+        if seg.size:
+            peak = max(peak, float(np.sqrt(np.mean(seg ** 2))))
+    return peak
+
+
+class GapCapture:
+    """Rolling mic capture for the gaps BETWEEN turns.
+
+    run_turn owns the mic only while a turn is open; everything said while
+    Halo is routing, thinking, or finishing its reply used to land in dead
+    air and was lost ("it doesn't capture all I talk"). The orchestrator
+    starts a GapCapture when a turn commits and take()s the buffer as the
+    seed for the next turn (run_turn(seed_audio=...)).
+
+    - Keeps only the most recent `max_sec` seconds (ring buffer).
+    - Drops chunks while Halo's TTS is speaking (echo would poison the seed).
+    - take() returns audio ONLY if it contains speech-level energy
+      (windowed peak RMS >= SPEECH_RMS_FLOOR) — seeding minutes of room tone
+      would slow Whisper and invite hallucinations.
+    - Fail-soft: if the input stream can't open (device busy/missing), it
+      just captures nothing.
+
+    feed() is separated from the stream callback so the buffering/gating
+    logic is unit-testable without audio hardware (scripts/test_gap_capture.py).
+    """
+
+    def __init__(self, max_sec: float = 30.0) -> None:
+        self._chunks: deque[np.ndarray] = deque(
+            maxlen=max(1, int(max_sec * SAMPLE_RATE / VAD_CHUNK))
+        )
+        self._lock = threading.Lock()
+        self._stream = None
+        self._is_speaking: Callable[[], bool] | None = None
+
+    def feed(self, chunk: np.ndarray) -> None:
+        with self._lock:
+            self._chunks.append(chunk)
+
+    def _callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
+        if self._is_speaking is not None and self._is_speaking():
+            return  # Halo's own TTS — never seed our voice into the next turn
+        self.feed(indata[:, 0].copy())
+
+    def start(self) -> None:
+        if self._stream is not None:
+            return
+        if self._is_speaking is None:
+            from halo.voice import is_speaking
+            self._is_speaking = is_speaking
+        try:
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+                blocksize=VAD_CHUNK,
+                latency="high",
+                callback=self._callback,
+            )
+            self._stream.start()
+        except Exception as exc:
+            print(f"  gap-capture unavailable ({exc})")
+            self._stream = None
+
+    def stop(self) -> None:
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
+    def take(self) -> np.ndarray:
+        """Return buffered audio if it contains speech-level energy, else an
+        empty array. Always clears the buffer."""
+        with self._lock:
+            chunks = list(self._chunks)
+            self._chunks.clear()
+        if not chunks:
+            return np.zeros(0, dtype=np.int16)
+        audio = np.concatenate(chunks)
+        if _windowed_peak_rms_i16(audio) < SPEECH_RMS_FLOOR:
+            return np.zeros(0, dtype=np.int16)
+        return audio
 
 
 @contextmanager

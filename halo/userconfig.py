@@ -204,6 +204,9 @@ class DictationConfig:
     # typing). Adds a small per-phrase delay; set false for fastest raw
     # typing.
     autocorrect: bool = True
+    # Global hotkey to START dictation while Halo is idle (no wake word needed).
+    # Win32 modifier+key spec, e.g. "ctrl+alt+d". Empty = off. Windows-only.
+    hotkey: str = "ctrl+alt+d"
 
 
 @dataclass
@@ -220,6 +223,14 @@ class McpConfig:
     # True = load ONLY the servers in config_path (ignore any you've added
     # with `claude mcp add`). False = also keep those.
     strict: bool = False
+    # --- brain tools (Phase 7) — let the ROUTER BRAIN call MCP tools directly,
+    # not just the spawned Claude. Both `enabled` and `brain_tools` must be True.
+    brain_tools: bool = False
+    # Optional allow-list of server names (from mcp.json) to expose to the brain.
+    # Empty = all. Keep powerful servers (desktop control) OUT of the brain loop.
+    brain_tool_servers: list[str] = field(default_factory=list)
+    brain_max_tool_hops: int = 4          # hard cap on tool-call iterations per turn
+    brain_tool_timeout_sec: float = 20.0  # per tool-call execution timeout
 
 
 @dataclass
@@ -287,9 +298,11 @@ _ENV_OVERRIDES: dict[str, tuple[str, str, type]] = {
     "HALO_CHARACTER":           ("persona", "halo_character", str),
     "HALO_DICTATION_SMART_STOP":  ("dictation", "smart_stop", bool),
     "HALO_DICTATION_AUTOCORRECT": ("dictation", "autocorrect", bool),
+    "HALO_DICTATION_HOTKEY":      ("dictation", "hotkey", str),
     "HALO_MCP_ENABLED":           ("mcp", "enabled", bool),
     "HALO_MEMORY_ENABLED":        ("memory", "enabled", bool),
     "HALO_MCP_CONFIG_PATH":       ("mcp", "config_path", str),
+    "HALO_MCP_BRAIN_TOOLS":       ("mcp", "brain_tools", bool),
 }
 
 
@@ -596,7 +609,7 @@ openrouter_timeout_sec = 20.0
 [conversation]
 # Seconds of silence before Halo sleeps when no command has been
 # processed yet this conversation (e.g. accidental wake).
-idle_sec = 5.0
+idle_sec = 8.0
 
 # Seconds of silence AFTER you've spoken at least one command. Long so
 # you can think between turns.
@@ -657,6 +670,9 @@ auto_period = false
 # for fastest raw typing with no cleanup delay.
 autocorrect = true
 
+# Global hotkey to start dictation while Halo is idle (no wake word). Empty = off.
+hotkey = "ctrl+alt+d"
+
 [mcp]
 # Give the Claude sessions Halo spawns extra tools via MCP. With desktop
 # control you can say: "Claude, take a screenshot and open Notepad",
@@ -674,6 +690,15 @@ config_path = ""
 
 # true = load ONLY config_path's servers (ignore `claude mcp add` ones).
 strict = false
+
+# Phase 7 — let the ROUTER BRAIN call MCP tools directly (weather / files / web),
+# not just the spawned Claude. Needs enabled = true too. Works best with a cloud
+# model (OpenRouter); a small local 1.5B may ignore tools. Keep desktop-control
+# OUT of brain_tool_servers — leave it for confirmed agent dispatch.
+brain_tools = false
+# brain_tool_servers = []        # allow-list of mcp.json server names; empty = all
+# brain_max_tool_hops = 4
+# brain_tool_timeout_sec = 20.0
 
 # ---------------------------------------------------------------------------
 # Per-machine overlays. Any [section] above can be repeated under

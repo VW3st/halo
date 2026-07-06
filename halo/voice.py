@@ -33,7 +33,7 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 
-from halo import bus
+from halo import bus, floor
 from halo.config import MODELS_DIR
 from halo.userconfig import cfg as user_cfg
 
@@ -224,6 +224,25 @@ WORKING_PHRASES = (
 )
 
 
+def _try_load_kokoro() -> bool:
+    """Load the local Kokoro engine if its model files are present. Returns True
+    if available. Used as the primary TTS and as the ElevenLabs fallback so a
+    cloud failure degrades to local audio instead of silence."""
+    global _kokoro
+    if _kokoro is not None:
+        return True
+    if not _MODEL_PATH.exists() or not _VOICES_PATH.exists():
+        return False
+    try:
+        from kokoro_onnx import Kokoro  # noqa: WPS433 — late import for optional dep
+        _kokoro = Kokoro(str(_MODEL_PATH), str(_VOICES_PATH))
+        print("  Kokoro loaded.")
+        return True
+    except Exception as exc:
+        print(f"  Kokoro load failed: {exc}")
+        return False
+
+
 def preload_voice() -> None:
     """Prepare the selected TTS provider once. Cheap to call from startup."""
     global _cloud_voice_ready, _kokoro
@@ -250,6 +269,9 @@ def preload_voice() -> None:
                 f"{user_cfg.voice.elevenlabs_output_format})..."
             )
             print("  ElevenLabs configured.")
+            # Kokoro (the fallback) is loaded LAZILY on the first ElevenLabs
+            # failure, NOT here — eager-loading a second TTS engine stalled
+            # startup for cloud-voice users. See _do_synth_and_play.
             return
         if provider != "kokoro":
             print(f"  unknown voice provider {provider!r} -- voice disabled.")
@@ -342,16 +364,21 @@ def say(
     blocking=True if the caller needs to wait (e.g. shutdown).
     """
     provider = (user_cfg.voice.provider or "kokoro").strip().lower()
-    if provider == "kokoro" and _kokoro is None:
-        return
-    if provider == "elevenlabs" and not _cloud_voice_ready:
-        return
     if provider not in {"kokoro", "elevenlabs"}:
+        return
+    # Bail only if NOTHING can make sound. Kokoro doubles as the ElevenLabs
+    # fallback, so elevenlabs can speak if either the cloud is ready or Kokoro
+    # is loaded.
+    if _kokoro is None and not (provider == "elevenlabs" and _cloud_voice_ready):
         return
     spoken = _clean_for_speech(text)
     if not spoken:
         return
     _note_spoken(spoken)  # for the barge-in echo guard
+    # If Halo just promised a beat ("give me ten seconds", "hold on"), arm a
+    # reclaim timer so the orchestrator takes its turn back instead of waiting.
+    if floor.note_halo_said(spoken):
+        bus.emit("floor.promised", text=spoken, seconds=floor.seconds_remaining())
     bus.emit("tts.spoke", text=spoken, who="Halo")
     # Speaking.start drives the Output spectrogram + the central
     # "Speaking" ring on the dashboard. Duration is estimated from
@@ -375,9 +402,23 @@ def say(
         import time as _time
         t0 = _time.monotonic()
         try:
-            if provider == "elevenlabs":
-                samples, sample_rate = _synth_elevenlabs(spoken)
+            if provider == "elevenlabs" and _cloud_voice_ready:
+                try:
+                    samples, sample_rate = _synth_elevenlabs(spoken)
+                except Exception as exc:
+                    # Load the local fallback lazily, only when the cloud
+                    # actually fails — never at startup.
+                    if _kokoro is None and not _try_load_kokoro():
+                        raise
+                    print(f"  ElevenLabs failed ({exc}); falling back to Kokoro")
+                    bus.emit("voice.fallback", primary="elevenlabs",
+                             fallback="kokoro", error=str(exc))
+                    samples, sample_rate = _kokoro.create(
+                        spoken, voice=voice, speed=speed, lang="en-us"
+                    )
             else:
+                # kokoro provider, OR elevenlabs configured-but-not-ready: use
+                # the local engine (guaranteed loaded by the say() gate above).
                 samples, sample_rate = _kokoro.create(
                     spoken, voice=voice, speed=speed, lang="en-us"
                 )
